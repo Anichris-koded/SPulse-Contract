@@ -72,6 +72,8 @@ pub enum DataKey {
     FeeRecipient(Address),
     HasReferrer(Address),
     RateWindow, // packed u64: high32=window_start_hi, low32=count
+    // ── Settlement-time payouts (issue #2) ───────────────────────────────
+    Payout(u64, Address), // i128 — exact payout computed at resolve time
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -497,25 +499,71 @@ impl PredictionMarketContract {
             return Err(MarketError::MarketNotExpired);
         }
 
-        let winning_side = if outcome {
+        let total_pool: i128 = market.total_yes + market.total_no;
+        let winning_side: i128 = if outcome {
             market.total_yes
         } else {
             market.total_no
         };
+
+        let mut acc_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+
         if winning_side == 0 {
-            let total_pool = market.total_yes + market.total_no;
+            // No contest on the winning side — the whole pool is swept to
+            // accumulated fees (protocol-defined behavior, kept from prior
+            // design). Bettors still earn tokens/points via claim().
             if total_pool > 0 {
-                let mut acc: i128 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::AccumulatedFees)
-                    .unwrap_or(0);
-                acc += total_pool;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::AccumulatedFees, &acc);
+                acc_fees += total_pool;
+            }
+        } else {
+            // Settlement-time payouts (issue #2): compute EXACT per-winner
+            // payouts and the deterministic remainder (dust) once, here, so:
+            //   Σ payouts + dust == total_pool   (no money can get trapped)
+            //   payouts never exceed the pool (floor per user)
+            //   claim() performs no division and cannot double-pay.
+            let mut payout_sum: i128 = 0;
+            let bettors: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::BettorCount(market_id))
+                .unwrap_or(0);
+
+            for i in 0..bettors {
+                let slot_key = DataKey::BettorAt(market_id, i);
+                let bettor: Address =
+                    if let Some(a) = env.storage().persistent().get(&slot_key) {
+                        a
+                    } else {
+                        continue;
+                    };
+                let bet_key = DataKey::Bet(market_id, bettor.clone());
+                if let Some(entry) = env.storage().persistent().get::<DataKey, BetEntry>(&bet_key) {
+                    if entry.is_yes == outcome {
+                        let payout = (entry.net * total_pool) / winning_side;
+                        let payout_key = DataKey::Payout(market_id, bettor.clone());
+                        env.storage().persistent().set(&payout_key, &payout);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&payout_key, TTL_BUMP, TTL_HIGH);
+                        payout_sum += payout;
+                    }
+                }
+            }
+
+            let dust: i128 = total_pool - payout_sum;
+            debug_assert!(dust >= 0, "payouts must never exceed the pool");
+            if dust > 0 {
+                acc_fees += dust;
             }
         }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &acc_fees);
 
         market.resolved = true;
         market.outcome = outcome;
@@ -645,11 +693,19 @@ impl PredictionMarketContract {
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         let this = env.current_contract_address();
 
-        // XLM payout: only when the winning side had bettors.
-        // If winning_side == 0, the pool was swept to AccumulatedFees at resolve
-        // time so the admin/fee-recipient can withdraw it via withdraw_fees().
-        if is_winner && winning_side > 0 {
-            let payout = (entry.net * total_pool) / winning_side;
+        // XLM payout straight from the settlement-time payout ledger.
+        // Winners are exactly the bettors who own a Payout entry; everyone
+        // else (losers, empty winning side) has no payout key at all.
+        let payout: i128 = if let Some(p) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::Payout(market_id, user.clone()))
+        {
+            p
+        } else {
+            0
+        };
+        if is_winner && payout > 0 {
             token::Client::new(&env, &cfg.xlm_sac).transfer(&this, &user, &payout);
         }
 
@@ -761,6 +817,13 @@ impl PredictionMarketContract {
         env.storage()
             .instance()
             .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0)
+    }
+
+    pub fn get_payout(env: Env, market_id: u64, user: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Payout(market_id, user))
             .unwrap_or(0)
     }
 

@@ -1037,3 +1037,96 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(refunded, 100_0000000);
     assert_eq!(t.xlm.balance(&charlie), charlie_before);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #2 (payout rounding / dust)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── #2: settlement-time payouts — Σ payouts + dust == pool ──────────────────
+#[test]
+fn test_many_winners_payouts_exact_and_dust_swept() {
+    let t = setup();
+    let id = create_test_market(&t);
+
+    let w1 = Address::generate(&t.env);
+    let w2 = Address::generate(&t.env);
+    let w3 = Address::generate(&t.env);
+    let l1 = Address::generate(&t.env);
+    fund_user(&t, &w1, 1_000_0000000);
+    fund_user(&t, &w2, 1_000_0000000);
+    fund_user(&t, &w3, 1_000_0000000);
+    fund_user(&t, &l1, 1_000_0000000);
+
+    // Deliberately uneven stakes that do NOT divide the pool evenly.
+    t.client.place_bet(&w1, &id, &true, &30_000_001_i128);
+    t.client.place_bet(&w2, &id, &true, &40_000_003_i128);
+    t.client.place_bet(&w3, &id, &true, &50_000_007_i128);
+    t.client.place_bet(&l1, &id, &false, &27_777_779_i128);
+
+    advance_time(&t.env, 3601);
+    let fees_before = t.client.get_accumulated_fees();
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let market = t.client.get_market(&id);
+    let pool: i128 = market.total_yes + market.total_no;
+    let win: i128 = market.total_yes;
+
+    let n1 = t.client.get_bet(&id, &w1).amount;
+    let n2 = t.client.get_bet(&id, &w2).amount;
+    let n3 = t.client.get_bet(&id, &w3).amount;
+    assert_eq!(n1 + n2 + n3, win);
+
+    // Stored payouts must equal the exact integer formula.
+    let p1 = (n1 * pool) / win;
+    let p2 = (n2 * pool) / win;
+    let p3 = (n3 * pool) / win;
+    assert_eq!(t.client.get_payout(&id, &w1), p1);
+    assert_eq!(t.client.get_payout(&id, &w2), p2);
+    assert_eq!(t.client.get_payout(&id, &w3), p3);
+    assert_eq!(t.client.get_payout(&id, &l1), 0);
+
+    // The dust is deterministic, bounded, and swept to the fee accumulator.
+    let dust: i128 = pool - p1 - p2 - p3;
+    assert!(dust >= 0);
+    assert!(dust < win);
+    assert_eq!(t.client.get_accumulated_fees(), fees_before + dust);
+
+    // No overpay: the sum of payouts never exceeds the pool.
+    assert!(p1 + p2 + p3 <= pool);
+
+    // After all claims the market's balance drops by exactly Σ payouts.
+    let market_contract = t.client.address.clone();
+    let bal_before = t.xlm.balance(&market_contract);
+    t.client.claim(&w1, &id);
+    t.client.claim(&w2, &id);
+    t.client.claim(&w3, &id);
+    assert_eq!(
+        bal_before - t.xlm.balance(&market_contract),
+        p1 + p2 + p3
+    );
+    assert_eq!(t.xlm.balance(&w1), 1_000_0000000_i128 - 30_000_001_i128 + p1);
+}
+
+// ── #2: single winner receives the whole pool (no dust) ─────────────────────
+#[test]
+fn test_single_winner_gets_whole_net_pool() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let winner = Address::generate(&t.env);
+    let loser = Address::generate(&t.env);
+    fund_user(&t, &winner, 1_000_0000000);
+    fund_user(&t, &loser, 1_000_0000000);
+
+    t.client.place_bet(&winner, &id, &true, &60_0000000_i128);
+    t.client.place_bet(&loser, &id, &false, &60_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let market = t.client.get_market(&id);
+    let total = market.total_yes + market.total_no;
+    let before = t.xlm.balance(&winner);
+    t.client.claim(&winner, &id);
+    // Whole pool (both nets) goes to the single winner.
+    assert_eq!(t.xlm.balance(&winner) - before, total);
+    assert_eq!(t.client.get_payout(&id, &winner), total);
+}

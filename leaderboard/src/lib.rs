@@ -56,6 +56,7 @@ pub struct PlayerEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayerStats {
     pub points: u64,
+    // Total activity: settled wins + settled losses + bonus awards.
     pub total_bets: u32,
     pub won_bets: u32,
     pub lost_bets: u32,
@@ -68,10 +69,12 @@ pub struct UserStats {
     pub points: u64,
     pub won_bets: u32,
     pub lost_bets: u32,
-    // OPT: total_bets removed — derived as won_bets + lost_bets + pending.
-    //      Since prediction_market no longer calls record_bet, we compute
-    //      total_bets at read time: won + lost (fully settled bets only).
-    //      This eliminates the won_bets vs total_bets drift issue too.
+    // bonus_bets counts referral/welcome bonus awards (reward_bonus and
+    // add_bonus_pts). total_bets is derived at read time as
+    // won_bets + lost_bets + bonus_bets so bonus-only activity is counted
+    // without mislabeling bonuses as win/loss outcomes, and the three
+    // counters can never drift apart.
+    pub bonus_bets: u32,
 }
 
 #[contract]
@@ -169,6 +172,7 @@ impl LeaderboardContract {
             points: 0,
             won_bets: 0,
             lost_bets: 0,
+            bonus_bets: 0,
         });
         s.points += points;
         if is_winner {
@@ -223,6 +227,7 @@ impl LeaderboardContract {
             points: 0,
             won_bets: 0,
             lost_bets: 0,
+            bonus_bets: 0,
         });
 
         s.points += points;
@@ -258,8 +263,10 @@ impl LeaderboardContract {
             points: 0,
             won_bets: 0,
             lost_bets: 0,
+            bonus_bets: 0,
         });
         s.points += points;
+        s.bonus_bets += 1;
         env.storage().persistent().set(&sk, &s);
         env.storage()
             .persistent()
@@ -305,8 +312,10 @@ impl LeaderboardContract {
             points: 0,
             won_bets: 0,
             lost_bets: 0,
+            bonus_bets: 0,
         });
         s.points += points;
+        s.bonus_bets += 1;
         env.storage().persistent().set(&sk, &s);
         env.storage()
             .persistent()
@@ -323,7 +332,7 @@ impl LeaderboardContract {
     pub fn record_bet(env: Env, caller: Address, _user: Address) -> Result<(), LeaderboardError> {
         caller.require_auth();
         Self::require_market_contract(&env, &caller)?;
-        // No-op: total_bets derived from won_bets + lost_bets at read time
+        // No-op: total_bets derived from won_bets + lost_bets + bonus_bets at read time
         Ok(())
     }
 
@@ -335,7 +344,7 @@ impl LeaderboardContract {
             .unwrap_or(0)
     }
 
-    // OPT: 1 read instead of 4; total_bets = won + lost (settled bets)
+    // OPT: 1 read instead of 4; total_bets = won + lost + bonus (all activity)
     pub fn get_stats(env: Env, user: Address) -> PlayerStats {
         let s: UserStats = env
             .storage()
@@ -345,10 +354,11 @@ impl LeaderboardContract {
                 points: 0,
                 won_bets: 0,
                 lost_bets: 0,
+                bonus_bets: 0,
             });
         PlayerStats {
             points: s.points,
-            total_bets: s.won_bets + s.lost_bets,
+            total_bets: s.won_bets + s.lost_bets + s.bonus_bets,
             won_bets: s.won_bets,
             lost_bets: s.lost_bets,
         }

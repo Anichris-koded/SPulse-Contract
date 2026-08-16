@@ -961,8 +961,8 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
-    // total_bets now = won+lost (0 before claim)
-    assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 0);
+    // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
+    assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
     assert_eq!(t.client.get_market(&market_id).total_yes, 98_0000000);
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 100_0000000);
 
@@ -970,7 +970,7 @@ fn test_e2e_full_inter_contract_flow() {
     t.client
         .place_bet(&bob, &market_id, &false, &200_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 5_5000000);
-    // total_bets now = won+lost (0 before claim)
+    // Bob never registered, so no bonus: total_bets = won(0) + lost(0) + bonus(0).
     assert_eq!(t.leaderboard_client.get_stats(&bob).total_bets, 0);
     assert_eq!(t.client.get_market(&market_id).total_no, 196_0000000);
 

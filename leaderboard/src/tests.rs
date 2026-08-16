@@ -56,6 +56,7 @@ fn test_bonus_pts_no_won_lost() {
 
     let after = client.get_stats(&user);
     assert_eq!(after.points, 40);
+    assert_eq!(after.total_bets, 3); // won(1) + lost(1) + bonus(1)
     assert_eq!(after.won_bets, 1);
     assert_eq!(after.lost_bets, 1);
 }
@@ -114,7 +115,7 @@ fn test_pagination_offset_beyond_count() {
     assert_eq!(result.len(), 0);
 }
 
-// OPT: record_bet is now a no-op — total_bets = won_bets + lost_bets
+// OPT: record_bet is now a no-op — total_bets = won_bets + lost_bets + bonus_bets
 #[test]
 fn test_record_bet_is_noop() {
     let (env, client, _admin, market, _referral) = setup();
@@ -126,7 +127,7 @@ fn test_record_bet_is_noop() {
     assert_eq!(stats.total_bets, 0); // no wins/losses yet
 }
 
-// OPT: total_bets now = won_bets + lost_bets (derived at read time)
+// OPT: total_bets now = won_bets + lost_bets + bonus_bets (derived at read time)
 #[test]
 fn test_get_stats_aggregate() {
     let (env, client, _admin, market, referral) = setup();
@@ -137,14 +138,35 @@ fn test_get_stats_aggregate() {
     client.add_pts(&market, &user, &30_u64, &true);
     client.add_pts(&market, &user, &5_u64, &false);
 
-    // Bonus points don't affect won/lost counts
+    // Bonus points don't affect won/lost counts, but do count toward total_bets
     client.add_bonus_pts(&referral, &user, &10_u64);
 
     let stats = client.get_stats(&user);
     assert_eq!(stats.points, 65);
-    assert_eq!(stats.total_bets, 3); // won_bets(2) + lost_bets(1)
+    assert_eq!(stats.total_bets, 4); // won_bets(2) + lost_bets(1) + bonus_bets(1)
     assert_eq!(stats.won_bets, 2);
     assert_eq!(stats.lost_bets, 1);
+}
+
+// ── Issue #19: bonus-only activity must be reflected in total_bets ──────────
+
+#[test]
+fn test_bonus_only_user_has_nonzero_total_bets() {
+    // A user who only ever receives referral/welcome bonuses must not read as
+    // total_bets == 0. Bonus awards are counted without polluting won/lost.
+    let (env, client, _admin, _market, referral) = setup();
+    let user = Address::generate(&env);
+
+    // add_bonus_pts: per-referred-bet bonus path.
+    client.add_bonus_pts(&referral, &user, &3_u64);
+    // reward_bonus: welcome-bonus path (tokens=0 so no mint wiring is needed).
+    client.reward_bonus(&referral, &user, &5_u64, &0_i128);
+
+    let stats = client.get_stats(&user);
+    assert_eq!(stats.points, 8);
+    assert_eq!(stats.total_bets, 2); // 2 bonus awards, 0 settled bets
+    assert_eq!(stats.won_bets, 0);
+    assert_eq!(stats.lost_bets, 0);
 }
 
 #[test]

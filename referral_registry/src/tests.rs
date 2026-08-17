@@ -53,7 +53,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);

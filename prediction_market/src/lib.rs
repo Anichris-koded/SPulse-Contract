@@ -500,6 +500,117 @@ impl PredictionMarketContract {
         Ok(())
     }
 
+    // ── Position management (issue #98) ────────────────────────────────────
+
+    // Users may REDUCE — or fully CLOSE — an existing same-side position while
+    // the market is live, which is the accounting-consistent way to manage
+    // exposure: the payout model is one-entry-per-user (resolve_market computes
+    // per-winner payouts from the per-user single entry), so opening a hedge on
+    // the opposite side would break pool math by letting one user count toward
+    // both sides. Reduction keeps every invariant intact:
+    //   - market totals shrink by exactly the net portion being released;
+    //   - fees are released back only if they are still held by the contract
+    //     (platform always; referral only when it was never paid to a referrer);
+    //   - claim()/resolve payouts stay exact (Σ payouts + dust == pool).
+    // Comparable to cancel_refund, but scoped to a live market and a portion.
+    pub fn reduce_position(
+        env: Env,
+        user: Address,
+        market_id: u64,
+        amount: i128,
+    ) -> Result<i128, MarketError> {
+        user.require_auth();
+
+        if amount <= 0 {
+            return Err(MarketError::InvalidAmount);
+        }
+
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.cancelled {
+            return Err(MarketError::MarketCancelled);
+        }
+        if market.resolved {
+            return Err(MarketError::MarketResolved);
+        }
+        if env.ledger().timestamp() >= market.end_time {
+            return Err(MarketError::MarketExpired);
+        }
+
+        let bet_key = DataKey::Bet(market_id, user.clone());
+        let mut entry: BetEntry = env
+            .storage()
+            .persistent()
+            .get(&bet_key)
+            .ok_or(MarketError::NoBetFound)?;
+        if entry.gross < amount {
+            return Err(MarketError::InvalidAmount);
+        }
+
+        // Decompose exactly like place_bet so partial reductions stay integral.
+        let net_part = amount * NET_NUMERATOR / BPS_DENOM;
+        let plat_part = amount * PLATFORM_FEE_BPS / BPS_DENOM;
+        let ref_part = amount * TOTAL_FEE_BPS / BPS_DENOM - plat_part;
+
+        // Referral fee is refundable only when the contract still holds it: it
+        // was kept in AccumulatedFees iff the user had no referrer (HasReferrer
+        // cache == Some(false)); otherwise it already left to the referrer.
+        let ref_held: bool = !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::HasReferrer(user.clone()))
+            .unwrap_or(false);
+        let held_fees = plat_part + if ref_held { ref_part } else { 0 };
+        let refund = net_part + held_fees;
+
+        // ── State FIRST, external call last ───────────────────────────────
+        entry.net -= net_part;
+        entry.gross -= amount;
+
+        // Accumulated fees shrink by the fees being released; never below 0
+        // (same clamp discipline as cancel_market / withdraw_fees).
+        let mut acc_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        acc_fees = acc_fees.saturating_sub(held_fees);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &acc_fees);
+
+        if entry.is_yes {
+            market.total_yes -= net_part;
+        } else {
+            market.total_no -= net_part;
+        }
+
+        let fully_closed = entry.gross == 0;
+        if fully_closed {
+            // A fully-reduced position is removed entirely: no payout entry is
+            // created for it at resolution, and claim() reports NoBetFound
+            // (no free PULSE/points for an empty position).
+            env.storage().persistent().remove(&bet_key);
+        } else {
+            env.storage().persistent().set(&bet_key, &entry);
+            env.storage()
+                .persistent()
+                .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
+        }
+        let mkt_key = DataKey::Market(market_id);
+        env.storage().persistent().set(&mkt_key, &market);
+        env.storage()
+            .persistent()
+            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
+        token::Client::new(&env, &cfg.xlm_sac).transfer(
+            &env.current_contract_address(),
+            &user,
+            &refund,
+        );
+        Ok(refund)
+    }
+
     // ── Resolution ────────────────────────────────────────────────────────
 
     pub fn resolve_market(
@@ -708,7 +819,6 @@ impl PredictionMarketContract {
         }
 
         let is_winner = entry.is_yes == market.outcome;
-        let total_pool = market.total_yes + market.total_no;
         let winning_side = if market.outcome {
             market.total_yes
         } else {
@@ -756,18 +866,35 @@ impl PredictionMarketContract {
             (LOSE_POINTS, LOSE_TOKENS)
         };
 
+        // The leaderboard API was renamed reward() -> add_pts() (points only,
+        // no token amount), and add_pts no longer mints PULSE internally. The
+        // market mints the PULSE reward directly — it is the authorized minter
+        // for this legacy wiring, keeping the original mint semantics intact.
         let _: Val = env.invoke_contract(
             &cfg.leaderboard,
-            &Symbol::new(&env, "reward"),
+            &Symbol::new(&env, "add_pts"),
             vec![
                 &env,
                 this.clone().into_val(&env),
                 user.clone().into_val(&env),
                 points.into_val(&env),
-                tokens.into_val(&env),
                 real_win.into_val(&env),
             ],
         );
+        if tokens > 0 {
+            // PULSE is a custom token contract (not a token::Client-compatible
+            // SAC interface): mint directly via its exported `mint` ABI.
+            let _: Val = env.invoke_contract(
+                &cfg.token,
+                &Symbol::new(&env, "mint"),
+                vec![
+                    &env,
+                    this.clone().into_val(&env),
+                    user.clone().into_val(&env),
+                    tokens.into_val(&env),
+                ],
+            );
+        }
 
         Ok(())
     }

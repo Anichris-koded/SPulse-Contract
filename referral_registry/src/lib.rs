@@ -152,14 +152,34 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
+        // The leaderboard API renamed reward_bonus -> add_bonus_pts (which
+        // enforces caller == ReferralContract and no longer takes a token
+        // amount); keep the welcome-bonus points call in sync. The 1 PULSE
+        // welcome bonus is minted directly here — the registry is the
+        // authorized minter for this wiring.
         let _: Val = env.invoke_contract(
             &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
+            &Symbol::new(&env, "add_bonus_pts"),
             vec![
                 &env,
-                this.into_val(&env),
-                user.into_val(&env),
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
                 WELCOME_BONUS_POINTS.into_val(&env),
+            ],
+        );
+        let token_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenContract)
+            .unwrap();
+        // PULSE is a custom token contract; mint via its exported `mint` ABI.
+        let _: Val = env.invoke_contract(
+            &token_contract,
+            &Symbol::new(&env, "mint"),
+            vec![
+                &env,
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
                 WELCOME_BONUS_TOKENS.into_val(&env),
             ],
         );

@@ -296,7 +296,130 @@ fn test_total_supply_tracking() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  12. Emergency Pause (issue #83)
+//  12. Approve + allowance reflects granted amount
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_approve_and_allowance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let expiration_ledger = env.ledger().sequence() + 1000;
+
+    client.approve(&owner, &spender, &50_0000000_i128, &expiration_ledger);
+
+    assert_eq!(client.allowance(&owner, &spender), 50_0000000_i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  13. transfer_from spends down the allowance and moves balances
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_transfer_from_spends_allowance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.mint(&minter, &owner, &100_0000000_i128);
+
+    let expiration_ledger = env.ledger().sequence() + 1000;
+    client.approve(&owner, &spender, &40_0000000_i128, &expiration_ledger);
+
+    client.transfer_from(&spender, &owner, &recipient, &15_0000000_i128);
+
+    assert_eq!(client.balance(&owner), 85_0000000_i128);
+    assert_eq!(client.balance(&recipient), 15_0000000_i128);
+    assert_eq!(client.allowance(&owner, &spender), 25_0000000_i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  14. Reject transfer_from beyond the granted allowance
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reject_transfer_from_exceeding_allowance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.mint(&minter, &owner, &100_0000000_i128);
+
+    let expiration_ledger = env.ledger().sequence() + 1000;
+    client.approve(&owner, &spender, &10_0000000_i128, &expiration_ledger);
+
+    // Attempt to spend more than approved
+    client.transfer_from(&spender, &owner, &recipient, &20_0000000_i128); // panics
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  15. Approving amount 0 revokes an existing allowance
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_approve_zero_revokes_allowance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let expiration_ledger = env.ledger().sequence() + 1000;
+
+    client.approve(&owner, &spender, &50_0000000_i128, &expiration_ledger);
+    assert_eq!(client.allowance(&owner, &spender), 50_0000000_i128);
+
+    client.approve(&owner, &spender, &0_i128, &expiration_ledger);
+    assert_eq!(client.allowance(&owner, &spender), 0_i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  16. Allowance reads as 0 once past its expiration ledger
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_allowance_expires() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let owner = Address::generate(&env);
+    let spender = Address::generate(&env);
+    let expiration_ledger = env.ledger().sequence() + 5;
+
+    client.approve(&owner, &spender, &50_0000000_i128, &expiration_ledger);
+    assert_eq!(client.allowance(&owner, &spender), 50_0000000_i128);
+
+    env.ledger().with_mut(|li| li.sequence_number = expiration_ledger + 1);
+
+    assert_eq!(client.allowance(&owner, &spender), 0_i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  17. Emergency Pause (issue #83)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -326,7 +449,7 @@ fn test_pause_rejects_non_admin() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "Error(Contract, #9)")]
 fn test_paused_rejects_mint() {
     let env = Env::default();
     env.mock_all_auths();
@@ -343,7 +466,7 @@ fn test_paused_rejects_mint() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "Error(Contract, #9)")]
 fn test_paused_rejects_transfer() {
     let env = Env::default();
     env.mock_all_auths();
@@ -361,7 +484,7 @@ fn test_paused_rejects_transfer() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "Error(Contract, #9)")]
 fn test_paused_rejects_burn() {
     let env = Env::default();
     env.mock_all_auths();

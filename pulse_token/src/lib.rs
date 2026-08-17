@@ -14,7 +14,9 @@ pub enum TokenError {
     InsufficientBalance = 4,
     InvalidAmount = 5,
     NotAdmin = 6,
-    ContractPaused = 7,
+    InsufficientAllowance = 7,
+    InvalidExpirationLedger = 8,
+    ContractPaused = 9,
 }
 
 #[contracttype]
@@ -27,7 +29,15 @@ pub enum DataKey {
     Name,
     Symbol,
     Decimals,
+    Allowance(Address, Address),
     Paused,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub expiration_ledger: u32,
 }
 
 #[contract]

@@ -918,7 +918,11 @@ impl PredictionMarketContract {
             .get(&DataKey::RateWindow)
             .unwrap_or((now, 0));
 
-        let (new_ws, new_cnt) = if now - ws < 3600 {
+        // A timestamp regression must remain in the existing window. Using
+        // checked subtraction prevents underflow from resetting the limit and
+        // allowing an extra burst of market creations.
+        let elapsed = now.checked_sub(ws).unwrap_or(0);
+        let (new_ws, new_cnt) = if elapsed < 3600 {
             if cnt >= MAX_MARKETS_PER_HOUR {
                 return Err(MarketError::RateLimitExceeded);
             }

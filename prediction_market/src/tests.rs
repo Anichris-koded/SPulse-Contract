@@ -124,6 +124,20 @@ fn advance_time(env: &Env, secs: u64) {
     });
 }
 
+fn rewind_time(env: &Env, secs: u64) {
+    let current = env.ledger().timestamp();
+    env.ledger().set(LedgerInfo {
+        timestamp: current - secs,
+        protocol_version: 26,
+        sequence_number: env.ledger().sequence() + 1,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 100,
+        min_persistent_entry_ttl: 100,
+        max_entry_ttl: 10_000_000,
+    });
+}
+
 // ── 1. Initialize ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -742,6 +756,31 @@ fn test_market_creation_rate_limit_resets_after_window() {
         &7200_u64,
     );
     assert_eq!(id, 11);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_market_creation_rate_limit_rejects_timestamp_regression() {
+    let t = setup();
+    for i in 0..10u32 {
+        let _ = t.client.create_market(
+            &t.admin,
+            &String::from_str(&t.env, "Market"),
+            &String::from_str(&t.env, "https://x.png"),
+            &Category::Crypto,
+            &(3600_u64 + i as u64),
+        );
+    }
+
+    // Rewinding the ledger must not reset the active rate-limit window.
+    rewind_time(&t.env, 1);
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Over limit after rewind"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Sports,
+        &7200_u64,
+    );
 }
 
 // ── 33. Double initialization rejected ───────────────────────────────────────

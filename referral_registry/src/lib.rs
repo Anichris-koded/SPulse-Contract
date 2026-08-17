@@ -19,6 +19,8 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    // Issue #99: the address given as `referrer` has never registered.
+    ReferrerNotRegistered = 7,
 }
 
 #[contracttype]
@@ -123,6 +125,14 @@ impl ReferralRegistryContract {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
             }
+            // Issue #99: a referral relationship may only point at a registered
+            // participant. Without this, anyone could name an arbitrary
+            // (attacker-controlled) address as their referrer and have it
+            // receive referral fees and accrue ReferralCount/ReferralEarnings
+            // without ever registering.
+            if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                return Err(ReferralError::ReferrerNotRegistered);
+            }
         }
         // Lever A: write ONE packed Profile entry (display_name + referrer)
         // instead of the three legacy keys (Registered + DisplayName + Referrer).
@@ -152,14 +162,34 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
+        // The leaderboard API renamed reward_bonus -> add_bonus_pts (which
+        // enforces caller == ReferralContract and no longer takes a token
+        // amount); keep the welcome-bonus points call in sync. The 1 PULSE
+        // welcome bonus is minted directly here — the registry is the
+        // authorized minter for this wiring.
         let _: Val = env.invoke_contract(
             &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
+            &Symbol::new(&env, "add_bonus_pts"),
             vec![
                 &env,
-                this.into_val(&env),
-                user.into_val(&env),
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
                 WELCOME_BONUS_POINTS.into_val(&env),
+            ],
+        );
+        let token_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenContract)
+            .unwrap();
+        // PULSE is a custom token contract; mint via its exported `mint` ABI.
+        let _: Val = env.invoke_contract(
+            &token_contract,
+            &Symbol::new(&env, "mint"),
+            vec![
+                &env,
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
                 WELCOME_BONUS_TOKENS.into_val(&env),
             ],
         );
@@ -178,6 +208,28 @@ impl ReferralRegistryContract {
         let referrer: Option<Address> = Self::load_profile(&env, &user).and_then(|p| p.referrer);
         match referrer {
             Some(ref_addr) => {
+                // Issue #99 defense-in-depth: even if a referral relationship
+                // exists in storage (e.g. written by pre-validation legacy code
+                // or malformed state), never pay out to — or accrue counters
+                // for — an address that is not a registered participant.
+                // The fee is refunded to the caller and we report "no referral",
+                // so the market keeps it in AccumulatedFees.
+                if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                    if referral_fee > 0 {
+                        let xlm_sac: Address = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::XlmSacContract)
+                            .unwrap();
+                        token::Client::new(&env, &xlm_sac).transfer(
+                            &env.current_contract_address(),
+                            &caller,
+                            &referral_fee,
+                        );
+                    }
+                    return Ok(false);
+                }
+
                 let xlm_sac: Address = env
                     .storage()
                     .instance()

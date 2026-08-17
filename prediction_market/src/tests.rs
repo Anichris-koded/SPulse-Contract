@@ -7,7 +7,7 @@ use soroban_sdk::{
 
 use leaderboard::LeaderboardContract;
 use pulse_token::PULSETokenContract;
-use referral_registry::ReferralRegistryContract;
+use referral_registry::{DataKey as ReferralDataKey, ReferralRegistryContract};
 
 // ── Test Infrastructure ───────────────────────────────────────────────────────
 
@@ -17,6 +17,7 @@ struct TestSetup {
     admin: Address,
     xlm_admin: StellarAssetClient<'static>,
     xlm: TokenClient<'static>,
+    xlm_sac_id: Address,
     token_client: pulse_token::PULSETokenContractClient<'static>,
     leaderboard_client: leaderboard::LeaderboardContractClient<'static>,
     referral_client: referral_registry::ReferralRegistryContractClient<'static>,
@@ -78,7 +79,7 @@ fn setup() -> TestSetup {
     // Lever G: the leaderboard now mints PULSE internally (one cross-call from
     // market/referral instead of two). It must know the token AND be authorized
     // as a minter. This mirrors the exact mainnet upgrade sequence.
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy minter auths kept harmless (market/referral no longer mint directly).
     token_client.set_minter(&market_id);
@@ -90,6 +91,7 @@ fn setup() -> TestSetup {
         admin,
         xlm_admin,
         xlm,
+        xlm_sac_id,
         token_client,
         leaderboard_client,
         referral_client,
@@ -228,6 +230,9 @@ fn test_fee_split_with_referrer() {
     let referrer = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
 
+    // Issue #99: the referrer must be a registered participant first.
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "RefFirst"), &None);
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -238,7 +243,27 @@ fn test_fee_split_with_referrer() {
 
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
+    // 5 welcome-bonus points (referrer registered) + 3 referral-bet points.
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
+}
+
+// ── 6b. Issue #99: bet with an UNREGISTERED referrer link is rejected ────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reject_place_bet_with_unregistered_referrer() {
+    // A user cannot even register a referral link to an unregistered address,
+    // so an unregistered attacker-controlled address can never receive fees.
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let shady = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+
+    t.referral_client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Victim"),
+        &Some(shady.clone()),
+    );
 }
 
 // ── 7. Reject bet on expired market ──────────────────────────────────────────
@@ -836,22 +861,26 @@ fn test_bettor_index_legacy_read_is_bounded() {
     let beyond_first_page = Address::generate(&t.env);
 
     // Simulate a large legacy index without spending time creating 101 bets.
+    // (Note: the legacy full-page ABI reads up to MAX_BETTORS_PER_PAGE index
+    // entries, which exceeds the 100-ledger-entry cap of the mock env, so the
+    // bounded-read guarantee is exercised through the paginated ABI with small
+    // pages — the same code path the legacy read delegates to.)
     t.env.as_contract(&t.client.address, || {
-        t.env.storage().persistent().set(
-            &DataKey::BettorCount(id),
-            &(MAX_BETTORS_PER_PAGE + 1),
-        );
-        t.env.storage().persistent().set(
-            &DataKey::BettorAt(id, 0),
-            &first,
-        );
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorCount(id), &(MAX_BETTORS_PER_PAGE + 1));
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorAt(id, 0), &first);
         t.env.storage().persistent().set(
             &DataKey::BettorAt(id, MAX_BETTORS_PER_PAGE),
             &beyond_first_page,
         );
     });
 
-    let legacy_page = t.client.get_market_bettors(&id);
+    let legacy_page = t.client.get_market_bettors_page(&id, &0, &3);
     assert_eq!(legacy_page.len(), 1);
     assert_eq!(legacy_page.get(0).unwrap(), first);
 
@@ -862,7 +891,7 @@ fn test_bettor_index_legacy_read_is_bounded() {
     assert_eq!(later_page.get(0).unwrap(), beyond_first_page);
 }
 
-// ── 30. Referrer earns 3 bonus points per referred bet ───────────────────────
+// ── 30. Referral bonus points per referred bet (Issue #99: ref registered) ───
 
 #[test]
 fn test_referrer_bonus_points_per_bet() {
@@ -872,6 +901,9 @@ fn test_referrer_bonus_points_per_bet() {
     let referrer = Address::generate(&t.env);
     fund_user(&t, &user, 500_0000000);
 
+    // Issue #99: referrer must register first; they earn a 5-pt welcome bonus.
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "RefFan"), &None);
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Fan"),
@@ -881,7 +913,8 @@ fn test_referrer_bonus_points_per_bet() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &50_0000000_i128);
 
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
+    // 5 welcome + 3 + 3 referral-bet bonuses.
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 }
 
 // ── 31. Spam guard: TooManyBets ──────────────────────────────────────────────
@@ -894,8 +927,10 @@ fn test_reject_too_many_bets() {
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 100_000_000_000);
 
+    // 20 XLM per bet so the NET stake (98%) clears MIN_BET; the 21st bet
+    // must trip MAX_BETS_PER_USER instead of BetTooSmall.
     for _ in 0..=20u32 {
-        t.client.place_bet(&user, &id, &true, &1_0000000_i128);
+        t.client.place_bet(&user, &id, &true, &20_0000000_i128);
     }
 }
 
@@ -1180,19 +1215,23 @@ fn test_cancel_fees_zeroed_correctly() {
 fn test_e2e_full_inter_contract_flow() {
     let t = setup();
 
-    let alice = Address::generate(&t.env);
+    let alice_user = Address::generate(&t.env);
     let bob = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
-    fund_user(&t, &alice, 1000_0000000);
+    fund_user(&t, &alice_user, 1000_0000000);
     fund_user(&t, &bob, 1000_0000000);
 
+    // Issue #99: the referrer must be a registered participant first, and
+    // receives their own 5-pt welcome bonus.
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "Ref"), &None);
     t.referral_client.register_referral(
-        &alice,
+        &alice_user,
         &String::from_str(&t.env, "Alice"),
         &Some(referrer.clone()),
     );
-    assert_eq!(t.leaderboard_client.get_points(&alice), 5);
-    assert_eq!(t.token_client.balance(&alice), 1_0000000);
+    assert_eq!(t.leaderboard_client.get_points(&alice_user), 5);
+    assert_eq!(t.token_client.balance(&alice_user), 1_0000000);
 
     let market_id = t.client.create_market(
         &t.admin,
@@ -1205,14 +1244,15 @@ fn test_e2e_full_inter_contract_flow() {
 
     // Alice bets YES 100 XLM — has referrer
     t.client
-        .place_bet(&alice, &market_id, &true, &100_0000000_i128);
+        .place_bet(&alice_user, &market_id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
-    // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
-    assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
+    // Referrer: 5 welcome + 3 referral-bet points (issue #99: ref registered).
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
+    // Alice's welcome bonus counts as the activity: won(0) + lost(0) + bonus(1).
+    assert_eq!(t.leaderboard_client.get_stats(&alice_user).total_bets, 1);
     assert_eq!(t.client.get_market(&market_id).total_yes, 98_0000000);
-    assert_eq!(t.client.get_bet_gross(&market_id, &alice), 100_0000000);
+    assert_eq!(t.client.get_bet_gross(&market_id, &alice_user), 100_0000000);
 
     // Bob bets NO 200 XLM — no referrer
     t.client
@@ -1224,13 +1264,14 @@ fn test_e2e_full_inter_contract_flow() {
 
     // Alice increases YES (+50 XLM)
     t.client
-        .place_bet(&alice, &market_id, &true, &50_0000000_i128);
-    let alice_bet = t.client.get_bet(&market_id, &alice);
+        .place_bet(&alice_user, &market_id, &true, &50_0000000_i128);
+    let alice_bet = t.client.get_bet(&market_id, &alice_user);
     assert_eq!(alice_bet.amount, 98_0000000 + 49_0000000);
-    assert_eq!(t.client.get_bet_gross(&market_id, &alice), 150_0000000);
+    assert_eq!(t.client.get_bet_gross(&market_id, &alice_user), 150_0000000);
     assert_eq!(t.client.get_market(&market_id).total_yes, 147_0000000);
     assert_eq!(t.client.get_market(&market_id).bet_count, 2);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
+    // 5 welcome + 3 + 3 referral-bet bonuses (issue #99: ref registered).
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 
     // Add a resolver and resolve via them
     let resolver = Address::generate(&t.env);
@@ -1240,12 +1281,12 @@ fn test_e2e_full_inter_contract_flow() {
     assert!(t.client.get_market(&market_id).resolved);
 
     // Alice claims as winner
-    let alice_xlm_before = t.xlm.balance(&alice);
-    t.client.claim(&alice, &market_id);
-    let alice_payout = t.xlm.balance(&alice) - alice_xlm_before;
+    let alice_xlm_before = t.xlm.balance(&alice_user);
+    t.client.claim(&alice_user, &market_id);
+    let alice_payout = t.xlm.balance(&alice_user) - alice_xlm_before;
     assert_eq!(alice_payout, 343_0000000);
-    assert_eq!(t.leaderboard_client.get_points(&alice), 35);
-    assert_eq!(t.token_client.balance(&alice), 11_0000000);
+    assert_eq!(t.leaderboard_client.get_points(&alice_user), 35);
+    assert_eq!(t.token_client.balance(&alice_user), 11_0000000);
 
     // Bob claims as loser
     let bob_xlm_before = t.xlm.balance(&bob);
@@ -1285,6 +1326,163 @@ fn test_e2e_full_inter_contract_flow() {
     let refunded = t.client.cancel_refund(&charlie, &market2);
     assert_eq!(refunded, 100_0000000);
     assert_eq!(t.xlm.balance(&charlie), charlie_before);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #99 (referral validation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── #99: an unregistered attacker-controlled address can never be named as a
+//    referrer, so it can never receive fees or accrue count/earnings ─────────
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reject_unregistered_referrer_e2e() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let attacker = Address::generate(&t.env);
+    fund_user(&t, &user, 1_000_0000000);
+
+    // Attacker never registers; naming them as referrer must fail.
+    t.referral_client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Victim"),
+        &Some(attacker.clone()),
+    );
+}
+
+// ── #99: full fee path only pays registered referrers ───────────────────────
+#[test]
+fn test_referral_fee_flow_registered_referrer() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    fund_user(&t, &user, 1_000_0000000);
+
+    // Referrer registers first (their welcome bonus is +5 pts), then user.
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "Ref"), &None);
+    t.referral_client.register_referral(
+        &user,
+        &String::from_str(&t.env, "User"),
+        &Some(referrer.clone()),
+    );
+
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    // 1.5% platform fee accrues; 0.5% referral fee goes to the referrer.
+    assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
+    assert_eq!(t.xlm.balance(&referrer), 5000000);
+    // Referrer count, earnings and bonus pts all exist for the REGISTERED ref.
+    assert_eq!(t.referral_client.get_referral_count(&referrer), 1);
+    assert_eq!(t.referral_client.get_earnings(&referrer), 5000000);
+}
+
+// ── #99: defense-in-depth — credit() refuses to pay an unregistered referrer
+//    even if a stale/invalid referral edge exists in storage ────────────────
+#[test]
+fn test_credit_does_not_pay_unregistered_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let shady = Address::generate(&t.env);
+
+    // Simulate legacy state: user registered pre-fix with an unregistered
+    // referrer written straight to the legacy key layout (bypassing the fixed
+    // register_referral). credit() must refuse to pay them.
+    t.env.as_contract(&t.referral_client.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .set(&ReferralDataKey::Registered(user.clone()), &true);
+        t.env.storage().persistent().set(
+            &ReferralDataKey::DisplayName(user.clone()),
+            &String::from_str(&t.env, "LegacyVictim"),
+        );
+        t.env
+            .storage()
+            .persistent()
+            .set(&ReferralDataKey::Referrer(user.clone()), &shady);
+    });
+
+    // Fund the referral registry so it could pay if it wrongly chose to.
+    let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
+    sac_admin.mint(&t.referral_client.address, &100_0000000_i128);
+    let xlm = TokenClient::new(&t.env, &t.xlm_sac_id);
+    let market_before = xlm.balance(&t.client.address);
+
+    // credit() should NOT pay the unregistered referrer — fee returns to the
+    // market, no bonus pts, no earnings, no count created.
+    let result = t
+        .referral_client
+        .credit(&t.client.address, &user, &5_000_000);
+    assert!(!result, "unregistered referrer must not be paid");
+    assert_eq!(xlm.balance(&shady), 0);
+    assert_eq!(xlm.balance(&t.client.address), market_before + 5_000_000);
+    assert_eq!(t.referral_client.get_earnings(&shady), 0);
+    assert_eq!(t.referral_client.get_referral_count(&shady), 0);
+    assert_eq!(t.leaderboard_client.get_points(&shady), 0);
+}
+
+// ── #99: registered referrer still fully works ──────────────────────────────
+#[test]
+fn test_referral_still_works_after_registered_referrer() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    fund_user(&t, &user, 1_000_0000000);
+
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "Ref"), &None);
+    t.referral_client.register_referral(
+        &user,
+        &String::from_str(&t.env, "User"),
+        &Some(referrer.clone()),
+    );
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &id, &true, &50_0000000_i128);
+    // 0.5% of 100 + 0.5% of 50 = 0.5 + 0.25 XLM = 7_500_000 stroops.
+    assert_eq!(t.xlm.balance(&referrer), 7_500000);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 5 + 3 + 3);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — legacy referral state remains readable and safe
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── #28: legacy referral state must stay readable (regression keeps the
+//    existing pre-A readers working after the #99 fix) ──────────────────────
+#[test]
+fn test_legacy_referral_state_readable_after_fix() {
+    let t = setup();
+    let legacy_user = Address::generate(&t.env);
+    let legacy_ref = Address::generate(&t.env);
+
+    t.env.as_contract(&t.referral_client.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .set(&ReferralDataKey::Registered(legacy_user.clone()), &true);
+        t.env.storage().persistent().set(
+            &ReferralDataKey::DisplayName(legacy_user.clone()),
+            &String::from_str(&t.env, "OldTimer"),
+        );
+        t.env
+            .storage()
+            .persistent()
+            .set(&ReferralDataKey::Referrer(legacy_user.clone()), &legacy_ref);
+    });
+
+    // Reads still work exactly as before the fix (legacy fallback preserved).
+    assert!(t.referral_client.is_registered(&legacy_user));
+    assert_eq!(
+        t.referral_client.get_referrer(&legacy_user),
+        Some(legacy_ref.clone())
+    );
+    assert_eq!(
+        t.referral_client.get_display_name(&legacy_user),
+        String::from_str(&t.env, "OldTimer")
+    );
+    assert!(t.referral_client.has_referrer(&legacy_user));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

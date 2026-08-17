@@ -708,7 +708,6 @@ impl PredictionMarketContract {
         }
 
         let is_winner = entry.is_yes == market.outcome;
-        let total_pool = market.total_yes + market.total_no;
         let winning_side = if market.outcome {
             market.total_yes
         } else {
@@ -756,18 +755,35 @@ impl PredictionMarketContract {
             (LOSE_POINTS, LOSE_TOKENS)
         };
 
+        // The leaderboard API was renamed reward() -> add_pts() (points only,
+        // no token amount), and add_pts no longer mints PULSE internally. The
+        // market mints the PULSE reward directly — it is the authorized minter
+        // for this legacy wiring, keeping the original mint semantics intact.
         let _: Val = env.invoke_contract(
             &cfg.leaderboard,
-            &Symbol::new(&env, "reward"),
+            &Symbol::new(&env, "add_pts"),
             vec![
                 &env,
                 this.clone().into_val(&env),
                 user.clone().into_val(&env),
                 points.into_val(&env),
-                tokens.into_val(&env),
                 real_win.into_val(&env),
             ],
         );
+        if tokens > 0 {
+            // PULSE is a custom token contract (not a token::Client-compatible
+            // SAC interface): mint directly via its exported `mint` ABI.
+            let _: Val = env.invoke_contract(
+                &cfg.token,
+                &Symbol::new(&env, "mint"),
+                vec![
+                    &env,
+                    this.clone().into_val(&env),
+                    user.clone().into_val(&env),
+                    tokens.into_val(&env),
+                ],
+            );
+        }
 
         Ok(())
     }

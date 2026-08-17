@@ -53,7 +53,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);
@@ -78,7 +78,7 @@ fn setup() -> TestSetup {
     }
 }
 
-// ── 1. Register with display name + custom referrer ───────────────────────────
+// ── 1. Register with display name + custom referrer (who must be registered) ──
 
 #[test]
 fn test_register_with_referrer() {
@@ -86,6 +86,9 @@ fn test_register_with_referrer() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    // Issue #99: the referrer must be a registered participant first.
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "RefKing"), &None);
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "CryptoKing"),
@@ -96,6 +99,43 @@ fn test_register_with_referrer() {
     assert_eq!(t.client.get_referrer(&user), Some(referrer.clone()));
     assert!(t.client.has_referrer(&user));
     assert_eq!(t.client.get_referral_count(&referrer), 1);
+}
+
+// ── 1b. Issue #99: unregistered referrer is rejected ──────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reject_unregistered_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let shady = Address::generate(&t.env); // never registers
+
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Victim"),
+        &Some(shady.clone()),
+    );
+}
+
+// ── 1c. Issue #99: unregistered referrer gets NO count/state created ─────────
+
+#[test]
+fn test_unregistered_referrer_no_state_created() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let shady = Address::generate(&t.env);
+
+    // Registration with the unregistered referrer is race-rejected; no Profile
+    // for the user, no ReferralCount for the shady address.
+    let res = t.client.try_register_referral(
+        &user,
+        &String::from_str(&t.env, "Victim"),
+        &Some(shady.clone()),
+    );
+    assert!(res.is_err());
+    assert!(!t.client.is_registered(&user));
+    assert_eq!(t.client.get_referral_count(&shady), 0);
+    assert_eq!(t.client.get_earnings(&shady), 0);
 }
 
 // ── 2. Register with display name + no referrer ──────────────────────────────
@@ -114,7 +154,8 @@ fn test_register_no_referrer() {
     assert!(!t.client.has_referrer(&user));
 }
 
-// ── 3. Welcome bonus: 5 pts + 1 PULSE on registration ─────────────────────
+// ── 3. Welcome bonus: 5 pts + 1 PULSE on registration - note: the referrer
+//    also gets their own welcome bonus when they register first (issue #99) ──
 
 #[test]
 fn test_welcome_bonus() {
@@ -201,6 +242,10 @@ fn test_credit_with_referrer() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    // Issue #99: the referrer must be registered before the relationship
+    // may be created.
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "RefKing"), &None);
     // Register user with referrer
     t.client.register_referral(
         &user,
@@ -222,9 +267,9 @@ fn test_credit_with_referrer() {
     let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
     assert_eq!(xlm_client.balance(&referrer), referral_fee);
 
-    // Referrer got 3 leaderboard bonus points
+    // Referrer got 3 leaderboard bonus points (5 welcome + 3 referred-bet)
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 3);
+    assert_eq!(lb_client.get_points(&referrer), 8);
 
     // Earnings tracked
     assert_eq!(t.client.get_earnings(&referrer), referral_fee);
@@ -286,6 +331,10 @@ fn test_earnings_accumulation() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    // Issue #99: the referrer must be registered before the relationship
+    // may be created.
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "RefKing"), &None);
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -312,6 +361,10 @@ fn test_referrer_bonus_points_accumulate() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    // Issue #99: the referrer must be registered before the relationship
+    // may be created.
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "RefKing"), &None);
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -328,7 +381,7 @@ fn test_referrer_bonus_points_accumulate() {
     t.client.credit(&t.market, &user, &5_000_000_i128);
 
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 9); // 3 × 3 pts
+    assert_eq!(lb_client.get_points(&referrer), 14); // 5 welcome + 3 × 3 pts
 }
 
 // ── 11. Referral count tracking ──────────────────────────────────────────────
@@ -337,6 +390,10 @@ fn test_referrer_bonus_points_accumulate() {
 fn test_referral_count_tracking() {
     let t = setup();
     let referrer = Address::generate(&t.env);
+
+    // Issue #99: the referrer must be registered before any referrals count.
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "RefKing"), &None);
 
     // 3 users register with the same referrer
     for _ in 0..3 {

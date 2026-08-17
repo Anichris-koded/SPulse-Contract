@@ -1,12 +1,10 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal,
-    Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, vec, Address, Env, Vec,
 };
 
 const MAX_TOP_PLAYERS: u32 = 50;
-const MAX_PAGE_SIZE: u32 = 20;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 

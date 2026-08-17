@@ -637,7 +637,8 @@ impl PredictionMarketContract {
         }
 
         let gross = entry.gross;
-        entry.gross = 0; // idempotency guard
+        entry.gross = 0;
+        entry.net = 0;
         env.storage().persistent().set(&bet_key, &entry);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();

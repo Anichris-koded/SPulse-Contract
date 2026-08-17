@@ -76,6 +76,14 @@ pub enum MarketError {
     WithdrawalRequestExists = 23,
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
+    /// A dependency (referral_registry or leaderboard) reported an
+    /// interface_version this contract wasn't built against (issue #84).
+    /// Note: a matching version number alone does not prove the callee's
+    /// actual function shape still matches, it only proves the callee's
+    /// author intended it to. The guarantee only holds if every breaking
+    /// ABI change (renamed function, changed argument order/count/type,
+    /// changed return type) always increments INTERFACE_VERSION in the same
+    /// commit. See EXPECTED_REFERRAL_INTERFACE_VERSION / EXPECTED_LEADERBOARD_INTERFACE_VERSION.
     IncompatibleInterface = 26,
 }
 

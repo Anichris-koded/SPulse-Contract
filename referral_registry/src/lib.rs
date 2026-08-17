@@ -30,6 +30,13 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    /// leaderboard reported an interface_version this contract wasn't built
+    /// against (issue #84). Note: a matching version number alone does not
+    /// prove the callee's actual function shape still matches, it only
+    /// proves the callee's author intended it to. The guarantee only holds
+    /// if every breaking ABI change (renamed function, changed argument
+    /// order/count/type, changed return type) always increments
+    /// INTERFACE_VERSION in the same commit. See EXPECTED_LEADERBOARD_INTERFACE_VERSION.
     IncompatibleInterface = 7,
 }
 

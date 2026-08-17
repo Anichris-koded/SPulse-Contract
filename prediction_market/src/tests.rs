@@ -1523,3 +1523,49 @@ fn test_claim_rejects_incompatible_leaderboard() {
 
     t.client.claim(&user, &id);
 }
+
+// Stands in for a leaderboard deployment that reports the version this
+// prediction_market build expects, but is missing the actual reward()
+// function it's about to call. Proves the known limitation of the version
+// check: a matching u32 alone does not prove ABI compatibility, only that
+// the callee's author intended it to be compatible. If a breaking change to
+// reward()'s signature ever ships without bumping INTERFACE_VERSION, this is
+// exactly the failure mode that results, just past the version check instead
+// of at it.
+#[contract]
+struct MockLeaderboardMissingReward;
+
+#[contractimpl]
+impl MockLeaderboardMissingReward {
+    pub fn interface_version(_env: Env) -> u32 {
+        1
+    }
+    // No reward() here on purpose.
+}
+
+#[test]
+#[should_panic]
+fn test_matching_version_does_not_guarantee_claim_succeeds() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let fake_leaderboard = t.env.register(MockLeaderboardMissingReward, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &fake_leaderboard,
+        &cfg.xlm_sac,
+    );
+
+    // require_compatible_leaderboard passes (version 1 == version 1), then
+    // claim() panics inside the real reward() invoke_contract call because
+    // the function doesn't exist on the callee.
+    t.client.claim(&user, &id);
+}

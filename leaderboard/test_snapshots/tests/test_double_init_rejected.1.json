@@ -86,6 +86,30 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "MinPoints"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "MinSlot"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "ReferralContract"
                           }
                         ]
@@ -113,7 +137,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       },
       {
         "entry": {
@@ -147,7 +171,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       }
     ]
   },

@@ -16,6 +16,11 @@ const TTL_HIGH: u32 = 6_307_200;
 // fails with a clear error instead of a silently broken cross-contract call.
 pub const INTERFACE_VERSION: u32 = 1;
 
+// Issue #84: the version of pulse_token's ABI that reward()/reward_bonus()
+// were built against. Bump this whenever a breaking change is made to the
+// mint() signature/argument order/return type that this contract relies on.
+const EXPECTED_TOKEN_INTERFACE_VERSION: u32 = 1;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -25,6 +30,17 @@ pub enum LeaderboardError {
     UnauthorizedCaller = 3,
     InvalidPoints = 4,
     NotAdmin = 5,
+    /// pulse_token reported an interface_version this contract wasn't built
+    /// against (issue #84). Note: a matching version number alone does not
+    /// prove the callee's actual function shape still matches; it only
+    /// proves the callee's author intended it to. The guarantee only holds
+    /// if every breaking ABI change (renamed function, changed argument
+    /// order/count/type, changed return type) always increments
+    /// INTERFACE_VERSION in the same commit. See EXPECTED_TOKEN_INTERFACE_VERSION.
+    IncompatibleInterface = 6,
+    /// reward()/reward_bonus() called with tokens > 0 but no TokenContract
+    /// has been set via set_token_contract.
+    TokenNotConfigured = 7,
 }
 
 // OPT: was 4 separate keys per user (Points, TotalBets, WonBets, LostBets).
@@ -205,6 +221,107 @@ impl LeaderboardContract {
         Ok(())
     }
 
+    /// Lever G: like add_pts, but also mints `tokens` PULSE to `user` in the
+    /// same call — one cross-call from the market instead of add_pts + a
+    /// separate mint. Only the market contract may call this (protects
+    /// minting, same as add_pts protects points). `tokens == 0` skips the
+    /// mint entirely so callers that only care about points (and tests) don't
+    /// need a token wired via set_token_contract.
+    pub fn reward(
+        env: Env,
+        caller: Address,
+        user: Address,
+        pts: u64,
+        tokens: i128,
+        is_won: bool,
+    ) -> Result<(), LeaderboardError> {
+        let market: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != market {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        caller.require_auth();
+
+        let mut stats: PlayerStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or(PlayerStats {
+                points: 0,
+                total_bets: 0,
+                won_bets: 0,
+                lost_bets: 0,
+            });
+
+        stats.points += pts;
+        stats.total_bets += 1;
+        if is_won {
+            stats.won_bets += 1;
+        } else {
+            stats.lost_bets += 1;
+        }
+
+        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
+        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+
+        Self::update_top_players(&env, user.clone(), stats.points);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+
+        if tokens > 0 {
+            Self::mint_reward(&env, &user, tokens)?;
+        }
+        Ok(())
+    }
+
+    /// Lever G: like add_bonus_pts, but also mints `tokens` PULSE to `user`
+    /// in the same call. Only the referral_registry contract may call this.
+    /// `tokens == 0` skips the mint (used by the welcome-bonus path today).
+    pub fn reward_bonus(
+        env: Env,
+        caller: Address,
+        user: Address,
+        pts: u64,
+        tokens: i128,
+    ) -> Result<(), LeaderboardError> {
+        let referral: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferralContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != referral {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        caller.require_auth();
+
+        let mut stats: PlayerStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or(PlayerStats {
+                points: 0,
+                total_bets: 0,
+                won_bets: 0,
+                lost_bets: 0,
+            });
+
+        stats.points += pts;
+        stats.total_bets += 1;
+
+        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
+        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+
+        Self::update_top_players(&env, user.clone(), stats.points);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+
+        if tokens > 0 {
+            Self::mint_reward(&env, &user, tokens)?;
+        }
+        Ok(())
+    }
+
     pub fn get_points(env: Env, user: Address) -> u64 {
         env.storage()
             .persistent()
@@ -253,6 +370,17 @@ impl LeaderboardContract {
             .unwrap_or(0)
     }
 
+    /// 1-based rank in the top list (1 = highest points), or 0 if the user
+    /// isn't currently in the top MAX_TOP_PLAYERS. O(1) via the TopPlayerSlot
+    /// reverse lookup instead of scanning get_top_players.
+    pub fn get_rank(env: Env, user: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::TopPlayerSlot(user))
+            .map(|slot| slot + 1)
+            .unwrap_or(0)
+    }
+
     pub fn get_min_points(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -265,6 +393,45 @@ impl LeaderboardContract {
             .instance()
             .get(&DataKey::MinSlot)
             .unwrap_or(0)
+    }
+
+    // ── Internal: Lever G minting ────────────────────────────────────────────
+
+    // Issue #84: check pulse_token's reported ABI version before invoking
+    // mint(), so an incompatible token upgrade fails with a clear error
+    // instead of an opaque invoke_contract failure or, worse, a call that
+    // still type-checks against a changed signature and silently misbehaves.
+    // A matching version number alone does not prove the callee's shape is
+    // still compatible; see IncompatibleInterface's doc comment.
+    fn require_compatible_token(env: &Env, token: &Address) -> Result<(), LeaderboardError> {
+        let version: u32 =
+            env.invoke_contract(token, &Symbol::new(env, "interface_version"), vec![env]);
+        if version != EXPECTED_TOKEN_INTERFACE_VERSION {
+            return Err(LeaderboardError::IncompatibleInterface);
+        }
+        Ok(())
+    }
+
+    fn mint_reward(env: &Env, user: &Address, tokens: i128) -> Result<(), LeaderboardError> {
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenContract)
+            .ok_or(LeaderboardError::TokenNotConfigured)?;
+        Self::require_compatible_token(env, &token)?;
+
+        let this = env.current_contract_address();
+        let _: Val = env.invoke_contract(
+            &token,
+            &Symbol::new(env, "mint"),
+            vec![
+                env,
+                this.into_val(env),
+                user.into_val(env),
+                tokens.into_val(env),
+            ],
+        );
+        Ok(())
     }
 
     // ── Internal: maintain a persistent sorted top list ──────────────────────
@@ -418,5 +585,7 @@ impl LeaderboardContract {
     }
 }
 
+#[cfg(test)]
+mod tests;
 #[cfg(test)]
 mod ttl_tests;

@@ -93,14 +93,6 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "bonus_bets"
-                    },
-                    "val": {
-                      "u32": 0
-                    }
-                  },
-                  {
-                    "key": {
                       "symbol": "lost_bets"
                     },
                     "val": {
@@ -113,6 +105,14 @@
                     },
                     "val": {
                       "u64": "100"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_bets"
+                    },
+                    "val": {
+                      "u32": 1
                     }
                   },
                   {
@@ -200,7 +200,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6307200
+        "live_until": 4095
       },
       {
         "entry": {
@@ -250,7 +250,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "100"
+                        "u64": "0"
                       }
                     },
                     {
@@ -296,7 +296,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       },
       {
         "entry": {
@@ -350,7 +350,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       }
     ]
   },

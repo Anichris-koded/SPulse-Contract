@@ -1,6 +1,6 @@
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
+    testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
     Env, String,
 };
@@ -1378,4 +1378,81 @@ fn test_single_winner_gets_whole_net_pool() {
     // Whole pool (both nets) goes to the single winner.
     assert_eq!(t.xlm.balance(&winner) - before, total);
     assert_eq!(t.client.get_payout(&id, &winner), total);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #9 (persistent storage TTL)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn advance_ledgers(env: &Env, n: u32) {
+    let current_seq = env.ledger().sequence();
+    env.ledger().set(LedgerInfo {
+        timestamp: env.ledger().timestamp() + 1,
+        protocol_version: 26,
+        sequence_number: current_seq + n,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 100,
+        min_persistent_entry_ttl: 100,
+        max_entry_ttl: 10_000_000,
+    });
+}
+
+// ── #9: claims/refunds keep recoverable storage alive (TTL re-bump) ──────────
+#[test]
+fn test_claim_rebumps_ttl_entries() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    // Fast-forward deep into the TTL window (but not past it).
+    advance_ledgers(&t.env, 6_000_000);
+
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let before_bet = ttl(&bet_key);
+    let before_market = ttl(&market_key);
+
+    t.client.claim(&user, &id);
+
+    let after_bet = ttl(&bet_key);
+    let after_market = ttl(&market_key);
+    assert!(after_bet > before_bet);
+    assert!(after_market > before_market);
+}
+
+#[test]
+fn test_cancel_refund_rebumps_ttl_entries() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.cancel_market(&t.admin, &id);
+
+    advance_ledgers(&t.env, 6_000_000);
+
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let bet_before = ttl(&bet_key);
+    let market_before = ttl(&market_key);
+
+    t.client.cancel_refund(&user, &id);
+
+    assert!(ttl(&bet_key) > bet_before);
+    assert!(ttl(&market_key) > market_before);
 }

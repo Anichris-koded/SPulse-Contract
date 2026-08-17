@@ -662,6 +662,15 @@ impl PredictionMarketContract {
         let gross = entry.gross;
         entry.gross = 0; // idempotency guard
         env.storage().persistent().set(&bet_key, &entry);
+        // Read-time TTL refresh (issue #9): a refund must not be able to observe
+        // an expired bet/market record — keep both alive so a user who returns
+        // late to a cancelled market can still pull their refund.
+        env.storage()
+            .persistent()
+            .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         token::Client::new(&env, &cfg.xlm_sac).transfer(
@@ -712,6 +721,12 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
+        // Read-time TTL refresh (issue #9): a claim must not be able to observe
+        // an expired market/bet record — keep the market entry alive here too
+        // so late claims on a long-lived market keep working.
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         let this = env.current_contract_address();

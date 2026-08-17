@@ -19,6 +19,7 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    ContractPaused = 7,
 }
 
 #[contracttype]
@@ -42,6 +43,7 @@ pub enum DataKey {
     TokenContract,
     LeaderboardContract,
     XlmSacContract,
+    Paused,
 }
 
 // Lever A: packed registrant profile — one storage slot instead of three.
@@ -109,12 +111,37 @@ impl ReferralRegistryContract {
         Ok(())
     }
 
+    /// Halt registration and crediting in an emergency. Admin only. View
+    /// functions keep working so the frontend can still read state.
+    pub fn pause(env: Env, admin: Address) -> Result<(), ReferralError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Resume registration and crediting. Admin only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), ReferralError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     pub fn register_referral(
         env: Env,
         user: Address,
         display_name: String,
         referrer: Option<Address>,
     ) -> Result<(), ReferralError> {
+        Self::require_not_paused(&env)?;
         user.require_auth();
         if Self::is_registered(env.clone(), user.clone()) {
             return Err(ReferralError::AlreadyRegistered);
@@ -172,6 +199,7 @@ impl ReferralRegistryContract {
         user: Address,
         referral_fee: i128,
     ) -> Result<bool, ReferralError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_market_contract(&env, &caller)?;
         // Lever A: resolve referrer via packed Profile (new) or legacy key (old).
@@ -316,6 +344,13 @@ impl ReferralRegistryContract {
             .ok_or(ReferralError::NotInitialized)?;
         if *caller != admin {
             return Err(ReferralError::NotAdmin);
+        }
+        Ok(())
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ReferralError> {
+        if Self::is_paused(env.clone()) {
+            return Err(ReferralError::ContractPaused);
         }
         Ok(())
     }

@@ -831,6 +831,10 @@ fn test_bettor_index_enumeration() {
 #[test]
 fn test_bettor_index_legacy_read_is_bounded() {
     let t = setup();
+    // Simulating a 101-entry legacy index legitimately reads 100 slots in one
+    // call, which exceeds the default mainnet-like resource limits — this test
+    // proves read boundedness, not gas, so lift the limits like other suites.
+    t.env.cost_estimate().disable_resource_limits();
     let id = create_test_market(&t);
     let first = Address::generate(&t.env);
     let beyond_first_page = Address::generate(&t.env);
@@ -894,8 +898,10 @@ fn test_reject_too_many_bets() {
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 100_000_000_000);
 
+    // 1.1 XLM gross clears the net minimum (net = 1.078 XLM >= MIN_BET) so the
+    // 21st bet actually trips the TooManyBets guard instead of BetTooSmall.
     for _ in 0..=20u32 {
-        t.client.place_bet(&user, &id, &true, &1_0000000_i128);
+        t.client.place_bet(&user, &id, &true, &11_0000000_i128);
     }
 }
 

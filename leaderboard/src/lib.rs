@@ -87,6 +87,7 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::TopPlayerCount, &0_u32);
         env.storage().instance().set(&DataKey::MinPoints, &0_u64);
         env.storage().instance().set(&DataKey::MinSlot, &0_u32);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -101,6 +102,7 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::TokenContract, &token);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -144,6 +146,10 @@ impl LeaderboardContract {
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
         Self::update_top_players(&env, user, stats.points);
+        // Instance storage (TopPlayerCount, MinPoints, MinSlot, Admin, etc.)
+        // has its own TTL that is never bumped by persistent-key writes above —
+        // refresh it on every write so the leaderboard's cached min survives.
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -181,6 +187,7 @@ impl LeaderboardContract {
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
         Self::update_top_players(&env, user, stats.points);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -396,3 +403,6 @@ impl LeaderboardContract {
         }
     }
 }
+
+#[cfg(test)]
+mod ttl_tests;

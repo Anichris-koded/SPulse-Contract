@@ -283,6 +283,19 @@ fn test_reject_bet_below_minimum() {
     t.client.place_bet(&user, &id, &true, &5_000_000_i128);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_reject_gross_minimum_when_net_is_too_small() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+
+    // The gross minimum is not enough to produce the one-XLM net minimum
+    // after the two-percent fee.
+    t.client.place_bet(&user, &id, &true, &MIN_BET);
+}
+
 // ── 11. Increase existing position ───────────────────────────────────────────
 
 #[test]

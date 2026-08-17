@@ -7,7 +7,7 @@ use soroban_sdk::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MIN_BET: i128 = 10_000_000; // 1 XLM in stroops
+const MIN_BET: i128 = 10_000_000; // minimum net stake: 1 XLM in stroops
 
 const MAX_BETS_PER_USER: u32 = 20;
 const MAX_MARKETS_PER_HOUR: u32 = 10;
@@ -359,7 +359,8 @@ impl PredictionMarketContract {
     ) -> Result<(), MarketError> {
         user.require_auth();
 
-        if amount < MIN_BET {
+        let net = amount * NET_NUMERATOR / BPS_DENOM;
+        if net < MIN_BET {
             return Err(MarketError::BetTooSmall);
         }
 
@@ -395,7 +396,6 @@ impl PredictionMarketContract {
         let total_fee = amount * TOTAL_FEE_BPS / BPS_DENOM;
         let platform_fee = amount * PLATFORM_FEE_BPS / BPS_DENOM;
         let referral_fee = total_fee - platform_fee;
-        let net = amount * NET_NUMERATOR / BPS_DENOM;
 
         // OPT: one Config read instead of 4 separate instance reads
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();

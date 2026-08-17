@@ -11,6 +11,7 @@ const MIN_BET: i128 = 10_000_000; // 1 XLM in stroops
 
 const MAX_BETS_PER_USER: u32 = 20;
 const MAX_MARKETS_PER_HOUR: u32 = 10;
+const MAX_BETTORS_PER_PAGE: u32 = 100;
 
 // Fee constants — multiply before divide to avoid precision loss
 const TOTAL_FEE_BPS: i128 = 200;
@@ -793,15 +794,33 @@ impl PredictionMarketContract {
             .unwrap_or(0)
     }
 
+    /// Return the first bounded page of bettors for compatibility with the
+    /// original ABI. Call `get_market_bettors_page` for later pages.
     pub fn get_market_bettors(env: Env, market_id: u64) -> Result<Vec<Address>, MarketError> {
+        Self::get_market_bettors_page(env, market_id, 0, MAX_BETTORS_PER_PAGE)
+    }
+
+    /// Return at most `limit` bettors starting at the given index.
+    ///
+    /// The upper bound keeps each request's storage work predictable. The
+    /// `start` index maps directly to the append-only bettor index, so paging
+    /// does not scan or deserialize earlier entries.
+    pub fn get_market_bettors_page(
+        env: Env,
+        market_id: u64,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<Address>, MarketError> {
         Self::load_market(&env, market_id)?;
         let count: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::BettorCount(market_id))
             .unwrap_or(0);
+        let page_limit = limit.min(MAX_BETTORS_PER_PAGE);
+        let end = start.saturating_add(page_limit).min(count);
         let mut result: Vec<Address> = Vec::new(&env);
-        for i in 0..count {
+        for i in start..end {
             if let Some(addr) = env
                 .storage()
                 .persistent()

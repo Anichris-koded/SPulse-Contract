@@ -652,6 +652,49 @@ fn test_bettor_index_enumeration() {
     assert_eq!(bettors.get(0).unwrap(), alice);
     assert_eq!(bettors.get(1).unwrap(), bob);
     assert_eq!(bettors.get(2).unwrap(), charlie);
+
+    let first_page = t.client.get_market_bettors_page(&id, &0, &2);
+    assert_eq!(first_page.len(), 2);
+    assert_eq!(first_page.get(0).unwrap(), alice);
+    assert_eq!(first_page.get(1).unwrap(), bob);
+
+    let second_page = t.client.get_market_bettors_page(&id, &2, &2);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0).unwrap(), charlie);
+}
+
+#[test]
+fn test_bettor_index_legacy_read_is_bounded() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let first = Address::generate(&t.env);
+    let beyond_first_page = Address::generate(&t.env);
+
+    // Simulate a large legacy index without spending time creating 101 bets.
+    t.env.as_contract(&t.client.address, || {
+        t.env.storage().persistent().set(
+            &DataKey::BettorCount(id),
+            &(MAX_BETTORS_PER_PAGE + 1),
+        );
+        t.env.storage().persistent().set(
+            &DataKey::BettorAt(id, 0),
+            &first,
+        );
+        t.env.storage().persistent().set(
+            &DataKey::BettorAt(id, MAX_BETTORS_PER_PAGE),
+            &beyond_first_page,
+        );
+    });
+
+    let legacy_page = t.client.get_market_bettors(&id);
+    assert_eq!(legacy_page.len(), 1);
+    assert_eq!(legacy_page.get(0).unwrap(), first);
+
+    let later_page = t
+        .client
+        .get_market_bettors_page(&id, &MAX_BETTORS_PER_PAGE, &1);
+    assert_eq!(later_page.len(), 1);
+    assert_eq!(later_page.get(0).unwrap(), beyond_first_page);
 }
 
 // ── 30. Referrer earns 3 bonus points per referred bet ───────────────────────

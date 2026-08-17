@@ -291,3 +291,17 @@ fn test_total_supply_tracking() {
     assert_eq!(client.balance(&alice), 50_0000000_i128);
     assert_eq!(client.balance(&bob), 60_0000000_i128);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  12. Cross-contract interface versioning (issue #84)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_interface_version_reported() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    assert_eq!(client.interface_version(), 1);
+}

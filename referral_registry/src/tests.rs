@@ -1,5 +1,6 @@
 use super::*;
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::Address as _,
     token::{Client as TokenClient, StellarAssetClient},
     Env, String,
@@ -53,7 +54,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);
@@ -430,4 +431,107 @@ fn test_legacy_user_without_referrer() {
     assert!(s.client.is_registered(&legacy_user));
     assert_eq!(s.client.get_referrer(&legacy_user), None);
     assert!(!s.client.has_referrer(&legacy_user));
+}
+
+// ── Cross-contract interface versioning (issue #84) ───────────────────────────
+
+// A stand-in for a leaderboard deployment that was upgraded to an
+// incompatible ABI: it only implements interface_version(), reporting a
+// version this referral_registry build does not expect. Used to prove that
+// register_referral/credit refuse to call into it rather than failing deep
+// inside argument decoding (or, worse, silently misinterpreting arguments).
+#[contract]
+struct MockIncompatibleLeaderboard;
+
+#[contractimpl]
+impl MockIncompatibleLeaderboard {
+    pub fn interface_version(_env: Env) -> u32 {
+        99
+    }
+}
+
+fn setup_with_incompatible_leaderboard() -> TestSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+
+    let token_id = env.register(PULSETokenContract, ());
+    pulse_token::PULSETokenContractClient::new(&env, &token_id).initialize(
+        &admin,
+        &String::from_str(&env, "PULSE"),
+        &String::from_str(&env, "PLSE"),
+        &7u32,
+    );
+
+    let leaderboard_id = env.register(MockIncompatibleLeaderboard, ());
+
+    let referral_id = env.register(ReferralRegistryContract, ());
+    let referral_client = ReferralRegistryContractClient::new(&env, &referral_id);
+
+    let xlm_sac_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    referral_client.initialize(&admin, &market, &token_id, &leaderboard_id, &xlm_sac_id);
+
+    TestSetup {
+        env,
+        client: referral_client,
+        admin,
+        market,
+        token_id,
+        leaderboard_id,
+        xlm_sac_id,
+        referral_id,
+    }
+}
+
+#[test]
+fn test_interface_version_reported() {
+    let t = setup();
+    assert_eq!(t.client.interface_version(), 1);
+}
+
+#[test]
+fn test_register_referral_rejects_incompatible_leaderboard() {
+    let t = setup_with_incompatible_leaderboard();
+
+    let user = Address::generate(&t.env);
+    let result =
+        t.client
+            .try_register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+    assert_eq!(result.unwrap_err().unwrap(), ReferralError::IncompatibleInterface);
+    // The registration itself must not have partially applied.
+    assert!(!t.client.is_registered(&user));
+}
+
+#[test]
+fn test_credit_rejects_incompatible_leaderboard() {
+    let t = setup_with_incompatible_leaderboard();
+
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    // Write the profile directly — register_referral itself would already
+    // fail against the incompatible leaderboard, and this test is only
+    // concerned with credit()'s own version check.
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Bettor"),
+                referrer: Some(referrer),
+            },
+        );
+    });
+
+    // Fund the referral contract so the fee transfer preceding the
+    // leaderboard call succeeds and the version check is what's exercised.
+    let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
+    sac_admin.mint(&t.referral_id, &100_0000000_i128);
+
+    let result = t.client.try_credit(&t.market, &user, &1_0000000_i128);
+    assert_eq!(result.unwrap_err().unwrap(), ReferralError::IncompatibleInterface);
 }

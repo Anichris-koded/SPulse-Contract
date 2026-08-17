@@ -34,6 +34,17 @@ const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated f
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+// Issue #84: bump whenever a function signature, argument order, or return
+// type that a caller relies on changes.
+pub const INTERFACE_VERSION: u32 = 1;
+
+// The referral/leaderboard interface_version this contract was built
+// against. A deployed dependency reporting a different version may have a
+// changed credit/reward ABI — refuse the call rather than invoke blind
+// (issue #84).
+const EXPECTED_REFERRAL_INTERFACE_VERSION: u32 = 1;
+const EXPECTED_LEADERBOARD_INTERFACE_VERSION: u32 = 1;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -65,6 +76,7 @@ pub enum MarketError {
     WithdrawalRequestExists = 23,
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
+    IncompatibleInterface = 26,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -237,6 +249,11 @@ impl PredictionMarketContract {
     /// Read the current Config (for verification/admin tooling).
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
+    }
+
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
     }
 
     // ── Resolver Management ───────────────────────────────────────────────
@@ -420,6 +437,7 @@ impl PredictionMarketContract {
         let paid_referrer = if cached == Some(false) {
             false
         } else {
+            Self::require_compatible_referral(&env, &cfg.referral)?;
             xlm.transfer(&this, &cfg.referral, &referral_fee);
             let result: bool = env.invoke_contract(
                 &cfg.referral,
@@ -756,6 +774,7 @@ impl PredictionMarketContract {
             (LOSE_POINTS, LOSE_TOKENS)
         };
 
+        Self::require_compatible_leaderboard(&env, &cfg.leaderboard)?;
         let _: Val = env.invoke_contract(
             &cfg.leaderboard,
             &Symbol::new(&env, "reward"),
@@ -1036,6 +1055,31 @@ impl PredictionMarketContract {
             .persistent()
             .get(&DataKey::Market(market_id))
             .ok_or(MarketError::MarketNotFound)
+    }
+
+    // Issue #84: check a dependency's reported ABI version before invoking
+    // it, so a unilateral upgrade with an incompatible credit/reward
+    // signature fails with a clear error instead of an opaque
+    // invoke_contract failure or silent misbehavior.
+    fn require_compatible_referral(env: &Env, referral: &Address) -> Result<(), MarketError> {
+        let version: u32 =
+            env.invoke_contract(referral, &Symbol::new(env, "interface_version"), vec![env]);
+        if version != EXPECTED_REFERRAL_INTERFACE_VERSION {
+            return Err(MarketError::IncompatibleInterface);
+        }
+        Ok(())
+    }
+
+    fn require_compatible_leaderboard(env: &Env, leaderboard: &Address) -> Result<(), MarketError> {
+        let version: u32 = env.invoke_contract(
+            leaderboard,
+            &Symbol::new(env, "interface_version"),
+            vec![env],
+        );
+        if version != EXPECTED_LEADERBOARD_INTERFACE_VERSION {
+            return Err(MarketError::IncompatibleInterface);
+        }
+        Ok(())
     }
 
     #[inline]

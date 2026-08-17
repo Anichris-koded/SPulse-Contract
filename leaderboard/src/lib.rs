@@ -10,6 +10,12 @@ const MAX_PAGE_SIZE: u32 = 20;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+// Issue #84: bump whenever a function signature, argument order, or return
+// type that a caller relies on changes. Callers pin the version they were
+// built against and check it before invoking, so an incompatible upgrade
+// fails with a clear error instead of a silently broken cross-contract call.
+pub const INTERFACE_VERSION: u32 = 1;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -104,6 +110,14 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::TokenContract, &token);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
+    }
+
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    /// Callers that invoke add_pts/add_bonus_pts should check this before
+    /// calling so an upgrade with a breaking signature change fails loudly
+    /// instead of misbehaving.
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
     }
 
     pub fn add_pts(

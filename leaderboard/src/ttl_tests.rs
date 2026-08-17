@@ -167,3 +167,11 @@ fn test_instance_ttl_not_bumped_again_while_above_threshold() {
     // sequence advance rather than reset to TTL_HIGH again.
     assert_eq!(instance_ttl(&env, &client.address), TTL_HIGH - 10);
 }
+
+// ── Cross-contract interface versioning (issue #84) ───────────────────────────
+
+#[test]
+fn test_interface_version_reported() {
+    let (_env, client, _admin, _market, _referral) = setup();
+    assert_eq!(client.interface_version(), 1);
+}

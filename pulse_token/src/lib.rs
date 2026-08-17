@@ -19,6 +19,8 @@ pub enum TokenError {
     InsufficientBalance = 4,
     InvalidAmount = 5,
     NotAdmin = 6,
+    InsufficientAllowance = 7,
+    InvalidExpirationLedger = 8,
 }
 
 #[contracttype]
@@ -31,6 +33,14 @@ pub enum DataKey {
     Name,
     Symbol,
     Decimals,
+    Allowance(Address, Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub expiration_ledger: u32,
 }
 
 #[contract]
@@ -132,6 +142,109 @@ impl PULSETokenContract {
         if from_balance < amount {
             return Err(TokenError::InsufficientBalance);
         }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(from), &(from_balance - amount));
+        let to_balance = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(to), &(to_balance + amount));
+        Ok(())
+    }
+
+    /// Allow `spender` to transfer up to `amount` of `from`'s PULSE, until
+    /// `expiration_ledger` (inclusive). Pass `amount == 0` to revoke.
+    pub fn approve(
+        env: Env,
+        from: Address,
+        spender: Address,
+        amount: i128,
+        expiration_ledger: u32,
+    ) -> Result<(), TokenError> {
+        if amount < 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        from.require_auth();
+
+        if amount > 0 && expiration_ledger < env.ledger().sequence() {
+            return Err(TokenError::InvalidExpirationLedger);
+        }
+
+        let key = DataKey::Allowance(from, spender);
+        if amount == 0 {
+            env.storage().temporary().remove(&key);
+            return Ok(());
+        }
+
+        let value = AllowanceValue {
+            amount,
+            expiration_ledger,
+        };
+        env.storage().temporary().set(&key, &value);
+        let live_for = expiration_ledger
+            .saturating_sub(env.ledger().sequence());
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, live_for, live_for);
+        Ok(())
+    }
+
+    /// Amount `spender` is still allowed to transfer on `from`'s behalf.
+    /// Returns 0 once the allowance has expired.
+    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        let key = DataKey::Allowance(from, spender);
+        match env.storage().temporary().get::<DataKey, AllowanceValue>(&key) {
+            Some(allowance) if allowance.expiration_ledger >= env.ledger().sequence() => {
+                allowance.amount
+            }
+            _ => 0,
+        }
+    }
+
+    /// Transfer `amount` from `from` to `to`, spending down the allowance
+    /// previously granted to `spender` via `approve`.
+    pub fn transfer_from(
+        env: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        spender.require_auth();
+
+        let current_allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
+        if current_allowance < amount {
+            return Err(TokenError::InsufficientAllowance);
+        }
+
+        let from_balance = Self::balance(env.clone(), from.clone());
+        if from_balance < amount {
+            return Err(TokenError::InsufficientBalance);
+        }
+
+        let key = DataKey::Allowance(from.clone(), spender);
+        let remaining = current_allowance - amount;
+        if remaining == 0 {
+            env.storage().temporary().remove(&key);
+        } else {
+            let expiration_ledger: u32 = env
+                .storage()
+                .temporary()
+                .get::<DataKey, AllowanceValue>(&key)
+                .map(|v| v.expiration_ledger)
+                .unwrap_or(env.ledger().sequence());
+            env.storage().temporary().set(
+                &key,
+                &AllowanceValue {
+                    amount: remaining,
+                    expiration_ledger,
+                },
+            );
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from), &(from_balance - amount));

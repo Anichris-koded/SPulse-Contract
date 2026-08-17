@@ -62,20 +62,9 @@ pub struct PlayerStats {
     pub lost_bets: u32,
 }
 
-// Internal packed stats — single storage slot per user
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserStats {
-    pub points: u64,
-    pub won_bets: u32,
-    pub lost_bets: u32,
-    // bonus_bets counts referral/welcome bonus awards (reward_bonus and
-    // add_bonus_pts). total_bets is derived at read time as
-    // won_bets + lost_bets + bonus_bets so bonus-only activity is counted
-    // without mislabeling bonuses as win/loss outcomes, and the three
-    // counters can never drift apart.
-    pub bonus_bets: u32,
-}
+// Internal packed stats —
+
+// ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct LeaderboardContract;
@@ -93,565 +82,317 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::MarketContract, &market_contract);
-        env.storage()
-            .instance()
-            .set(&DataKey::ReferralContract, &referral_contract);
-        // OPT: TopPlayerCount in instance storage — free co-read with other instance keys
-        env.storage()
-            .instance()
-            .set(&DataKey::TopPlayerCount, &0_u32);
+        env.storage().instance().set(&DataKey::MarketContract, &market_contract);
+        env.storage().instance().set(&DataKey::ReferralContract, &referral_contract);
+        env.storage().instance().set(&DataKey::TopPlayerCount, &0_u32);
+        env.storage().instance().set(&DataKey::MinPoints, &0_u64);
+        env.storage().instance().set(&DataKey::MinSlot, &0_u32);
         Ok(())
     }
 
-    // ── Upgradeability & Config (admin only) ──────────────────────────────────
-
-    /// Replace this contract's WASM in place. Admin only. Storage preserved.
-    pub fn upgrade(
-        env: Env,
-        admin: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<(), LeaderboardError> {
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        Ok(())
-    }
-
-    /// Re-point the trusted market and referral contracts. Admin only.
-    /// Needed if the market/referral are redeployed to new addresses.
-    pub fn set_contracts(
-        env: Env,
-        admin: Address,
-        market_contract: Address,
-        referral_contract: Address,
-    ) -> Result<(), LeaderboardError> {
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-        env.storage()
+    pub fn set_token_contract(env: Env, admin: Address, token: Address) -> Result<(), LeaderboardError> {
+        let stored: Address = env
+            .storage()
             .instance()
-            .set(&DataKey::MarketContract, &market_contract);
-        env.storage()
-            .instance()
-            .set(&DataKey::ReferralContract, &referral_contract);
-        Ok(())
-    }
-
-    pub fn set_token(
-        env: Env,
-        admin: Address,
-        token_contract: Address,
-    ) -> Result<(), LeaderboardError> {
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::TokenContract, &token_contract);
-        Ok(())
-    }
-
-    pub fn reward(
-        env: Env,
-        caller: Address,
-        user: Address,
-        points: u64,
-        tokens: i128,
-        is_winner: bool,
-    ) -> Result<(), LeaderboardError> {
-        caller.require_auth();
-        Self::require_market_contract(&env, &caller)?;
-        if points == 0 {
-            return Err(LeaderboardError::InvalidPoints);
+            .get(&DataKey::Admin)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if admin != stored {
+            return Err(LeaderboardError::NotAdmin);
         }
-
-        // 1) Points / win-loss — identical to add_pts.
-        let sk = DataKey::Stats(user.clone());
-        let mut s: UserStats = env.storage().persistent().get(&sk).unwrap_or(UserStats {
-            points: 0,
-            won_bets: 0,
-            lost_bets: 0,
-            bonus_bets: 0,
-        });
-        s.points += points;
-        if is_winner {
-            s.won_bets += 1;
-        } else {
-            s.lost_bets += 1;
-        }
-        env.storage().persistent().set(&sk, &s);
-        env.storage()
-            .persistent()
-            .extend_ttl(&sk, TTL_BUMP, TTL_HIGH);
-        Self::upsert_top(&env, &user, s.points);
-
-        // 2) Mint PULSE internally (the second cross-call the market used to make).
-        if tokens > 0 {
-            let token: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::TokenContract)
-                .ok_or(LeaderboardError::NotInitialized)?;
-            let this = env.current_contract_address();
-            let _: Val = env.invoke_contract(
-                &token,
-                &Symbol::new(&env, "mint"),
-                vec![
-                    &env,
-                    this.into_val(&env),
-                    user.into_val(&env),
-                    tokens.into_val(&env),
-                ],
-            );
-        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::TokenContract, &token);
         Ok(())
     }
 
-    // OPT: 1 storage read+write instead of 4 separate reads + 2 writes
     pub fn add_pts(
         env: Env,
         caller: Address,
         user: Address,
-        points: u64,
-        is_winner: bool,
+        pts: u64,
+        is_won: bool,
     ) -> Result<(), LeaderboardError> {
-        caller.require_auth();
-        Self::require_market_contract(&env, &caller)?;
-        if points == 0 {
-            return Err(LeaderboardError::InvalidPoints);
+        let market: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != market {
+            return Err(LeaderboardError::UnauthorizedCaller);
         }
+        caller.require_auth();
 
-        let sk = DataKey::Stats(user.clone());
-        let mut s: UserStats = env.storage().persistent().get(&sk).unwrap_or(UserStats {
-            points: 0,
-            won_bets: 0,
-            lost_bets: 0,
-            bonus_bets: 0,
-        });
+        let mut stats: PlayerStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or(PlayerStats {
+                points: 0,
+                total_bets: 0,
+                won_bets: 0,
+                lost_bets: 0,
+            });
 
-        s.points += points;
-        if is_winner {
-            s.won_bets += 1;
+        stats.points += pts;
+        stats.total_bets += 1;
+        if is_won {
+            stats.won_bets += 1;
         } else {
-            s.lost_bets += 1;
+            stats.lost_bets += 1;
         }
-        env.storage().persistent().set(&sk, &s);
-        env.storage()
-            .persistent()
-            .extend_ttl(&sk, TTL_BUMP, TTL_HIGH);
 
-        Self::upsert_top(&env, &user, s.points);
+        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
+        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+
+        Self::update_top_players(&env, user, stats.points);
         Ok(())
     }
 
-    pub fn reward_bonus(
-        env: Env,
-        caller: Address,
-        user: Address,
-        points: u64,
-        tokens: i128,
-    ) -> Result<(), LeaderboardError> {
-        caller.require_auth();
-        Self::require_referral_contract(&env, &caller)?;
-        if points == 0 {
-            return Err(LeaderboardError::InvalidPoints);
-        }
-
-        let sk = DataKey::Stats(user.clone());
-        let mut s: UserStats = env.storage().persistent().get(&sk).unwrap_or(UserStats {
-            points: 0,
-            won_bets: 0,
-            lost_bets: 0,
-            bonus_bets: 0,
-        });
-        s.points += points;
-        s.bonus_bets += 1;
-        env.storage().persistent().set(&sk, &s);
-        env.storage()
-            .persistent()
-            .extend_ttl(&sk, TTL_BUMP, TTL_HIGH);
-        Self::upsert_top(&env, &user, s.points);
-
-        if tokens > 0 {
-            let token: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::TokenContract)
-                .ok_or(LeaderboardError::NotInitialized)?;
-            let this = env.current_contract_address();
-            let _: Val = env.invoke_contract(
-                &token,
-                &Symbol::new(&env, "mint"),
-                vec![
-                    &env,
-                    this.into_val(&env),
-                    user.into_val(&env),
-                    tokens.into_val(&env),
-                ],
-            );
-        }
-        Ok(())
-    }
-
-    // OPT: same 1-read pattern for bonus points
     pub fn add_bonus_pts(
         env: Env,
         caller: Address,
         user: Address,
-        points: u64,
+        pts: u64,
     ) -> Result<(), LeaderboardError> {
-        caller.require_auth();
-        Self::require_referral_contract(&env, &caller)?;
-        if points == 0 {
-            return Err(LeaderboardError::InvalidPoints);
+        let referral: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferralContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != referral {
+            return Err(LeaderboardError::UnauthorizedCaller);
         }
-
-        let sk = DataKey::Stats(user.clone());
-        let mut s: UserStats = env.storage().persistent().get(&sk).unwrap_or(UserStats {
-            points: 0,
-            won_bets: 0,
-            lost_bets: 0,
-            bonus_bets: 0,
-        });
-        s.points += points;
-        s.bonus_bets += 1;
-        env.storage().persistent().set(&sk, &s);
-        env.storage()
-            .persistent()
-            .extend_ttl(&sk, TTL_BUMP, TTL_HIGH);
-
-        Self::upsert_top(&env, &user, s.points);
-        Ok(())
-    }
-
-    // OPT: record_bet is kept for ABI compatibility but now a no-op —
-    //      we removed the cross-contract call from place_bet so this is
-    //      never called. The body simply returns Ok to avoid breaking
-    //      any caller that still invokes it.
-    pub fn record_bet(env: Env, caller: Address, _user: Address) -> Result<(), LeaderboardError> {
         caller.require_auth();
-        Self::require_market_contract(&env, &caller)?;
-        // No-op: total_bets derived from won_bets + lost_bets + bonus_bets at read time
+
+        let mut stats: PlayerStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or(PlayerStats {
+                points: 0,
+                total_bets: 0,
+                won_bets: 0,
+                lost_bets: 0,
+            });
+
+        stats.points += pts;
+        stats.total_bets += 1; // bonus counts as activity
+
+        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
+        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+
+        Self::update_top_players(&env, user, stats.points);
         Ok(())
     }
 
     pub fn get_points(env: Env, user: Address) -> u64 {
         env.storage()
             .persistent()
-            .get::<DataKey, UserStats>(&DataKey::Stats(user))
+            .get::<_, PlayerStats>(&DataKey::Stats(user))
             .map(|s| s.points)
             .unwrap_or(0)
     }
 
-    // OPT: 1 read instead of 4; total_bets = won + lost + bonus (all activity)
     pub fn get_stats(env: Env, user: Address) -> PlayerStats {
-        let s: UserStats = env
-            .storage()
+        env.storage()
             .persistent()
             .get(&DataKey::Stats(user))
-            .unwrap_or(UserStats {
+            .unwrap_or(PlayerStats {
                 points: 0,
+                total_bets: 0,
                 won_bets: 0,
                 lost_bets: 0,
-                bonus_bets: 0,
-            });
-        PlayerStats {
-            points: s.points,
-            total_bets: s.won_bets + s.lost_bets + s.bonus_bets,
-            won_bets: s.won_bets,
-            lost_bets: s.lost_bets,
-        }
+            })
     }
 
-    // OPT: sort is now done with an in-place swap instead of full Vec rebuild.
-    //      Previous: O(n²) Vec rebuilds in Soroban linear memory — extremely
-    //      expensive. New: track max so far, do one pass, insertion sort with
-    //      index swap. Still O(n²) worst case but ~10x fewer allocations.
-    pub fn get_top_players(env: Env, offset: u32, limit: u32) -> Vec<PlayerEntry> {
+    pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
         let count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::TopPlayerCount)
             .unwrap_or(0);
-        if count == 0 || offset >= count {
-            return Vec::new(&env);
+
+        if offset >= count || page_size == 0 {
+            return vec![&env];
         }
 
-        let page_size = if limit == 0 || limit > MAX_PAGE_SIZE {
-            MAX_PAGE_SIZE
-        } else {
-            limit
-        };
-
-        // Collect all entries into a flat vec
-        let mut all: Vec<PlayerEntry> = Vec::new(&env);
-        for i in 0..count {
-            if let Some(e) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PlayerEntry>(&DataKey::TopPlayerAt(i))
-            {
-                all.push_back(e);
-            }
-        }
-
-        let n = all.len();
-        // OPT: selection sort (O(n²) swaps) — fewer Vec rebuilds than insertion sort
-        // Each "swap" here is still a full Vec rebuild due to Soroban Vec constraints,
-        // but we only rebuild when order is wrong (best case: already sorted = 0 rebuilds)
-        for i in 0..n {
-            let mut max_idx = i;
-            for j in (i + 1)..n {
-                if all.get(j).unwrap().points > all.get(max_idx).unwrap().points {
-                    max_idx = j;
-                }
-            }
-            if max_idx != i {
-                // Swap i and max_idx
-                let a = all.get(i).unwrap();
-                let b = all.get(max_idx).unwrap();
-                let mut rebuilt: Vec<PlayerEntry> = Vec::new(&env);
-                for k in 0..n {
-                    if k == i {
-                        rebuilt.push_back(b.clone());
-                    } else if k == max_idx {
-                        rebuilt.push_back(a.clone());
-                    } else {
-                        rebuilt.push_back(all.get(k).unwrap());
-                    }
-                }
-                all = rebuilt;
-            }
-        }
-
-        // Slice [offset .. offset+page_size]
-        let end = {
-            let e = offset + page_size;
-            if e < all.len() {
-                e
-            } else {
-                all.len()
-            }
-        };
-        let mut result: Vec<PlayerEntry> = Vec::new(&env);
+        let end = (offset + page_size).min(count);
+        let mut result = Vec::new(&env);
         for i in offset..end {
-            result.push_back(all.get(i).unwrap());
+            if let Some(entry) = env.storage().persistent().get(&DataKey::TopPlayerAt(i)) {
+                result.push_back(entry);
+            }
         }
         result
     }
 
-    pub fn get_rank(env: Env, user: Address) -> u32 {
-        // OPT: early exit if user not in top list
-        let slot: Option<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TopPlayerSlot(user.clone()));
-        if slot.is_none() {
-            return 0;
-        }
-
-        let user_pts: u64 = env
-            .storage()
-            .persistent()
-            .get::<DataKey, UserStats>(&DataKey::Stats(user.clone()))
-            .map(|s| s.points)
-            .unwrap_or(0);
-
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TopPlayerCount)
-            .unwrap_or(0);
-        let mut rank: u32 = 1;
-        for i in 0..count {
-            if let Some(e) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PlayerEntry>(&DataKey::TopPlayerAt(i))
-            {
-                if e.address != user && e.points > user_pts {
-                    rank += 1;
-                }
-            }
-        }
-        rank
-    }
-
-    pub fn get_player_count(env: Env) -> u32 {
+    pub fn get_top_player_count(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::TopPlayerCount)
             .unwrap_or(0)
     }
 
-    fn upsert_top(env: &Env, user: &Address, new_points: u64) {
+    pub fn get_min_points(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinPoints)
+            .unwrap_or(0)
+    }
+
+    pub fn get_min_slot(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinSlot)
+            .unwrap_or(0)
+    }
+
+    // ── Internal: maintain a persistent sorted top list ──────────────────────
+
+    fn update_top_players(env: &Env, user: Address, new_points: u64) {
         let count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::TopPlayerCount)
             .unwrap_or(0);
-        let slot: Option<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TopPlayerSlot(user.clone()));
 
-        if let Some(s) = slot {
-            // Already in the list — in-place update, O(1).
-            let e = PlayerEntry {
-                address: user.clone(),
-                points: new_points,
-            };
-            env.storage().persistent().set(&DataKey::TopPlayerAt(s), &e);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::TopPlayerAt(s), TTL_BUMP, TTL_HIGH);
-            let cached_min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
-            if count >= MAX_TOP_PLAYERS && s == cached_min_slot {
-                Self::recompute_min(env, count);
-            }
-            return;
-        }
-
-        if count < MAX_TOP_PLAYERS {
-            // Room available — append. O(1).
-            let s = count;
-            let e = PlayerEntry {
-                address: user.clone(),
-                points: new_points,
-            };
-            env.storage().persistent().set(&DataKey::TopPlayerAt(s), &e);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::TopPlayerAt(s), TTL_BUMP, TTL_HIGH);
-            let sk = DataKey::TopPlayerSlot(user.clone());
-            env.storage().persistent().set(&sk, &s);
-            env.storage()
-                .persistent()
-                .extend_ttl(&sk, TTL_BUMP, TTL_HIGH);
-            let new_count = count + 1;
-            env.storage()
-                .instance()
-                .set(&DataKey::TopPlayerCount, &new_count);
-            // Lever E: maintain the cached min. When the list becomes full, the
-            // min is authoritative; while filling, track the lowest seen so far.
-            let cur_min: u64 = env
-                .storage()
-                .instance()
-                .get(&DataKey::MinPoints)
-                .unwrap_or(u64::MAX);
-            if new_count == 1 || new_points < cur_min {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::MinPoints, &new_points);
-                env.storage().instance().set(&DataKey::MinSlot, &s);
-            }
-            return;
-        }
-
-        let mut min_pts: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinPoints)
-            .unwrap_or(u64::MAX);
-        if min_pts == u64::MAX {
-            Self::recompute_min(env, count);
-            min_pts = env
-                .storage()
-                .instance()
-                .get(&DataKey::MinPoints)
-                .unwrap_or(u64::MAX);
-        }
-        let min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
-        if new_points <= min_pts {
-            return;
-        }
-
-        if let Some(old) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PlayerEntry>(&DataKey::TopPlayerAt(min_slot))
-        {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::TopPlayerSlot(old.address));
-        }
-        let e = PlayerEntry {
-            address: user.clone(),
-            points: new_points,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::TopPlayerAt(min_slot), &e);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::TopPlayerAt(min_slot), TTL_BUMP, TTL_HIGH);
-        let sk = DataKey::TopPlayerSlot(user.clone());
-        env.storage().persistent().set(&sk, &min_slot);
-        env.storage()
-            .persistent()
-            .extend_ttl(&sk, TTL_BUMP, TTL_HIGH);
-        // The slot we just overwrote held the old min; recompute the new min.
-        Self::recompute_min(env, count);
-    }
-
-    fn recompute_min(env: &Env, count: u32) {
-        let mut min_pts = u64::MAX;
-        let mut min_slot: u32 = 0;
-        for i in 0..count {
-            if let Some(e) = env
+        // If user is already in the list, update their points and re-sort in place.
+        if let Some(slot) = env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(user.clone())) {
+            let mut entry: PlayerEntry = env
                 .storage()
                 .persistent()
-                .get::<DataKey, PlayerEntry>(&DataKey::TopPlayerAt(i))
-            {
-                if e.points < min_pts {
-                    min_pts = e.points;
-                    min_slot = i;
+                .get(&DataKey::TopPlayerAt(slot))
+                .unwrap();
+            entry.points = new_points;
+            env.storage().persistent().set(&DataKey::TopPlayerAt(slot), &entry);
+            env.storage().persistent().extend_ttl(&DataKey::TopPlayerAt(slot), TTL_BUMP, TTL_HIGH);
+
+            // Bubble the updated entry up to maintain descending order.
+            let mut current = slot;
+            while current > 0 {
+                let prev: PlayerEntry = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TopPlayerAt(current - 1))
+                    .unwrap();
+                if prev.points < entry.points {
+                    // Swap
+                    env.storage().persistent().set(&DataKey::TopPlayerAt(current - 1), &entry);
+                    env.storage().persistent().set(&DataKey::TopPlayerAt(current), &prev);
+                    env.storage().persistent().set(&DataKey::TopPlayerSlot(entry.address.clone()), &(current - 1));
+                    env.storage().persistent().set(&DataKey::TopPlayerSlot(prev.address.clone()), &current);
+                    current -= 1;
+                } else {
+                    break;
                 }
             }
-        }
-        env.storage().instance().set(&DataKey::MinPoints, &min_pts);
-        env.storage().instance().set(&DataKey::MinSlot, &min_slot);
-    }
 
-    #[inline]
-    fn require_market_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
-        let mkt: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if *caller != mkt {
-            return Err(LeaderboardError::UnauthorizedCaller);
+            // Update min points/slot if this was the last slot.
+            if count > 0 {
+                let min_slot = count - 1;
+                let min_entry: PlayerEntry = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TopPlayerAt(min_slot))
+                    .unwrap();
+                env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
+                env.storage().instance().set(&DataKey::MinSlot, &min_slot);
+            }
+            return;
         }
-        Ok(())
-    }
 
-    #[inline]
-    fn require_referral_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
-        let ref_: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReferralContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if *caller != ref_ {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
-        Ok(())
-    }
+        // New user: insert if list not full or if they beat the current minimum.
+        if count < MAX_TOP_PLAYERS {
+            let slot = count;
+            let entry = PlayerEntry {
+                address: user.clone(),
+                points: new_points,
+            };
+            env.storage().persistent().set(&DataKey::TopPlayerAt(slot), &entry);
+            env.storage().persistent().set(&DataKey::TopPlayerSlot(user.clone()), &slot);
+            env.storage().persistent().extend_ttl(&DataKey::TopPlayerAt(slot), TTL_BUMP, TTL_HIGH);
+            env.storage().instance().set(&DataKey::TopPlayerCount, &(count + 1));
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if *caller != admin {
-            return Err(LeaderboardError::NotAdmin);
+            // Bubble up to maintain order.
+            let mut current = slot;
+            while current > 0 {
+                let prev: PlayerEntry = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TopPlayerAt(current - 1))
+                    .unwrap();
+                if prev.points < entry.points {
+                    env.storage().persistent().set(&DataKey::TopPlayerAt(current - 1), &entry);
+                    env.storage().persistent().set(&DataKey::TopPlayerAt(current), &prev);
+                    env.storage().persistent().set(&DataKey::TopPlayerSlot(entry.address.clone()), &(current - 1));
+                    env.storage().persistent().set(&DataKey::TopPlayerSlot(prev.address.clone()), &current);
+                    current -= 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Update min if we just filled the last slot.
+            if count + 1 == MAX_TOP_PLAYERS {
+                let min_slot = MAX_TOP_PLAYERS - 1;
+                let min_entry: PlayerEntry = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TopPlayerAt(min_slot))
+                    .unwrap();
+                env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
+                env.storage().instance().set(&DataKey::MinSlot, &min_slot);
+            }
+        } else {
+            // List full: replace the minimum if the new points beat it.
+            let min_points: u64 = env.storage().instance().get(&DataKey::MinPoints).unwrap_or(0);
+            if new_points > min_points {
+                let min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
+                let old_entry: PlayerEntry = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TopPlayerAt(min_slot))
+                    .unwrap();
+
+                // Remove old slot mapping.
+                env.storage().persistent().remove(&DataKey::TopPlayerSlot(old_entry.address.clone()));
+
+                let new_entry = PlayerEntry {
+                    address: user.clone(),
+                    points: new_points,
+                };
+                env.storage().persistent().set(&DataKey::TopPlayerAt(min_slot), &new_entry);
+                env.storage().persistent().set(&DataKey::TopPlayerSlot(user.clone()), &min_slot);
+                env.storage().persistent().extend_ttl(&DataKey::TopPlayerAt(min_slot), TTL_BUMP, TTL_HIGH);
+
+                // Bubble up from min_slot.
+                let mut current = min_slot;
+                while current > 0 {
+                    let prev: PlayerEntry = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::TopPlayerAt(current - 1))
+                        .unwrap();
+                    if prev.points < new_entry.points {
+                        env.storage().persistent().set(&DataKey::TopPlayerAt(current - 1), &new_entry);
+                        env.storage().persistent().set(&DataKey::TopPlayerAt(current), &prev);
+                        env.storage().persistent().set(&DataKey::TopPlayerSlot(new_entry.address.clone()), &(current - 1));
+                        env.storage().persistent().set(&DataKey::TopPlayerSlot(prev.address.clone()), &current);
+                        current -= 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Recompute min (now at the last slot after bubbling).
+                let new_min_slot = MAX_TOP_PLAYERS - 1;
+                let new_min_entry: PlayerEntry = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TopPlayerAt(new_min_slot))
+                    .unwrap();
+                env.storage().instance().set(&DataKey::MinPoints, &new_min_entry.points);
+                env.storage().instance().set(&DataKey::MinSlot, &new_min_slot);
+            }
         }
-        Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

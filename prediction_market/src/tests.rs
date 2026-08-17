@@ -463,6 +463,31 @@ fn test_reduce_then_rebuild_same_side_opposite_still_rejected() {
     assert!(opp.is_err());
 }
 
+// ── 98e2. Cancellation after reduction: cancel_refund pays the REMAINING
+//     gross — the reduced portion is never double-refunded ─────────────────
+#[test]
+fn test_reduce_then_cancel_refund_pays_remaining_gross() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 10_000_0000000);
+
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    let reduced = t.client.reduce_position(&user, &id, &40_0000000_i128);
+    assert_eq!(reduced, 40_0000000);
+    assert_eq!(t.client.get_bet_gross(&id, &user), 60_0000000);
+
+    // Market is then cancelled: refund covers only the 60 XLM still held.
+    t.client.cancel_market(&t.admin, &id);
+    let refunded = t.client.cancel_refund(&user, &id);
+    assert_eq!(refunded, 60_0000000);
+    assert_eq!(t.client.get_bet_gross(&id, &user), 0);
+
+    // Idempotent: a second refund attempt finds nothing left.
+    let again = t.client.try_cancel_refund(&user, &id);
+    assert!(again.is_err());
+}
+
 // ── 98f. Rejections: amount > position, zero/negative, no bet, and
 //     resolved / cancelled / expired markets ────────────────────────────────
 #[test]

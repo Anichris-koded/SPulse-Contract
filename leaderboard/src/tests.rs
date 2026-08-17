@@ -159,8 +159,8 @@ fn test_bonus_only_user_has_nonzero_total_bets() {
 
     // add_bonus_pts: per-referred-bet bonus path.
     client.add_bonus_pts(&referral, &user, &3_u64);
-    // reward_bonus: welcome-bonus path (tokens=0 so no mint wiring is needed).
-    client.reward_bonus(&referral, &user, &5_u64, &0_i128);
+    // add_bonus_pts: welcome-bonus path (tokens=0 so no mint wiring is needed).
+    client.add_bonus_pts(&referral, &user, &5_u64);
 
     let stats = client.get_stats(&user);
     assert_eq!(stats.points, 8);
@@ -305,11 +305,11 @@ fn test_reward_rejects_non_market_caller() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
-fn test_reward_bonus_rejects_non_referral_caller() {
+fn test_add_bonus_pts_rejects_non_referral_caller() {
     let (env, client, _admin, _market, _referral) = setup();
     let rando = Address::generate(&env);
     let user = Address::generate(&env);
-    client.reward_bonus(&rando, &user, &5_u64, &0_i128);
+    client.add_bonus_pts(&rando, &user, &5_u64);
 }
 
 #[test]

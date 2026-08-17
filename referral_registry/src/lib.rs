@@ -19,6 +19,8 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    // Issue #95: operation blocked by the contract being paused.
+    Paused = 7,
 }
 
 #[contracttype]
@@ -42,6 +44,7 @@ pub enum DataKey {
     TokenContract,
     LeaderboardContract,
     XlmSacContract,
+    Paused,
 }
 
 // Lever A: packed registrant profile — one storage slot instead of three.
@@ -109,12 +112,41 @@ impl ReferralRegistryContract {
         Ok(())
     }
 
+    /// Issue #95 circuit breaker: halt registration and credit disbursements
+    /// during an emergency. Admin only; idempotent. Read/view paths stay open.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), ReferralError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ReferralError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(ReferralError::Paused);
+        }
+        Ok(())
+    }
+
     pub fn register_referral(
         env: Env,
         user: Address,
         display_name: String,
         referrer: Option<Address>,
     ) -> Result<(), ReferralError> {
+        Self::require_not_paused(&env)?;
         user.require_auth();
         if Self::is_registered(env.clone(), user.clone()) {
             return Err(ReferralError::AlreadyRegistered);
@@ -152,14 +184,34 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
+        // The leaderboard API renamed reward_bonus -> add_bonus_pts (which
+        // enforces caller == ReferralContract and no longer takes a token
+        // amount); keep the welcome-bonus points call in sync. The 1 PULSE
+        // welcome bonus is minted directly here — the registry is the
+        // authorized minter for this wiring.
         let _: Val = env.invoke_contract(
             &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
+            &Symbol::new(&env, "add_bonus_pts"),
             vec![
                 &env,
-                this.into_val(&env),
-                user.into_val(&env),
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
                 WELCOME_BONUS_POINTS.into_val(&env),
+            ],
+        );
+        let token_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenContract)
+            .unwrap();
+        // PULSE is a custom token contract; mint via its exported `mint` ABI.
+        let _: Val = env.invoke_contract(
+            &token_contract,
+            &Symbol::new(&env, "mint"),
+            vec![
+                &env,
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
                 WELCOME_BONUS_TOKENS.into_val(&env),
             ],
         );
@@ -172,6 +224,7 @@ impl ReferralRegistryContract {
         user: Address,
         referral_fee: i128,
     ) -> Result<bool, ReferralError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_market_contract(&env, &caller)?;
         // Lever A: resolve referrer via packed Profile (new) or legacy key (old).

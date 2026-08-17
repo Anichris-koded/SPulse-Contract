@@ -53,7 +53,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);
@@ -430,4 +430,40 @@ fn test_legacy_user_without_referrer() {
     assert!(s.client.is_registered(&legacy_user));
     assert_eq!(s.client.get_referrer(&legacy_user), None);
     assert!(!s.client.has_referrer(&legacy_user));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 95 — pause / circuit breaker
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_registry_pause_requires_admin() {
+    let t = setup();
+    let rando = Address::generate(&t.env);
+    t.client.set_paused(&rando, &true);
+}
+
+#[test]
+fn test_registry_pause_blocks_registration_and_credit_then_resume() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    t.client.set_paused(&t.admin, &true);
+    assert!(t.client.paused());
+    let no_ref: Option<Address> = None;
+    assert!(t
+        .client
+        .try_register_referral(&user, &String::from_str(&t.env, "User"), &no_ref)
+        .is_err());
+    assert!(t.client.try_credit(&t.market, &user, &5_000_000).is_err());
+
+    // Views stay fully available while paused.
+    assert!(!t.client.is_registered(&user));
+    assert_eq!(t.client.get_referral_count(&user), 0);
+
+    t.client.set_paused(&t.admin, &false);
+    assert!(!t.client.paused());
+    t.client.register_referral(&user, &String::from_str(&t.env, "User"), &no_ref);
+    assert!(t.client.is_registered(&user));
 }

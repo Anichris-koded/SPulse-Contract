@@ -65,6 +65,8 @@ pub enum MarketError {
     WithdrawalRequestExists = 23,
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
+    // Issue #95: operation blocked because the contract is paused.
+    Paused = 26,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -83,6 +85,7 @@ pub enum DataKey {
     Resolver(Address),
     FeeRecipient(Address),
     HasReferrer(Address),
+    Paused,
     RateWindow, // packed u64: high32=window_start_hi, low32=count
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
@@ -239,6 +242,40 @@ impl PredictionMarketContract {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
     }
 
+    // ── Emergency circuit breaker (issue #95) ───────────────────────────────
+
+    /// Halt (or resume) all risk-creating, settlement and withdrawal
+    /// operations: place_bet, create_market, resolve_market, cancel_market,
+    /// withdraw_fees, request_withdraw_fees and execute_withdraw_fees are
+    /// blocked while paused. User recovery paths — claim() and
+    /// cancel_refund() — stay available on purpose, so an emergency pause
+    /// never locks user funds in the contract. Admin only; idempotent.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), MarketError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), MarketError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(MarketError::Paused);
+        }
+        Ok(())
+    }
+
     // ── Resolver Management ───────────────────────────────────────────────
 
     pub fn add_resolver(env: Env, admin: Address, resolver: Address) -> Result<(), MarketError> {
@@ -308,6 +345,7 @@ impl PredictionMarketContract {
         category: Category,
         duration_secs: u64,
     ) -> Result<u64, MarketError> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         Self::check_rate(&env)?;
@@ -357,6 +395,7 @@ impl PredictionMarketContract {
         is_yes: bool,
         amount: i128,
     ) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         user.require_auth();
 
         let net = amount * NET_NUMERATOR / BPS_DENOM;
@@ -508,6 +547,7 @@ impl PredictionMarketContract {
         market_id: u64,
         outcome: bool,
     ) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_admin_or_resolver(&env, &caller)?;
 
@@ -601,6 +641,7 @@ impl PredictionMarketContract {
     // ── Cancellation ──────────────────────────────────────────────────────
 
     pub fn cancel_market(env: Env, admin: Address, market_id: u64) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
 
@@ -708,7 +749,6 @@ impl PredictionMarketContract {
         }
 
         let is_winner = entry.is_yes == market.outcome;
-        let total_pool = market.total_yes + market.total_no;
         let winning_side = if market.outcome {
             market.total_yes
         } else {
@@ -756,18 +796,35 @@ impl PredictionMarketContract {
             (LOSE_POINTS, LOSE_TOKENS)
         };
 
+        // The leaderboard API was renamed reward() -> add_pts() (points only,
+        // no token amount), and add_pts no longer mints PULSE internally. The
+        // market mints the PULSE reward directly — it is the authorized minter
+        // for this legacy wiring, keeping the original mint semantics intact.
         let _: Val = env.invoke_contract(
             &cfg.leaderboard,
-            &Symbol::new(&env, "reward"),
+            &Symbol::new(&env, "add_pts"),
             vec![
                 &env,
                 this.clone().into_val(&env),
                 user.clone().into_val(&env),
                 points.into_val(&env),
-                tokens.into_val(&env),
                 real_win.into_val(&env),
             ],
         );
+        if tokens > 0 {
+            // PULSE is a custom token contract (not a token::Client-compatible
+            // SAC interface): mint directly via its exported `mint` ABI.
+            let _: Val = env.invoke_contract(
+                &cfg.token,
+                &Symbol::new(&env, "mint"),
+                vec![
+                    &env,
+                    this.clone().into_val(&env),
+                    user.clone().into_val(&env),
+                    tokens.into_val(&env),
+                ],
+            );
+        }
 
         Ok(())
     }
@@ -784,6 +841,7 @@ impl PredictionMarketContract {
         caller: Address,
         recipient: Address,
     ) -> Result<i128, MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
         Self::require_valid_fee_recipient(&env, &caller, &recipient)?;
@@ -819,6 +877,7 @@ impl PredictionMarketContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_admin_or_fee_recipient(&env, &caller)?;
         Self::require_valid_fee_recipient(&env, &caller, &recipient)?;
@@ -863,6 +922,7 @@ impl PredictionMarketContract {
     /// Issue #12: pay out a matured withdrawal request. Reverts while the
     /// WITHDRAW_DELAY_SECS timelock is still running.
     pub fn execute_withdraw_fees(env: Env, caller: Address) -> Result<i128, MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let key = DataKey::PendingWithdrawal(caller.clone());
         let req: WithdrawalRequest = env

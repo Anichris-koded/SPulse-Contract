@@ -150,6 +150,49 @@ fn test_create_market() {
     assert_eq!(market.bet_count, 0);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reject_zero_market_duration() {
+    let t = setup();
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Zero duration"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &0_u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reject_market_duration_below_minimum() {
+    let t = setup();
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Too short"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &(MIN_MARKET_DURATION_SECS - 1),
+    );
+}
+
+#[test]
+fn test_market_duration_minimum_is_allowed() {
+    let t = setup();
+    let id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Minimum duration"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &MIN_MARKET_DURATION_SECS,
+    );
+
+    assert_eq!(
+        t.client.get_market(&id).end_time,
+        t.env.ledger().timestamp() + MIN_MARKET_DURATION_SECS
+    );
+}
+
 // ── 3. Place YES bet ──────────────────────────────────────────────────────────
 
 #[test]

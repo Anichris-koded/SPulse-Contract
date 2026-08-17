@@ -11,6 +11,7 @@ const MIN_BET: i128 = 10_000_000; // 1 XLM in stroops
 
 const MAX_BETS_PER_USER: u32 = 20;
 const MAX_MARKETS_PER_HOUR: u32 = 10;
+const MIN_MARKET_DURATION_SECS: u64 = 60;
 
 // Fee constants — multiply before divide to avoid precision loss
 const TOTAL_FEE_BPS: i128 = 200;
@@ -53,6 +54,7 @@ pub enum MarketError {
     NotAuthorized = 18,
     MarketNotCancelled = 19,
     RateLimitExceeded = 20,
+    InvalidDuration = 21,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -287,6 +289,9 @@ impl PredictionMarketContract {
     ) -> Result<u64, MarketError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
+        if duration_secs < MIN_MARKET_DURATION_SECS {
+            return Err(MarketError::InvalidDuration);
+        }
         Self::check_rate(&env)?;
 
         // OPT: single instance read for count (was already one read)

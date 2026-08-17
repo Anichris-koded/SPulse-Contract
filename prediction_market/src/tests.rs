@@ -595,7 +595,7 @@ fn test_withdraw_fees() {
     assert_eq!(t.xlm.balance(&t.admin), admin_xlm_before + fees_before);
 }
 
-// ── 27. Fee recipient can withdraw ───────────────────────────────────────────
+// ── 27. Fee recipient withdrawal is capped + timelocked (issue #12) ──────────
 
 #[test]
 fn test_fee_recipient_withdraw() {
@@ -608,18 +608,170 @@ fn test_fee_recipient_withdraw() {
     let recipient = Address::generate(&t.env);
     let treasury = Address::generate(&t.env);
     t.client.add_fee_recipient(&t.admin, &recipient);
+    t.client.add_fee_recipient(&t.admin, &treasury);
 
     let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
     let treasury_before = t.xlm.balance(&treasury);
-    t.client.withdraw_fees(&recipient, &treasury);
-    assert_eq!(t.xlm.balance(&treasury), treasury_before + fees);
-    assert_eq!(t.client.get_accumulated_fees(), 0);
+
+    // Fee recipient requests a capped withdrawal to the registered treasury.
+    t.client.request_withdraw_fees(&recipient, &treasury, &cap);
+
+    // Payout is NOT immediate: timelocked for WITHDRAW_DELAY_SECS.
+    let pending = t.client.get_pending_withdrawal(&recipient).unwrap();
+    assert_eq!(pending.recipient, treasury);
+    assert_eq!(pending.amount, cap);
+    assert_eq!(t.xlm.balance(&treasury), treasury_before);
+
+    // After the delay the payout executes.
+    advance_time(&t.env, WITHDRAW_DELAY_SECS);
+    let withdrawn = t.client.execute_withdraw_fees(&recipient);
+    assert_eq!(withdrawn, cap);
+    assert_eq!(t.xlm.balance(&treasury), treasury_before + cap);
+    assert_eq!(t.client.get_accumulated_fees(), fees - cap);
+}
+
+// ── 27b. Fee recipient can no longer withdraw immediately (issue #12) ─────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reject_fee_recipient_immediate_withdraw() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    t.client.withdraw_fees(&recipient, &recipient);
+}
+
+// ── 27c. Withdraw to an arbitrary address is rejected (issue #12) ─────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reject_withdraw_fees_to_arbitrary_recipient() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let rando = Address::generate(&t.env);
+    t.client.withdraw_fees(&t.admin, &rando);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reject_fee_recipient_request_arbitrary_recipient() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    let rando = Address::generate(&t.env);
+    t.client.request_withdraw_fees(&recipient, &rando, &1_i128);
+}
+
+// ── 27d. Cannot drain the whole accumulator in one request (issue #12) ────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_reject_drain_entire_accumulator_in_one_request() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    t.client.request_withdraw_fees(&recipient, &recipient, &fees);
+}
+
+// ── 27e. Payout is locked until the timelock elapses (issue #12) ──────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_withdrawal_execute_before_delay() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    t.client.execute_withdraw_fees(&recipient);
+}
+
+// ── 27f. Admin can cancel a pending withdrawal request (issue #12) ────────────
+
+#[test]
+fn test_admin_cancel_pending_withdrawal() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    assert!(t.client.get_pending_withdrawal(&recipient).is_some());
+
+    t.client.cancel_withdrawal_request(&t.admin, &recipient);
+    assert!(t.client.get_pending_withdrawal(&recipient).is_none());
+    assert_eq!(t.client.get_accumulated_fees(), fees);
+}
+
+// ── 27g. Executing without a pending request is rejected (issue #12) ──────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn test_execute_without_request() {
+    let t = setup();
+    let rando = Address::generate(&t.env);
+    t.client.execute_withdraw_fees(&rando);
+}
+
+// ── 27h. Duplicate withdrawal requests are rejected (issue #12) ───────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_reject_duplicate_withdrawal_request() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
 }
 
 // ── 28. Non-authorized cannot withdraw fees ───────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #18)")]
+#[should_panic(expected = "Error(Contract, #3)")]
 fn test_reject_withdraw_fees_non_admin() {
     let t = setup();
     let id = create_test_market(&t);
@@ -964,8 +1116,9 @@ fn test_empty_side_resolution_pool_to_fees() {
         "entire YES pool should sweep to fees when NO side is empty"
     );
 
-    // Admin can withdraw the swept pool
+    // Admin can withdraw the swept pool to a registered treasury
     let treasury = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &treasury);
     let before = t.xlm.balance(&treasury);
     let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
     assert_eq!(withdrawn, fees_after);
@@ -1088,8 +1241,9 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.leaderboard_client.get_points(&bob), 10);
     assert_eq!(t.token_client.balance(&bob), 2_0000000);
 
-    // Fee withdrawal to a treasury address
+    // Fee withdrawal to a registered treasury address
     let treasury = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &treasury);
     let fees_total = t.client.get_accumulated_fees();
     assert!(fees_total > 0);
     let treasury_before = t.xlm.balance(&treasury);

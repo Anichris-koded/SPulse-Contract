@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env, IntoVal,
-    String, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env, Executable,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -30,6 +30,8 @@ const LOSE_TOKENS: i128 = 2_0000000;
 // accumulator to an arbitrary address in one call.
 const WITHDRAW_DELAY_SECS: u64 = 86_400; // 24h timelock between request and payout
 const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated fees
+const CONFIG_DELAY_SECS: u64 = 86_400; // issue #51: dispute window before Config is live
+const MAX_GOVERNORS: u32 = 10;
 
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
@@ -67,7 +69,15 @@ pub enum MarketError {
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
     ContractPaused = 26,
-    InvalidDuration = 26, // issue #10: duration below the minimum
+    InvalidDuration = 27, // issue #10: duration below the minimum
+    InvalidDependency = 28, // issue #51: address is not the expected executable kind
+    WasmHashMismatch = 29,  // issue #51: live WASM hash != pinned / pending hash
+    ConfigChangeExists = 30,
+    NoConfigChange = 31,
+    ConfigChangeTooSoon = 32,
+    InsufficientApprovals = 33,
+    AlreadyApproved = 34,
+    InvalidThreshold = 35,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -91,6 +101,12 @@ pub enum DataKey {
     Payout(u64, Address), // i128 — exact payout computed at resolve time
     // ── Timelocked withdrawal requests (issue #12) ───────────────────────
     PendingWithdrawal(Address), // caller -> WithdrawalRequest
+    // ── Dependency governance (issue #51) ────────────────────────────────
+    Governor(Address),
+    GovernorCount,
+    GovernorThreshold,
+    PendingConfig,
+    PinnedHashes,
     // ── Emergency circuit-breaker (issue #83) ─────────────────────────────
     Paused,
 }
@@ -103,6 +119,26 @@ pub struct Config {
     pub referral: Address,
     pub leaderboard: Address,
     pub xlm_sac: Address,
+}
+
+/// WASM hashes (or the SAC sentinel) pinned for each Config role.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedHashes {
+    pub token: BytesN<32>,
+    pub referral: BytesN<32>,
+    pub leaderboard: BytesN<32>,
+    pub xlm_sac: BytesN<32>,
+}
+
+/// Timelocked, multi-sig Config mutation. Inactive until execute_set_config.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingConfigChange {
+    pub cfg: Config,
+    pub hashes: PinnedHashes,
+    pub requested_at: u64,
+    pub approvers: Vec<Address>,
 }
 
 // ── BetEntry: Bet + Gross + BetCount in one slot ──────────────────────────
@@ -199,6 +235,28 @@ impl PredictionMarketContract {
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
+
+        // Bootstrap governance: the initializer is the first governor with
+        // a 1-of-1 threshold. Production deploys should add more governors
+        // and raise the threshold before relying on set_config.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Governor(admin.clone()), &true);
+        env.storage().instance().set(&DataKey::GovernorCount, &1_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorThreshold, &1_u32);
+        if let Ok(hashes) = Self::fingerprint_config(
+            &env,
+            &token_contract,
+            &referral_contract,
+            &leaderboard_contract,
+            &xlm_sac,
+        ) {
+            env.storage()
+                .instance()
+                .set(&DataKey::PinnedHashes, &hashes);
+        }
         Ok(())
     }
 
@@ -215,33 +273,244 @@ impl PredictionMarketContract {
         Ok(())
     }
 
-    /// Update the packed Config (token / referral / leaderboard / xlm_sac). Admin only.
-    /// Used to correct an address set at initialize time.
+    /// Propose a Config change. Does **not** take effect immediately.
+    ///
+    /// Issue #51: live WASM hashes are read on-chain (not caller-supplied),
+    /// the proposal is emitted for monitors, and it only becomes active after
+    /// `CONFIG_DELAY_SECS` **and** `GovernorThreshold` approvals via
+    /// `execute_set_config`. Any governor can `cancel_set_config` in between.
     pub fn set_config(
         env: Env,
-        admin: Address,
+        caller: Address,
         token_contract: Address,
         referral_contract: Address,
         leaderboard_contract: Address,
         xlm_sac: Address,
     ) -> Result<(), MarketError> {
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-        env.storage().instance().set(
-            &DataKey::Cfg,
-            &Config {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        if env.storage().instance().has(&DataKey::PendingConfig) {
+            return Err(MarketError::ConfigChangeExists);
+        }
+
+        let hashes = Self::fingerprint_config(
+            &env,
+            &token_contract,
+            &referral_contract,
+            &leaderboard_contract,
+            &xlm_sac,
+        )?;
+        let mut approvers: Vec<Address> = Vec::new(&env);
+        approvers.push_back(caller.clone());
+        let pending = PendingConfigChange {
+            cfg: Config {
                 token: token_contract,
                 referral: referral_contract,
                 leaderboard: leaderboard_contract,
                 xlm_sac,
             },
+            hashes,
+            requested_at: env.ledger().timestamp(),
+            approvers,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingConfig, &pending);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_req"), caller),
+            pending,
         );
+        Ok(())
+    }
+
+    /// A governor attests a pending Config change during the dispute window.
+    pub fn approve_set_config(env: Env, caller: Address) -> Result<u32, MarketError> {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        let mut pending: PendingConfigChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfig)
+            .ok_or(MarketError::NoConfigChange)?;
+        if Self::approver_index(&pending.approvers, &caller).is_some() {
+            return Err(MarketError::AlreadyApproved);
+        }
+        pending.approvers.push_back(caller.clone());
+        let count = pending.approvers.len();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingConfig, &pending);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_ok"), caller),
+            count,
+        );
+        Ok(count)
+    }
+
+    /// Activate a matured, sufficiently-approved Config change. Re-reads live
+    /// executables so a dependency cannot swap WASM during the delay.
+    pub fn execute_set_config(env: Env, caller: Address) -> Result<(), MarketError> {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        let pending: PendingConfigChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfig)
+            .ok_or(MarketError::NoConfigChange)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.requested_at || now - pending.requested_at < CONFIG_DELAY_SECS {
+            return Err(MarketError::ConfigChangeTooSoon);
+        }
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorThreshold)
+            .unwrap_or(1);
+        if pending.approvers.len() < threshold {
+            return Err(MarketError::InsufficientApprovals);
+        }
+
+        let live = Self::fingerprint_config(
+            &env,
+            &pending.cfg.token,
+            &pending.cfg.referral,
+            &pending.cfg.leaderboard,
+            &pending.cfg.xlm_sac,
+        )?;
+        if live != pending.hashes {
+            return Err(MarketError::WasmHashMismatch);
+        }
+
+        env.storage().instance().set(&DataKey::Cfg, &pending.cfg);
+        env.storage()
+            .instance()
+            .set(&DataKey::PinnedHashes, &pending.hashes);
+        env.storage().instance().remove(&DataKey::PendingConfig);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_act"), caller),
+            pending.cfg,
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending Config change during the dispute window.
+    pub fn cancel_set_config(env: Env, caller: Address) -> Result<(), MarketError> {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        if !env.storage().instance().has(&DataKey::PendingConfig) {
+            return Err(MarketError::NoConfigChange);
+        }
+        env.storage().instance().remove(&DataKey::PendingConfig);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_can"), caller),
+            1_u32,
+        );
+        Ok(())
+    }
+
+    pub fn add_governor(env: Env, admin: Address, governor: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let key = DataKey::Governor(governor.clone());
+        if env.storage().persistent().get(&key).unwrap_or(false) {
+            return Ok(());
+        }
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0);
+        if count >= MAX_GOVERNORS {
+            return Err(MarketError::RateLimitExceeded);
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorCount, &(count + 1));
+        Ok(())
+    }
+
+    pub fn remove_governor(env: Env, admin: Address, governor: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0);
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorThreshold)
+            .unwrap_or(1);
+        if count <= threshold {
+            return Err(MarketError::InvalidThreshold);
+        }
+        let key = DataKey::Governor(governor);
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(MarketError::NotAuthorized);
+        }
+        env.storage().persistent().remove(&key);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorCount, &(count - 1));
+        Ok(())
+    }
+
+    pub fn set_governor_threshold(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+    ) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0);
+        if threshold == 0 || threshold > count {
+            return Err(MarketError::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorThreshold, &threshold);
         Ok(())
     }
 
     /// Read the current Config (for verification/admin tooling).
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
+    }
+
+    pub fn get_pending_config(env: Env) -> Option<PendingConfigChange> {
+        env.storage().instance().get(&DataKey::PendingConfig)
+    }
+
+    pub fn get_pinned_hashes(env: Env) -> Option<PinnedHashes> {
+        env.storage().instance().get(&DataKey::PinnedHashes)
+    }
+
+    pub fn is_governor(env: Env, account: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Governor(account))
+            .unwrap_or(false)
+    }
+
+    pub fn get_governor_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GovernorThreshold)
+            .unwrap_or(1)
+    }
+
+    pub fn get_governor_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0)
     }
 
     // ── Emergency Pause (issue #83) ─────────────────────────────────────────
@@ -1075,6 +1344,67 @@ impl PredictionMarketContract {
     }
 
     // ── Internal Helpers ──────────────────────────────────────────────────
+
+    fn sac_sentinel(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[0u8; 32])
+    }
+
+    /// Live executable fingerprint for a dependency.
+    /// token / referral / leaderboard must be WASM; xlm_sac must be the SAC.
+    fn fingerprint(env: &Env, addr: &Address, expect_sac: bool) -> Result<BytesN<32>, MarketError> {
+        match addr.executable() {
+            Some(Executable::Wasm(hash)) => {
+                if expect_sac {
+                    return Err(MarketError::InvalidDependency);
+                }
+                Ok(hash)
+            }
+            Some(Executable::StellarAsset) => {
+                if !expect_sac {
+                    return Err(MarketError::InvalidDependency);
+                }
+                Ok(Self::sac_sentinel(env))
+            }
+            Some(Executable::Account) | None => Err(MarketError::InvalidDependency),
+        }
+    }
+
+    fn fingerprint_config(
+        env: &Env,
+        token: &Address,
+        referral: &Address,
+        leaderboard: &Address,
+        xlm_sac: &Address,
+    ) -> Result<PinnedHashes, MarketError> {
+        Ok(PinnedHashes {
+            token: Self::fingerprint(env, token, false)?,
+            referral: Self::fingerprint(env, referral, false)?,
+            leaderboard: Self::fingerprint(env, leaderboard, false)?,
+            xlm_sac: Self::fingerprint(env, xlm_sac, true)?,
+        })
+    }
+
+    fn approver_index(approvers: &Vec<Address>, who: &Address) -> Option<u32> {
+        let n = approvers.len();
+        for i in 0..n {
+            if approvers.get(i).unwrap() == *who {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn require_governor(env: &Env, caller: &Address) -> Result<(), MarketError> {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Governor(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        Err(MarketError::NotAuthorized)
+    }
 
     #[inline]
     fn load_market(env: &Env, market_id: u64) -> Result<Market, MarketError> {

@@ -66,6 +66,7 @@ pub enum MarketError {
     WithdrawalRequestExists = 23,
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
+    ContractPaused = 26,
     InvalidDuration = 26, // issue #10: duration below the minimum
 }
 
@@ -90,6 +91,8 @@ pub enum DataKey {
     Payout(u64, Address), // i128 — exact payout computed at resolve time
     // ── Timelocked withdrawal requests (issue #12) ───────────────────────
     PendingWithdrawal(Address), // caller -> WithdrawalRequest
+    // ── Emergency circuit-breaker (issue #83) ─────────────────────────────
+    Paused,
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -241,6 +244,35 @@ impl PredictionMarketContract {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
     }
 
+    // ── Emergency Pause (issue #83) ─────────────────────────────────────────
+    // Halts market creation, betting, resolution, claims, and fee withdrawals
+    // so an in-progress exploit (e.g. a malicious resolver or a reentrancy
+    // attempt) can be contained while a fix is prepared. cancel_refund and
+    // cancel_withdrawal_request stay open even while paused: refunds are the
+    // users' emergency exit from a cancelled market, and cancelling a pending
+    // withdrawal request is itself a safety action the admin needs.
+
+    pub fn pause(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    pub fn unpause(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     // ── Resolver Management ───────────────────────────────────────────────
 
     pub fn add_resolver(env: Env, admin: Address, resolver: Address) -> Result<(), MarketError> {
@@ -310,6 +342,7 @@ impl PredictionMarketContract {
         category: Category,
         duration_secs: u64,
     ) -> Result<u64, MarketError> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         if duration_secs < MIN_MARKET_DURATION_SECS {
@@ -362,6 +395,7 @@ impl PredictionMarketContract {
         is_yes: bool,
         amount: i128,
     ) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         user.require_auth();
 
         let net = amount * NET_NUMERATOR / BPS_DENOM;
@@ -513,6 +547,7 @@ impl PredictionMarketContract {
         market_id: u64,
         outcome: bool,
     ) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_admin_or_resolver(&env, &caller)?;
 
@@ -606,6 +641,7 @@ impl PredictionMarketContract {
     // ── Cancellation ──────────────────────────────────────────────────────
 
     pub fn cancel_market(env: Env, admin: Address, market_id: u64) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
 
@@ -692,6 +728,7 @@ impl PredictionMarketContract {
     // OPT: one Config read replaces 3 separate reads (xlm_sac, leaderboard, token)
 
     pub fn claim(env: Env, user: Address, market_id: u64) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         user.require_auth();
 
         let market = Self::load_market(&env, market_id)?;
@@ -790,6 +827,7 @@ impl PredictionMarketContract {
         caller: Address,
         recipient: Address,
     ) -> Result<i128, MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
         Self::require_valid_fee_recipient(&env, &caller, &recipient)?;
@@ -825,6 +863,7 @@ impl PredictionMarketContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_admin_or_fee_recipient(&env, &caller)?;
         Self::require_valid_fee_recipient(&env, &caller, &recipient)?;
@@ -869,6 +908,7 @@ impl PredictionMarketContract {
     /// Issue #12: pay out a matured withdrawal request. Reverts while the
     /// WITHDRAW_DELAY_SECS timelock is still running.
     pub fn execute_withdraw_fees(env: Env, caller: Address) -> Result<i128, MarketError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let key = DataKey::PendingWithdrawal(caller.clone());
         let req: WithdrawalRequest = env
@@ -1042,6 +1082,14 @@ impl PredictionMarketContract {
             .persistent()
             .get(&DataKey::Market(market_id))
             .ok_or(MarketError::MarketNotFound)
+    }
+
+    #[inline]
+    fn require_not_paused(env: &Env) -> Result<(), MarketError> {
+        if Self::is_paused(env.clone()) {
+            return Err(MarketError::ContractPaused);
+        }
+        Ok(())
     }
 
     #[inline]

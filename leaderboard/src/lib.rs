@@ -18,6 +18,7 @@ pub enum LeaderboardError {
     UnauthorizedCaller = 3,
     InvalidPoints = 4,
     NotAdmin = 5,
+    ContractPaused = 6,
 }
 
 // OPT: was 4 separate keys per user (Points, TotalBets, WonBets, LostBets).
@@ -40,6 +41,7 @@ pub enum DataKey {
     TopPlayerSlot(Address),
     MinPoints, // u64 — points of the weakest entry currently in the top list
     MinSlot,   // u32 — slot index of that weakest entry
+    Paused,
 }
 
 // OPT: PlayerEntry now embeds points directly (avoids a Stats read during sort)
@@ -105,6 +107,42 @@ impl LeaderboardContract {
         Ok(())
     }
 
+    /// Halt point/reward accrual in an emergency. Admin only. View functions
+    /// (get_points, get_top_players, ...) keep working.
+    pub fn pause(env: Env, admin: Address) -> Result<(), LeaderboardError> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if admin != stored {
+            return Err(LeaderboardError::NotAdmin);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Resume point/reward accrual. Admin only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), LeaderboardError> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if admin != stored {
+            return Err(LeaderboardError::NotAdmin);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     /// Original ABI name — kept for callers that deploy against the pre-#23
     /// interface (prediction_market and referral_registry tests use it).
     pub fn set_token(
@@ -122,6 +160,7 @@ impl LeaderboardContract {
         pts: u64,
         is_won: bool,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         let market: Address = env
             .storage()
             .instance()
@@ -284,6 +323,7 @@ impl LeaderboardContract {
         user: Address,
         pts: u64,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         let referral: Address = env
             .storage()
             .instance()
@@ -672,6 +712,11 @@ impl LeaderboardContract {
         }
     }
 
+    fn require_not_paused(env: &Env) -> Result<(), LeaderboardError> {
+        if Self::is_paused(env.clone()) {
+            return Err(LeaderboardError::ContractPaused);
+        }
+        Ok(())
     fn mint_pulse(env: &Env, user: Address, amount: i128) {
         let token: Address = env
             .storage()

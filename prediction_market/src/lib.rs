@@ -5,6 +5,23 @@ use soroban_sdk::{
     String, Symbol, Val, Vec,
 };
 
+// ── Event schema (issue #52) ────────────────────────────────────────────────
+// Topics: (event_name: Symbol, actor: Address [, market_id: u64])
+// Data:   state deltas so an indexer can rebuild history without polling.
+//
+// market_created     (admin, id)              (category, end_time)
+// bet_placed         (user, id)               (is_yes, amount, net)
+// market_resolved    (caller, id)             (outcome, pool, fees)
+// market_cancelled   (admin, id)              net_pool
+// cancel_refund      (user, id)               gross
+// claim_processed    (user, id)               (is_winner, payout)
+// fees_withdrawn     (caller)                 (recipient, amount)
+// withdraw_requested (caller)                 (recipient, amount)
+// withdraw_cancelled (admin)                  caller
+// config_changed     (admin)                  Config
+// paused / unpaused  (admin)                  ()
+// ────────────────────────────────────────────────────────────────────────────
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MIN_BET: i128 = 10_000_000; // minimum net stake: 1 XLM in stroops
@@ -189,16 +206,20 @@ impl PredictionMarketContract {
         env.storage().instance().set(
             &DataKey::Cfg,
             &Config {
-                token: token_contract,
-                referral: referral_contract,
-                leaderboard: leaderboard_contract,
-                xlm_sac,
+                token: token_contract.clone(),
+                referral: referral_contract.clone(),
+                leaderboard: leaderboard_contract.clone(),
+                xlm_sac: xlm_sac.clone(),
             },
         );
         env.storage().instance().set(&DataKey::MarketCount, &0_u64);
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
+        env.events().publish(
+            (Symbol::new(&env, "initialized"), admin),
+            (token_contract, referral_contract, leaderboard_contract, xlm_sac),
+        );
         Ok(())
     }
 
@@ -230,11 +251,15 @@ impl PredictionMarketContract {
         env.storage().instance().set(
             &DataKey::Cfg,
             &Config {
-                token: token_contract,
-                referral: referral_contract,
-                leaderboard: leaderboard_contract,
-                xlm_sac,
+                token: token_contract.clone(),
+                referral: referral_contract.clone(),
+                leaderboard: leaderboard_contract.clone(),
+                xlm_sac: xlm_sac.clone(),
             },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "config_changed"), admin),
+            (token_contract, referral_contract, leaderboard_contract, xlm_sac),
         );
         Ok(())
     }
@@ -256,6 +281,7 @@ impl PredictionMarketContract {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -263,6 +289,7 @@ impl PredictionMarketContract {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -384,6 +411,10 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::MarketCount, &market_id);
 
+        env.events().publish(
+            (Symbol::new(&env, "market_created"), market.creator.clone(), market_id),
+            (market.category.clone(), market.end_time),
+        );
         Ok(market_id)
     }
 
@@ -536,6 +567,10 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "bet_placed"), user, market_id),
+            (is_yes, amount, net),
+        );
         Ok(())
     }
 
@@ -635,6 +670,10 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "market_resolved"), caller, market_id),
+            (outcome, total_pool, acc_fees),
+        );
         Ok(())
     }
 
@@ -677,6 +716,10 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
 
+        env.events().publish(
+            (Symbol::new(&env, "market_cancelled"), admin, market_id),
+            net_pool,
+        );
         Ok(())
     }
 
@@ -721,6 +764,10 @@ impl PredictionMarketContract {
             &gross,
         );
 
+        env.events().publish(
+            (Symbol::new(&env, "cancel_refund"), user, market_id),
+            gross,
+        );
         Ok(gross)
     }
 
@@ -812,6 +859,10 @@ impl PredictionMarketContract {
             ],
         );
 
+        env.events().publish(
+            (Symbol::new(&env, "claim_processed"), user, market_id),
+            (is_winner, payout, real_win),
+        );
         Ok(())
     }
 
@@ -851,6 +902,10 @@ impl PredictionMarketContract {
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
+        env.events().publish(
+            (Symbol::new(&env, "fees_withdrawn"), caller, recipient.clone()),
+            fees,
+        );
         Ok(fees)
     }
 
@@ -894,7 +949,7 @@ impl PredictionMarketContract {
         env.storage().persistent().set(
             &key,
             &WithdrawalRequest {
-                recipient,
+                recipient: recipient.clone(),
                 amount,
                 requested_at: env.ledger().timestamp(),
             },
@@ -902,6 +957,10 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "withdraw_requested"), caller, recipient),
+            amount,
+        );
         Ok(())
     }
 
@@ -946,6 +1005,10 @@ impl PredictionMarketContract {
             &req.amount,
         );
 
+        env.events().publish(
+            (Symbol::new(&env, "fees_withdrawn"), caller, req.recipient.clone()),
+            req.amount,
+        );
         Ok(req.amount)
     }
 
@@ -958,11 +1021,15 @@ impl PredictionMarketContract {
     ) -> Result<(), MarketError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
-        let key = DataKey::PendingWithdrawal(caller);
+        let key = DataKey::PendingWithdrawal(caller.clone());
         if !env.storage().persistent().has(&key) {
             return Err(MarketError::NoWithdrawalRequest);
         }
         env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "withdraw_cancelled"), admin),
+            caller,
+        );
         Ok(())
     }
 

@@ -122,6 +122,7 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -137,6 +138,7 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -197,11 +199,15 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user, stats.points);
+        Self::update_top_players(&env, user.clone(), stats.points);
         // Instance storage (TopPlayerCount, MinPoints, MinSlot, Admin, etc.)
         // has its own TTL that is never bumped by persistent-key writes above —
         // refresh it on every write so the leaderboard's cached min survives.
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            (stats.points, stats.won_bets, stats.lost_bets),
+        );
         Ok(())
     }
 
@@ -257,8 +263,12 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user, tokens);
+            Self::mint_pulse(&env, user.clone(), tokens);
         }
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            (stats.points, is_winner, tokens),
+        );
         Ok(())
     }
 
@@ -301,8 +311,12 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user, tokens);
+            Self::mint_pulse(&env, user.clone(), tokens);
         }
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            (stats.points, tokens),
+        );
         Ok(())
     }
 
@@ -355,8 +369,12 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user, stats.points);
+        Self::update_top_players(&env, user.clone(), stats.points);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            stats.points,
+        );
         Ok(())
     }
 

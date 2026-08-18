@@ -53,7 +53,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);
@@ -85,6 +85,9 @@ fn test_register_with_referrer() {
     let t = setup();
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
 
     // Referrer must be a registered user before they can refer others.
     let no_ref: Option<Address> = None;
@@ -223,7 +226,6 @@ fn test_credit_with_referrer() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
-    // Referrer must be registered before they can be used as a referrer.
     let no_ref: Option<Address> = None;
     t.client
         .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
@@ -314,7 +316,6 @@ fn test_earnings_accumulation() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
-    // Referrer must be registered first.
     let no_ref: Option<Address> = None;
     t.client
         .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
@@ -345,7 +346,6 @@ fn test_referrer_bonus_points_accumulate() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
-    // Referrer must be registered first.
     let no_ref: Option<Address> = None;
     t.client
         .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
@@ -367,7 +367,7 @@ fn test_referrer_bonus_points_accumulate() {
     t.client.credit(&t.market, &user, &5_000_000_i128);
 
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 14); // 5 welcome + 3 × 3 bonus pts
+    assert_eq!(lb_client.get_points(&referrer), 14); // welcome bonus + 3 × 3 pts
 }
 
 // ── 11. Referral count tracking ──────────────────────────────────────────────
@@ -376,6 +376,9 @@ fn test_referrer_bonus_points_accumulate() {
 fn test_referral_count_tracking() {
     let t = setup();
     let referrer = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
 
     // Referrer must be registered before they can refer others.
     let no_ref: Option<Address> = None;
@@ -395,7 +398,23 @@ fn test_referral_count_tracking() {
     assert_eq!(t.client.get_referral_count(&referrer), 3);
 }
 
-// ── 12. Double initialization rejected ───────────────────────────────────────
+// ── 12. Unregistered referrers are rejected ─────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reject_unregistered_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let unregistered_referrer = Address::generate(&t.env);
+
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Bettor"),
+        &Some(unregistered_referrer),
+    );
+}
+
+// ── 13. Double initialization rejected ───────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "Error(Contract, #1)")]
@@ -474,4 +493,75 @@ fn test_legacy_user_without_referrer() {
     assert!(s.client.is_registered(&legacy_user));
     assert_eq!(s.client.get_referrer(&legacy_user), None);
     assert!(!s.client.has_referrer(&legacy_user));
+}
+
+// ── Emergency Pause (issue #83) ───────────────────────────────────────────────
+
+#[test]
+fn test_pause_unpause_admin_only() {
+    let t = setup();
+    assert!(!t.client.is_paused());
+    t.client.pause(&t.admin);
+    assert!(t.client.is_paused());
+    t.client.unpause(&t.admin);
+    assert!(!t.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_pause_rejects_non_admin() {
+    let t = setup();
+    let not_admin = Address::generate(&t.env);
+    t.client.pause(&not_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_paused_rejects_register_referral() {
+    let t = setup();
+    t.client.pause(&t.admin);
+    let user = Address::generate(&t.env);
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_paused_rejects_credit() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    // Write the profile directly rather than via register_referral, so this
+    // test only exercises the pause gate on credit() (register_referral's
+    // leaderboard cross-call has an unrelated, pre-existing ABI mismatch).
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Bettor"),
+                referrer: Some(referrer.clone()),
+            },
+        );
+    });
+
+    t.client.pause(&t.admin);
+    t.client.credit(&t.market, &user, &1_0000000_i128);
+}
+
+#[test]
+fn test_view_functions_work_while_paused() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Someone"),
+                referrer: None,
+            },
+        );
+    });
+
+    t.client.pause(&t.admin);
+    assert!(t.client.is_registered(&user));
 }

@@ -6,8 +6,14 @@ use soroban_sdk::{
 };
 
 const WELCOME_BONUS_POINTS: u64 = 5;
-const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
+
+// Storage TTL lifecycle (mirrors the leaderboard's read/write bump strategy):
+// referrer counters are kept alive for at least TTL_BUMP ledgers on every
+// read/write so active referrers' history does not silently expire (issue #73).
+// A full storage-rental/keeper approach is tracked separately (issue #9).
+const TTL_BUMP: u32 = 3_153_600;
+const TTL_HIGH: u32 = 6_307_200;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -144,6 +150,10 @@ impl ReferralRegistryContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
+            // Keep the referrer's counter alive on every write.
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::ReferralCount(ref_addr.clone()), TTL_BUMP, TTL_HIGH);
         }
 
         let this = env.current_contract_address();
@@ -152,15 +162,17 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
+        // Leaderboard mints the welcome bonus internally (Lever G); we only
+        // signal the bonus points. The old `reward_bonus(token)` entry point was
+        // removed in favour of `add_bonus_pts(caller, user, pts)`.
         let _: Val = env.invoke_contract(
             &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
+            &Symbol::new(&env, "add_bonus_pts"),
             vec![
                 &env,
                 this.into_val(&env),
                 user.into_val(&env),
                 WELCOME_BONUS_POINTS.into_val(&env),
-                WELCOME_BONUS_TOKENS.into_val(&env),
             ],
         );
         Ok(())
@@ -209,9 +221,13 @@ impl ReferralRegistryContract {
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
                 env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr),
+                    &DataKey::ReferralEarnings(ref_addr.clone()),
                     &(earnings + referral_fee),
                 );
+                // Keep the referrer's earnings alive on every write.
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::ReferralEarnings(ref_addr), TTL_BUMP, TTL_HIGH);
                 Ok(true)
             }
             None => {
@@ -275,17 +291,29 @@ impl ReferralRegistryContract {
     }
 
     pub fn get_referral_count(env: Env, user: Address) -> u32 {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReferralCount(user.clone()))
+            .unwrap_or(0);
+        // Read-bump: keep the counter alive while it is still being queried.
         env.storage()
             .persistent()
-            .get(&DataKey::ReferralCount(user))
-            .unwrap_or(0)
+            .extend_ttl(&DataKey::ReferralCount(user), TTL_BUMP, TTL_HIGH);
+        count
     }
 
     pub fn get_earnings(env: Env, user: Address) -> i128 {
+        let earnings: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReferralEarnings(user.clone()))
+            .unwrap_or(0);
+        // Read-bump: keep the earnings alive while it is still being queried.
         env.storage()
             .persistent()
-            .get(&DataKey::ReferralEarnings(user))
-            .unwrap_or(0)
+            .extend_ttl(&DataKey::ReferralEarnings(user), TTL_BUMP, TTL_HIGH);
+        earnings
     }
 
     pub fn has_referrer(env: Env, user: Address) -> bool {

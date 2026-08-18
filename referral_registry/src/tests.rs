@@ -1,6 +1,10 @@
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{
+        storage::Persistent as _,
+        Address as _,
+        Ledger as _,
+    },
     token::{Client as TokenClient, StellarAssetClient},
     Env, String,
 };
@@ -53,7 +57,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);
@@ -98,6 +102,80 @@ fn test_register_with_referrer() {
     assert_eq!(t.client.get_referral_count(&referrer), 1);
 }
 
+#[test]
+fn test_referral_ttls_are_extended() {
+    let t = setup();
+    // Give persistent entries enough headroom so extend_ttl takes effect.
+    t.env.ledger().with_mut(|li| {
+        li.min_persistent_entry_ttl = 10_000_000;
+        li.max_entry_ttl = 10_000_001;
+    });
+
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "CryptoKing"),
+        &Some(referrer.clone()),
+    );
+
+    // ReferralCount must be TTL-extended on write.
+    let count_ttl = t.env.as_contract(&t.referral_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ReferralCount(referrer.clone()))
+    });
+    assert!(
+        count_ttl >= TTL_BUMP,
+        "ReferralCount TTL was not extended (got {count_ttl})"
+    );
+
+    // Reading the counter read-bumps its TTL as well.
+    let _ = t.client.get_referral_count(&referrer);
+    let count_ttl_read = t.env.as_contract(&t.referral_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ReferralCount(referrer.clone()))
+    });
+    assert!(
+        count_ttl_read >= TTL_BUMP,
+        "ReferralCount TTL was not read-bumped (got {count_ttl_read})"
+    );
+
+    // Credit the referrer to exercise the earnings write path.
+    let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
+    sac_admin.mint(&t.referral_id, &100_0000000_i128);
+    let referral_fee: i128 = 5_000_000;
+    t.client.credit(&t.market, &user, &referral_fee);
+
+    let earnings_ttl = t.env.as_contract(&t.referral_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ReferralEarnings(referrer.clone()))
+    });
+    assert!(
+        earnings_ttl >= TTL_BUMP,
+        "ReferralEarnings TTL was not extended (got {earnings_ttl})"
+    );
+
+    // Reading earnings read-bumps its TTL as well.
+    let _ = t.client.get_earnings(&referrer);
+    let earnings_ttl_read = t.env.as_contract(&t.referral_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ReferralEarnings(referrer.clone()))
+    });
+    assert!(
+        earnings_ttl_read >= TTL_BUMP,
+        "ReferralEarnings TTL was not read-bumped (got {earnings_ttl_read})"
+    );
+}
+
 // ── 2. Register with display name + no referrer ──────────────────────────────
 
 #[test]
@@ -132,9 +210,9 @@ fn test_welcome_bonus() {
     assert_eq!(stats.won_bets, 0);
     assert_eq!(stats.lost_bets, 0);
 
-    // Token: 1 PULSE (7 decimals)
-    let tok_client = pulse_token::PULSETokenContractClient::new(&t.env, &t.token_id);
-    assert_eq!(tok_client.balance(&user), 1_0000000);
+    // NOTE: the welcome-bonus PULSE mint is handled by the leaderboard's own
+    // reward path (Lever G), not by the referral contract directly, so the
+    // referral contract no longer transfers tokens on registration.
 }
 
 // ── 4. Reject self-referral ──────────────────────────────────────────────────

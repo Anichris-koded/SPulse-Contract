@@ -94,6 +94,7 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::TopPlayerCount, &0_u32);
         env.storage().instance().set(&DataKey::MinPoints, &0_u64);
         env.storage().instance().set(&DataKey::MinSlot, &0_u32);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -400,6 +401,7 @@ impl LeaderboardContract {
             .instance()
             .set(&DataKey::TopPlayerCount, &write);
         Self::refresh_min(env, write);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         write
     }
 
@@ -464,6 +466,10 @@ impl LeaderboardContract {
         );
 
         Self::update_top_players(env, user.clone(), stats.points);
+        // Instance storage (TopPlayerCount, MinPoints, MinSlot, Admin, etc.)
+        // has its own TTL that is never bumped by persistent-key writes above —
+        // refresh it on every write so the leaderboard's cached min survives.
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
     }
 
     fn mint_tokens(env: &Env, user: &Address, tokens: i128) -> Result<(), LeaderboardError> {
@@ -506,6 +512,7 @@ impl LeaderboardContract {
         env.storage()
             .instance()
             .set(&DataKey::TokenContract, token);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -594,3 +601,5 @@ impl LeaderboardContract {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod ttl_tests;

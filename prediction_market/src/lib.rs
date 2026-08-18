@@ -7,10 +7,11 @@ use soroban_sdk::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MIN_BET: i128 = 10_000_000; // 1 XLM in stroops
+const MIN_BET: i128 = 10_000_000; // minimum net stake: 1 XLM in stroops
 
 const MAX_BETS_PER_USER: u32 = 20;
 const MAX_MARKETS_PER_HOUR: u32 = 10;
+const MAX_BETTORS_PER_PAGE: u32 = 100;
 
 // Fee constants — multiply before divide to avoid precision loss
 const TOTAL_FEE_BPS: i128 = 200;
@@ -22,6 +23,12 @@ const WIN_POINTS: u64 = 30;
 const LOSE_POINTS: u64 = 10;
 const WIN_TOKENS: i128 = 10_0000000;
 const LOSE_TOKENS: i128 = 2_0000000;
+
+// Withdrawal safety (issue #12): a single payout is capped and the non-admin
+// path is timelocked, so a compromised fee recipient cannot drain the whole
+// accumulator to an arbitrary address in one call.
+const WITHDRAW_DELAY_SECS: u64 = 86_400; // 24h timelock between request and payout
+const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated fees
 
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
@@ -53,6 +60,11 @@ pub enum MarketError {
     NotAuthorized = 18,
     MarketNotCancelled = 19,
     RateLimitExceeded = 20,
+    InvalidFeeRecipient = 21,
+    WithdrawalTooLarge = 22,
+    WithdrawalRequestExists = 23,
+    NoWithdrawalRequest = 24,
+    WithdrawalTooSoon = 25,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -74,6 +86,8 @@ pub enum DataKey {
     RateWindow, // packed u64: high32=window_start_hi, low32=count
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
+    // ── Timelocked withdrawal requests (issue #12) ───────────────────────
+    PendingWithdrawal(Address), // caller -> WithdrawalRequest
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -95,6 +109,15 @@ pub struct BetEntry {
     pub is_yes: bool,
     pub claimed: bool,
     pub count: u32, // how many times this user has bet on this market
+}
+
+// ── WithdrawalRequest: capped, recipient-validated, timelocked (issue #12) ──
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalRequest {
+    pub recipient: Address,
+    pub amount: i128,
+    pub requested_at: u64,
 }
 
 // ── Domain Structs ────────────────────────────────────────────────────────────
@@ -336,7 +359,8 @@ impl PredictionMarketContract {
     ) -> Result<(), MarketError> {
         user.require_auth();
 
-        if amount < MIN_BET {
+        let net = amount * NET_NUMERATOR / BPS_DENOM;
+        if net < MIN_BET {
             return Err(MarketError::BetTooSmall);
         }
 
@@ -372,7 +396,6 @@ impl PredictionMarketContract {
         let total_fee = amount * TOTAL_FEE_BPS / BPS_DENOM;
         let platform_fee = amount * PLATFORM_FEE_BPS / BPS_DENOM;
         let referral_fee = total_fee - platform_fee;
-        let net = amount * NET_NUMERATOR / BPS_DENOM;
 
         // OPT: one Config read instead of 4 separate instance reads
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
@@ -639,6 +662,15 @@ impl PredictionMarketContract {
         let gross = entry.gross;
         entry.gross = 0; // idempotency guard
         env.storage().persistent().set(&bet_key, &entry);
+        // Read-time TTL refresh (issue #9): a refund must not be able to observe
+        // an expired bet/market record — keep both alive so a user who returns
+        // late to a cancelled market can still pull their refund.
+        env.storage()
+            .persistent()
+            .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         token::Client::new(&env, &cfg.xlm_sac).transfer(
@@ -689,6 +721,12 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
+        // Read-time TTL refresh (issue #9): a claim must not be able to observe
+        // an expired market/bet record — keep the market entry alive here too
+        // so late claims on a long-lived market keep working.
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         let this = env.current_contract_address();
@@ -735,6 +773,11 @@ impl PredictionMarketContract {
     }
 
     // ── Withdraw Fees ─────────────────────────────────────────────────────
+    // Issue #12: the unbounded, instant, arbitrary-recipient withdrawal is
+    // gone. The immediate path is admin-only and its recipient must be the
+    // caller, the admin, or a registered fee recipient. Fee recipients must
+    // use the timelocked request_withdraw_fees -> execute_withdraw_fees flow,
+    // which is also capped so the accumulator can never be drained at once.
 
     pub fn withdraw_fees(
         env: Env,
@@ -742,7 +785,8 @@ impl PredictionMarketContract {
         recipient: Address,
     ) -> Result<i128, MarketError> {
         caller.require_auth();
-        Self::require_admin_or_fee_recipient(&env, &caller)?;
+        Self::require_admin(&env, &caller)?;
+        Self::require_valid_fee_recipient(&env, &caller, &recipient)?;
 
         let fees: i128 = env
             .storage()
@@ -764,6 +808,116 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
         Ok(fees)
+    }
+
+    /// Issue #12: request a capped, timelocked withdrawal. The payout lands
+    /// only after WITHDRAW_DELAY_SECS via execute_withdraw_fees, and the admin
+    /// can cancel the request before then (see cancel_withdrawal_request).
+    pub fn request_withdraw_fees(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), MarketError> {
+        caller.require_auth();
+        Self::require_admin_or_fee_recipient(&env, &caller)?;
+        Self::require_valid_fee_recipient(&env, &caller, &recipient)?;
+
+        if amount <= 0 {
+            return Err(MarketError::InvalidAmount);
+        }
+        let key = DataKey::PendingWithdrawal(caller.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(MarketError::WithdrawalRequestExists);
+        }
+
+        let fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        if amount > fees {
+            return Err(MarketError::WithdrawalTooLarge);
+        }
+        // Cap: a single request may take at most MAX_WITHDRAWAL_BPS of the
+        // accumulator, so even a compromised recipient cannot drain it fully.
+        let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+        if amount > cap {
+            return Err(MarketError::WithdrawalTooLarge);
+        }
+
+        env.storage().persistent().set(
+            &key,
+            &WithdrawalRequest {
+                recipient,
+                amount,
+                requested_at: env.ledger().timestamp(),
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    /// Issue #12: pay out a matured withdrawal request. Reverts while the
+    /// WITHDRAW_DELAY_SECS timelock is still running.
+    pub fn execute_withdraw_fees(env: Env, caller: Address) -> Result<i128, MarketError> {
+        caller.require_auth();
+        let key = DataKey::PendingWithdrawal(caller.clone());
+        let req: WithdrawalRequest = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MarketError::NoWithdrawalRequest)?;
+
+        let now = env.ledger().timestamp();
+        if now < req.requested_at || now - req.requested_at < WITHDRAW_DELAY_SECS {
+            return Err(MarketError::WithdrawalTooSoon);
+        }
+
+        let mut acc_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        if acc_fees < req.amount {
+            return Err(MarketError::WithdrawalTooLarge);
+        }
+        acc_fees -= req.amount;
+
+        // Effects before interaction so a reentrant recipient cannot re-read
+        // stale accumulator state.
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &acc_fees);
+        env.storage().persistent().remove(&key);
+
+        let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
+        token::Client::new(&env, &cfg.xlm_sac).transfer(
+            &env.current_contract_address(),
+            &req.recipient,
+            &req.amount,
+        );
+
+        Ok(req.amount)
+    }
+
+    /// Issue #12: the admin can cancel a pending (not yet executed) withdrawal
+    /// request, stopping a compromised fee recipient mid-timelock.
+    pub fn cancel_withdrawal_request(
+        env: Env,
+        admin: Address,
+        caller: Address,
+    ) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let key = DataKey::PendingWithdrawal(caller);
+        if !env.storage().persistent().has(&key) {
+            return Err(MarketError::NoWithdrawalRequest);
+        }
+        env.storage().persistent().remove(&key);
+        Ok(())
     }
 
     // ── View Functions ────────────────────────────────────────────────────
@@ -793,15 +947,33 @@ impl PredictionMarketContract {
             .unwrap_or(0)
     }
 
+    /// Return the first bounded page of bettors for compatibility with the
+    /// original ABI. Call `get_market_bettors_page` for later pages.
     pub fn get_market_bettors(env: Env, market_id: u64) -> Result<Vec<Address>, MarketError> {
+        Self::get_market_bettors_page(env, market_id, 0, MAX_BETTORS_PER_PAGE)
+    }
+
+    /// Return at most `limit` bettors starting at the given index.
+    ///
+    /// The upper bound keeps each request's storage work predictable. The
+    /// `start` index maps directly to the append-only bettor index, so paging
+    /// does not scan or deserialize earlier entries.
+    pub fn get_market_bettors_page(
+        env: Env,
+        market_id: u64,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<Address>, MarketError> {
         Self::load_market(&env, market_id)?;
         let count: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::BettorCount(market_id))
             .unwrap_or(0);
+        let page_limit = limit.min(MAX_BETTORS_PER_PAGE);
+        let end = start.saturating_add(page_limit).min(count);
         let mut result: Vec<Address> = Vec::new(&env);
-        for i in 0..count {
+        for i in start..end {
             if let Some(addr) = env
                 .storage()
                 .persistent()
@@ -818,6 +990,19 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0)
+    }
+
+    pub fn is_fee_recipient(env: Env, recipient: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeRecipient(recipient))
+            .unwrap_or(false)
+    }
+
+    pub fn get_pending_withdrawal(env: Env, caller: Address) -> Option<WithdrawalRequest> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingWithdrawal(caller))
     }
 
     pub fn get_payout(env: Env, market_id: u64, user: Address) -> i128 {
@@ -906,6 +1091,31 @@ impl PredictionMarketContract {
         Err(MarketError::NotAuthorized)
     }
 
+    // Issue #12: fees may only be paid to the caller, the admin, or a
+    // registered fee recipient — never to an arbitrary address.
+    fn require_valid_fee_recipient(
+        env: &Env,
+        caller: &Address,
+        recipient: &Address,
+    ) -> Result<(), MarketError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(MarketError::NotInitialized)?;
+        if *recipient == *caller
+            || *recipient == admin
+            || env
+                .storage()
+                .persistent()
+                .get(&DataKey::FeeRecipient(recipient.clone()))
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        Err(MarketError::InvalidFeeRecipient)
+    }
+
     // OPT: CreationWindow packed into two u32s stored as separate u32 keys
     // to avoid struct serialization. Actually simpler: store as (u64, u32) tuple
     // via a single key — Soroban serializes tuples efficiently.
@@ -918,7 +1128,11 @@ impl PredictionMarketContract {
             .get(&DataKey::RateWindow)
             .unwrap_or((now, 0));
 
-        let (new_ws, new_cnt) = if now - ws < 3600 {
+        // A timestamp regression must remain in the existing window. Using
+        // checked subtraction prevents underflow from resetting the limit and
+        // allowing an extra burst of market creations.
+        let elapsed = now.checked_sub(ws).unwrap_or(0);
+        let (new_ws, new_cnt) = if elapsed < 3600 {
             if cnt >= MAX_MARKETS_PER_HOUR {
                 return Err(MarketError::RateLimitExceeded);
             }

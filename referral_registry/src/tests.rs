@@ -53,7 +53,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);
@@ -114,16 +114,25 @@ fn test_register_no_referrer() {
     assert!(!t.client.has_referrer(&user));
 }
 
-// ── 3. Welcome bonus: 5 pts + 1 PULSE on registration ─────────────────────
+// ── 3. Welcome bonus: 5 pts + 1 PULSE only when a referrer is provided ────────
 
 #[test]
 fn test_welcome_bonus() {
     let t = setup();
+    let referrer = Address::generate(&t.env);
     let user = Address::generate(&t.env);
 
+    // Register the referrer first (no bonus expected — no referrer provided)
     let no_ref: Option<Address> = None;
     t.client
-        .register_referral(&user, &String::from_str(&t.env, "NewUser"), &no_ref);
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
+    // Register user WITH the referrer — this should trigger the welcome bonus
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "NewUser"),
+        &Some(referrer.clone()),
+    );
 
     // Leaderboard: 5 welcome points, no win/loss impact
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
@@ -135,6 +144,25 @@ fn test_welcome_bonus() {
     // Token: 1 PULSE (7 decimals)
     let tok_client = pulse_token::PULSETokenContractClient::new(&t.env, &t.token_id);
     assert_eq!(tok_client.balance(&user), 1_0000000);
+}
+
+// ── 3b. No welcome bonus when registering WITHOUT a referrer ──────────────────
+
+#[test]
+fn test_no_bonus_without_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Solo"), &no_ref);
+
+    // No bonus points, no PULSE minted
+    let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    assert_eq!(lb_client.get_points(&user), 0);
+
+    let tok_client = pulse_token::PULSETokenContractClient::new(&t.env, &t.token_id);
+    assert_eq!(tok_client.balance(&user), 0);
 }
 
 // ── 4. Reject self-referral ──────────────────────────────────────────────────
@@ -430,4 +458,123 @@ fn test_legacy_user_without_referrer() {
     assert!(s.client.is_registered(&legacy_user));
     assert_eq!(s.client.get_referrer(&legacy_user), None);
     assert!(!s.client.has_referrer(&legacy_user));
+}
+
+// ── Security: depth limit ─────────────────────────────────────────────────────
+
+/// Build a chain of MAX_REFERRAL_DEPTH users (depth 5) and verify that
+/// attempting to register one more node past the limit is rejected with
+/// Error(Contract, #7) == ReferralDepthExceeded.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_referral_depth_limit_exceeded() {
+    let t = setup();
+
+    // Build a chain: u0 → u1 → u2 → u3 → u4  (depth = 5, at the limit).
+    // u0 is the root (no referrer).
+    let no_ref: Option<Address> = None;
+    let u0 = Address::generate(&t.env);
+    t.client
+        .register_referral(&u0, &String::from_str(&t.env, "U0"), &no_ref);
+
+    let mut prev = u0;
+    for i in 1..=5u32 {
+        let u = Address::generate(&t.env);
+        t.client.register_referral(
+            &u,
+            &String::from_str(&t.env, "Ui"),
+            &Some(prev.clone()),
+        );
+        let _ = i;
+        prev = u;
+    }
+
+    // prev is now at depth 5. Trying to add one more node (depth 6) must fail.
+    let u_overflow = Address::generate(&t.env);
+    t.client.register_referral(
+        &u_overflow,
+        &String::from_str(&t.env, "Overflow"),
+        &Some(prev),
+    );
+}
+
+/// A chain exactly at MAX_REFERRAL_DEPTH (5 hops) must still be accepted.
+#[test]
+fn test_referral_depth_at_limit_accepted() {
+    let t = setup();
+
+    let no_ref: Option<Address> = None;
+    let u0 = Address::generate(&t.env);
+    t.client
+        .register_referral(&u0, &String::from_str(&t.env, "U0"), &no_ref);
+
+    let mut prev = u0;
+    for _ in 1..=5u32 {
+        let u = Address::generate(&t.env);
+        t.client.register_referral(
+            &u,
+            &String::from_str(&t.env, "Ui"),
+            &Some(prev.clone()),
+        );
+        prev = u;
+    }
+
+    // All 5 hops registered successfully — the last node is reachable.
+    assert!(t.client.is_registered(&prev));
+}
+
+// ── Security: cycle detection ─────────────────────────────────────────────────
+
+/// A → B is valid. When B tries to register with A as referrer, the chain
+/// A → B → A would be a cycle and must be rejected with Error(Contract, #8)
+/// == ReferralCycle.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_referral_cycle_direct() {
+    let t = setup();
+    let a = Address::generate(&t.env);
+    let b = Address::generate(&t.env);
+
+    // A registers with B as referrer
+    t.client.register_referral(
+        &a,
+        &String::from_str(&t.env, "A"),
+        &Some(b.clone()),
+    );
+
+    // B tries to register with A as referrer → cycle A→B→A
+    t.client.register_referral(
+        &b,
+        &String::from_str(&t.env, "B"),
+        &Some(a.clone()),
+    );
+}
+
+/// Indirect cycle: A refers B, B refers C; C tries to refer A.
+/// Chain would be A → B → C → A — must be rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_referral_cycle_indirect() {
+    let t = setup();
+    let a = Address::generate(&t.env);
+    let b = Address::generate(&t.env);
+    let c = Address::generate(&t.env);
+
+    t.client.register_referral(
+        &a,
+        &String::from_str(&t.env, "A"),
+        &Some(b.clone()),
+    );
+    t.client.register_referral(
+        &b,
+        &String::from_str(&t.env, "B"),
+        &Some(c.clone()),
+    );
+
+    // C tries to close the cycle back to A
+    t.client.register_referral(
+        &c,
+        &String::from_str(&t.env, "C"),
+        &Some(a.clone()),
+    );
 }

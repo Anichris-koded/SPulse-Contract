@@ -78,7 +78,7 @@ fn setup() -> TestSetup {
     // Lever G: the leaderboard now mints PULSE internally (one cross-call from
     // market/referral instead of two). It must know the token AND be authorized
     // as a minter. This mirrors the exact mainnet upgrade sequence.
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy minter auths kept harmless (market/referral no longer mint directly).
     token_client.set_minter(&market_id);

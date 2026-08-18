@@ -9,6 +9,12 @@ const WELCOME_BONUS_POINTS: u64 = 5;
 const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
 
+/// Maximum allowed depth of the referral chain. A new registration whose
+/// referrer already sits at depth MAX_REFERRAL_DEPTH (i.e. has MAX_REFERRAL_DEPTH
+/// ancestors) is rejected. This bounds both gas usage during the on-chain
+/// traversal and sybil-amplification attack surface.
+const MAX_REFERRAL_DEPTH: u32 = 5;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -19,6 +25,11 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    /// The referrer's chain already reaches MAX_REFERRAL_DEPTH ancestors.
+    ReferralDepthExceeded = 7,
+    /// The proposed referrer is already a descendant of `user`, which would
+    /// create a cycle in the referral graph.
+    ReferralCycle = 8,
 }
 
 #[contracttype]
@@ -123,7 +134,34 @@ impl ReferralRegistryContract {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
             }
+
+            // ── Sybil-resistance: depth limit + cycle detection ──────────────
+            // Walk the referrer's ancestor chain up to MAX_REFERRAL_DEPTH steps.
+            // Two invariants are enforced in a single pass:
+            //
+            //  1. Depth: if the referrer's chain already has MAX_REFERRAL_DEPTH
+            //     ancestors, reject — the new node would exceed the limit.
+            //
+            //  2. Cycle: if `user` appears anywhere in the referrer's chain,
+            //     linking them would create a cycle (e.g. A→B→C, C tries to
+            //     refer A). This also handles the indirect self-referral case.
+            //
+            // The walk is bounded by MAX_REFERRAL_DEPTH, so gas usage is O(depth).
+            let mut depth: u32 = 0;
+            let mut current: Option<Address> = Some(ref_addr.clone());
+            while let Some(ancestor) = current {
+                if ancestor == user {
+                    return Err(ReferralError::ReferralCycle);
+                }
+                if depth >= MAX_REFERRAL_DEPTH {
+                    return Err(ReferralError::ReferralDepthExceeded);
+                }
+                depth += 1;
+                current = Self::load_profile(&env, &ancestor)
+                    .and_then(|p| p.referrer);
+            }
         }
+
         // Lever A: write ONE packed Profile entry (display_name + referrer)
         // instead of the three legacy keys (Registered + DisplayName + Referrer).
         // Existence of Profile(user) is what is_registered() now checks.
@@ -144,25 +182,48 @@ impl ReferralRegistryContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
-        }
 
-        let this = env.current_contract_address();
-        let leaderboard: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::LeaderboardContract)
-            .unwrap();
-        let _: Val = env.invoke_contract(
-            &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
-            vec![
-                &env,
-                this.into_val(&env),
-                user.into_val(&env),
-                WELCOME_BONUS_POINTS.into_val(&env),
-                WELCOME_BONUS_TOKENS.into_val(&env),
-            ],
-        );
+            // ── Welcome bonus: only awarded when a referrer is provided ──────
+            // Granting a bonus to every registrant (with or without a referrer)
+            // allows sybil attackers to farm WELCOME_BONUS_TOKENS by creating
+            // unlimited self-owned accounts. Restricting the bonus to referred
+            // registrations means a real referrer must be incentivised to invite
+            // someone, and the attacker earns nothing from a chain of solo
+            // registrations.
+            let this = env.current_contract_address();
+            let leaderboard: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::LeaderboardContract)
+                .unwrap();
+            let _: Val = env.invoke_contract(
+                &leaderboard,
+                &Symbol::new(&env, "add_bonus_pts"),
+                vec![
+                    &env,
+                    this.clone().into_val(&env),
+                    user.clone().into_val(&env),
+                    WELCOME_BONUS_POINTS.into_val(&env),
+                ],
+            );
+            // Mint PULSE tokens directly from the referral contract (which is
+            // an authorised minter on the token contract).
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::TokenContract)
+                .unwrap();
+            let _: Val = env.invoke_contract(
+                &token,
+                &Symbol::new(&env, "mint"),
+                vec![
+                    &env,
+                    this.into_val(&env),
+                    user.into_val(&env),
+                    WELCOME_BONUS_TOKENS.into_val(&env),
+                ],
+            );
+        }
         Ok(())
     }
 

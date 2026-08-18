@@ -1,4 +1,4 @@
-﻿{
+{
   "generators": {
     "address": 10,
     "nonce": 0,
@@ -68,7 +68,7 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-              "function_name": "set_token",
+              "function_name": "set_token_contract",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -661,14 +661,6 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "bonus_bets"
-                    },
-                    "val": {
-                      "u32": 1
-                    }
-                  },
-                  {
-                    "key": {
                       "symbol": "lost_bets"
                     },
                     "val": {
@@ -681,6 +673,14 @@
                     },
                     "val": {
                       "u64": "5"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_bets"
+                    },
+                    "val": {
+                      "u32": 1
                     }
                   },
                   {
@@ -721,14 +721,6 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "bonus_bets"
-                    },
-                    "val": {
-                      "u32": 1
-                    }
-                  },
-                  {
-                    "key": {
                       "symbol": "lost_bets"
                     },
                     "val": {
@@ -741,6 +733,14 @@
                     },
                     "val": {
                       "u64": "5"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_bets"
+                    },
+                    "val": {
+                      "u32": 1
                     }
                   },
                   {
@@ -781,14 +781,6 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "bonus_bets"
-                    },
-                    "val": {
-                      "u32": 1
-                    }
-                  },
-                  {
-                    "key": {
                       "symbol": "lost_bets"
                     },
                     "val": {
@@ -801,6 +793,14 @@
                     },
                     "val": {
                       "u64": "5"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_bets"
+                    },
+                    "val": {
+                      "u32": 1
                     }
                   },
                   {
@@ -976,7 +976,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6307200
+        "live_until": 4095
       },
       {
         "entry": {
@@ -1003,7 +1003,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6307200
+        "live_until": 4095
       },
       {
         "entry": {
@@ -1030,7 +1030,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6307200
+        "live_until": 4095
       },
       {
         "entry": {
@@ -1080,7 +1080,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "5"
+                        "u64": "0"
                       }
                     },
                     {
@@ -1138,7 +1138,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       },
       {
         "entry": {
@@ -1558,7 +1558,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       }
     ]
   },

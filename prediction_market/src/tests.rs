@@ -165,7 +165,7 @@ fn test_create_market() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #26)")]
+#[should_panic(expected = "Error(Contract, #27)")]
 fn test_reject_zero_market_duration() {
     let t = setup();
     t.client.create_market(
@@ -178,7 +178,7 @@ fn test_reject_zero_market_duration() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #26)")]
+#[should_panic(expected = "Error(Contract, #27)")]
 fn test_reject_market_duration_below_minimum() {
     let t = setup();
     t.client.create_market(
@@ -1168,7 +1168,7 @@ fn test_create_multiple_markets() {
     assert_eq!(t.client.get_market(&id2).category, Category::Sports);
 }
 
-// ── 41. Empty-side resolution: pool goes to AccumulatedFees, admin can withdraw ─
+// ── 41. Empty-side resolution: principal stays claimable, fees stay fees (issue #57) ─
 
 #[test]
 fn test_empty_side_resolution_pool_to_fees() {
@@ -1181,33 +1181,36 @@ fn test_empty_side_resolution_pool_to_fees() {
     t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
     let fees_before = t.client.get_accumulated_fees();
     assert_eq!(fees_before, 2_0000000); // 2% platform fee
+    assert_eq!(t.client.get_market_fees(&id), 2_0000000);
 
     // Advance past end_time and resolve NO (empty winning side)
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &false); // total_no == 0
 
-    // The entire pool (total_yes net = 98 XLM) must be swept into AccumulatedFees
+    // Principal must NOT enter the fee pot. Only the 2 XLM platform fee remains.
     let fees_after = t.client.get_accumulated_fees();
     assert_eq!(
-        fees_after,
-        fees_before + 98_0000000,
-        "entire YES pool should sweep to fees when NO side is empty"
+        fees_after, fees_before,
+        "empty-side principal must not be swept into AccumulatedFees"
     );
+    assert_eq!(t.client.get_payout(&id, &alice), 98_0000000);
 
-    // Admin can withdraw the swept pool to a registered treasury
+    // Admin can withdraw proven fees only — not Alice's net stake
     let treasury = Address::generate(&t.env);
     t.client.add_fee_recipient(&t.admin, &treasury);
     let before = t.xlm.balance(&treasury);
     let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
-    assert_eq!(withdrawn, fees_after);
-    assert_eq!(t.xlm.balance(&treasury), before + fees_after);
+    assert_eq!(withdrawn, 2_0000000);
+    assert_eq!(t.xlm.balance(&treasury), before + 2_0000000);
     assert_eq!(t.client.get_accumulated_fees(), 0);
+    assert_eq!(t.client.get_market_fees(&id), 0);
 
-    // Alice (was YES, losing side) can still claim — gets PULSE tokens + points
+    // Alice claims her net principal plus lose-tier PULSE / points
+    let alice_xlm_before = t.xlm.balance(&alice);
     t.client.claim(&alice, &id);
     let bet = t.client.get_bet(&id, &alice);
     assert!(bet.claimed);
-    // Gets lose-tier rewards because winning_side == 0
+    assert_eq!(t.xlm.balance(&alice), alice_xlm_before + 98_0000000);
     assert_eq!(t.token_client.balance(&alice), 2_0000000); // LOSE_TOKENS
     assert_eq!(t.leaderboard_client.get_points(&alice), 10); // LOSE_POINTS
 }
@@ -1710,4 +1713,87 @@ fn test_cancel_withdrawal_request_still_works_while_paused() {
     t.client.cancel_withdrawal_request(&t.admin, &recipient);
 
     assert!(t.client.get_pending_withdrawal(&recipient).is_none());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION — issue #57 (withdraw_fees provenance / drain)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_cancel_does_not_wipe_other_market_fees() {
+    let t = setup();
+    let id1 = create_test_market(&t);
+    let id2 = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Market 2"),
+        &String::from_str(&t.env, "https://m2.png"),
+        &Category::Other,
+        &3600_u64,
+    );
+
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+
+    t.client.place_bet(&alice, &id1, &true, &100_0000000_i128); // 2 XLM
+    t.client.place_bet(&bob, &id2, &true, &100_0000000_i128); // 2 XLM
+    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+    assert_eq!(t.client.get_market_fees(&id1), 2_0000000);
+    assert_eq!(t.client.get_market_fees(&id2), 2_0000000);
+
+    t.client.cancel_market(&t.admin, &id1);
+
+    assert_eq!(t.client.get_market_fees(&id1), 0);
+    assert_eq!(t.client.get_market_fees(&id2), 2_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+}
+
+#[test]
+fn test_withdraw_fees_cannot_take_empty_side_principal() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &false);
+
+    let treasury = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &treasury);
+    let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
+    assert_eq!(withdrawn, 2_0000000);
+
+    // Alice's 98 XLM net is still sitting in the contract for her to claim.
+    let alice_before = t.xlm.balance(&alice);
+    t.client.claim(&alice, &id);
+    assert_eq!(t.xlm.balance(&alice), alice_before + 98_0000000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_fee_recipient_two_step_cannot_target_arbitrary_address() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    let stranger = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client
+        .request_withdraw_fees(&recipient, &stranger, &cap);
+}
+
+#[test]
+fn test_legacy_fees_start_empty_on_fresh_deploy() {
+    let t = setup();
+    t.client.migrate_fee_ledger();
+    assert_eq!(t.client.get_legacy_fees(), 0);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
 }

@@ -39,6 +39,8 @@ pub enum DataKey {
     TopPlayerAt(u32),
     TopPlayerCount,
     TopPlayerSlot(Address),
+    TopPlayerSeqAt(u32), // u64 — FIFO insertion sequence for the player at a slot
+    SeqCounter,          // u64 — monotonic counter feeding TopPlayerSeqAt
     MinPoints, // u64 — points of the weakest entry currently in the top list
     MinSlot,   // u32 — slot index of that weakest entry
     Paused,
@@ -143,6 +145,8 @@ impl LeaderboardContract {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
     /// Original ABI name — kept for callers that deploy against the pre-#23
     /// interface (prediction_market and referral_registry tests use it).
     pub fn set_token(
@@ -712,11 +716,40 @@ impl LeaderboardContract {
         }
     }
 
+    #[inline]
+    fn require_market_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
+        let mkt: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if *caller != mkt {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn require_referral_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
+        let ref_: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferralContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if *caller != ref_ {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn require_not_paused(env: &Env) -> Result<(), LeaderboardError> {
-        if Self::is_paused(env.clone()) {
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
             return Err(LeaderboardError::ContractPaused);
         }
         Ok(())
+    }
+
     fn mint_pulse(env: &Env, user: Address, amount: i128) {
         let token: Address = env
             .storage()

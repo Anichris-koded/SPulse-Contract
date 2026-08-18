@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 55,
+    "address": 57,
     "nonce": 0,
     "mux_id": 0
   },
@@ -1391,7 +1391,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADKPR2"
                 },
                 {
-                  "u64": "1048"
+                  "u64": "100"
                 },
                 {
                   "bool": true
@@ -1419,7 +1419,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADMXIK"
                 },
                 {
-                  "u64": "1049"
+                  "u64": "100"
                 },
                 {
                   "bool": true
@@ -1431,6 +1431,9 @@
         }
       ]
     ],
+    [],
+    [],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
@@ -1447,10 +1450,73 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADO7A2"
                 },
                 {
-                  "u64": "5"
+                  "u64": "100"
                 },
                 {
-                  "bool": false
+                  "bool": true
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
+    [],
+    [],
+    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "add_pts",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADRE7L"
+                },
+                {
+                  "u64": "100"
+                },
+                {
+                  "bool": true
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
+    [],
+    [],
+    [],
+    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "add_pts",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADTMX3"
+                },
+                {
+                  "u64": "100"
+                },
+                {
+                  "bool": true
                 }
               ]
             }
@@ -4394,7 +4460,7 @@
                       "symbol": "points"
                     },
                     "val": {
-                      "u64": "1048"
+                      "u64": "100"
                     }
                   },
                   {
@@ -4454,7 +4520,7 @@
                       "symbol": "points"
                     },
                     "val": {
-                      "u64": "1049"
+                      "u64": "100"
                     }
                   },
                   {
@@ -4506,7 +4572,7 @@
                       "symbol": "lost_bets"
                     },
                     "val": {
-                      "u32": 1
+                      "u32": 0
                     }
                   },
                   {
@@ -4514,7 +4580,7 @@
                       "symbol": "points"
                     },
                     "val": {
-                      "u64": "5"
+                      "u64": "100"
                     }
                   },
                   {
@@ -4522,7 +4588,127 @@
                       "symbol": "won_bets"
                     },
                     "val": {
+                      "u32": 1
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307200
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Stats"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADRE7L"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "bonus_bets"
+                    },
+                    "val": {
                       "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lost_bets"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "points"
+                    },
+                    "val": {
+                      "u64": "100"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "won_bets"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307200
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Stats"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADTMX3"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "bonus_bets"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lost_bets"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "points"
+                    },
+                    "val": {
+                      "u64": "100"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "won_bets"
+                    },
+                    "val": {
+                      "u32": 1
                     }
                   }
                 ]
@@ -6670,7 +6856,7 @@
                       "symbol": "address"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADKPR2"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADTMX3"
                     }
                   },
                   {
@@ -6678,7 +6864,7 @@
                       "symbol": "points"
                     },
                     "val": {
-                      "u64": "1048"
+                      "u64": "100"
                     }
                   }
                 ]
@@ -6714,7 +6900,7 @@
                       "symbol": "address"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADMXIK"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADRE7L"
                     }
                   },
                   {
@@ -6722,7 +6908,7 @@
                       "symbol": "points"
                     },
                     "val": {
-                      "u64": "1049"
+                      "u64": "100"
                     }
                   }
                 ]
@@ -8048,7 +8234,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u64": "49"
+                "u64": "53"
               }
             }
           },
@@ -8075,7 +8261,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u64": "50"
+                "u64": "52"
               }
             }
           },
@@ -9392,13 +9578,13 @@
                     "symbol": "TopPlayerSlot"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADKPR2"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADRE7L"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "u32": 48
+                "u32": 49
               }
             }
           },
@@ -9419,13 +9605,13 @@
                     "symbol": "TopPlayerSlot"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADMXIK"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADTMX3"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "u32": 49
+                "u32": 48
               }
             }
           },
@@ -9481,7 +9667,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "1000"
+                        "u64": "100"
                       }
                     },
                     {
@@ -9493,7 +9679,7 @@
                         ]
                       },
                       "val": {
-                        "u32": 0
+                        "u32": 49
                       }
                     },
                     {
@@ -9517,7 +9703,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "50"
+                        "u64": "53"
                       }
                     },
                     {
@@ -10470,6 +10656,26 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
               "key": {
                 "ledger_key_nonce": {
+                  "nonce": "8067048471933141837"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "ledger_key_nonce": {
                   "nonce": "8077058277077262192"
                 }
               },
@@ -10511,6 +10717,26 @@
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "8375915698557174338"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "8582780626144801259"
                 }
               },
               "durability": "temporary",

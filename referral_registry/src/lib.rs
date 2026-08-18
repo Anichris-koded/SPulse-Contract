@@ -19,6 +19,7 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    UnregisteredReferrer = 7,
 }
 
 #[contracttype]
@@ -122,6 +123,12 @@ impl ReferralRegistryContract {
         if let Some(ref ref_addr) = referrer {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
+            }
+            // Referrer must already be a registered user; reject unregistered
+            // addresses to prevent fee routing to arbitrary/attacker-controlled
+            // addresses and to keep the referral graph within real participants.
+            if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                return Err(ReferralError::UnregisteredReferrer);
             }
         }
         // Lever A: write ONE packed Profile entry (display_name + referrer)

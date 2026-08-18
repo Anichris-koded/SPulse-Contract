@@ -660,7 +660,8 @@ impl PredictionMarketContract {
         }
 
         let gross = entry.gross;
-        entry.gross = 0; // idempotency guard
+        entry.gross = 0;
+        entry.net = 0;
         env.storage().persistent().set(&bet_key, &entry);
         // Read-time TTL refresh (issue #9): a refund must not be able to observe
         // an expired bet/market record — keep both alive so a user who returns

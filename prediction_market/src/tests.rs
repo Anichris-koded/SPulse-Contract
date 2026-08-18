@@ -449,10 +449,14 @@ fn test_cancel_market_claim_style_refund() {
     let alice_refund = t.client.cancel_refund(&alice, &id);
     assert_eq!(alice_refund, 100_0000000); // full gross (100 XLM)
     assert_eq!(t.xlm.balance(&alice), alice_before);
+    assert_eq!(t.client.get_bet(&id, &alice).amount, 0);
+    assert_eq!(t.client.get_bet_gross(&id, &alice), 0);
 
     let bob_refund = t.client.cancel_refund(&bob, &id);
     assert_eq!(bob_refund, 50_0000000); // full gross (50 XLM)
     assert_eq!(t.xlm.balance(&bob), bob_before);
+    assert_eq!(t.client.get_bet(&id, &bob).amount, 0);
+    assert_eq!(t.client.get_bet_gross(&id, &bob), 0);
 }
 
 // ── 18. Cancel refund is idempotent — double refund rejected ──────────────────

@@ -165,6 +165,49 @@ fn test_create_market() {
     assert_eq!(market.bet_count, 0);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_reject_zero_market_duration() {
+    let t = setup();
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Zero duration"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &0_u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_reject_market_duration_below_minimum() {
+    let t = setup();
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Too short"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &(MIN_MARKET_DURATION_SECS - 1),
+    );
+}
+
+#[test]
+fn test_market_duration_minimum_is_allowed() {
+    let t = setup();
+    let id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Minimum duration"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &MIN_MARKET_DURATION_SECS,
+    );
+
+    assert_eq!(
+        t.client.get_market(&id).end_time,
+        t.env.ledger().timestamp() + MIN_MARKET_DURATION_SECS
+    );
+}
+
 // ── 3. Place YES bet ──────────────────────────────────────────────────────────
 
 #[test]
@@ -229,6 +272,12 @@ fn test_fee_split_with_referrer() {
     let referrer = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
 
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -239,7 +288,7 @@ fn test_fee_split_with_referrer() {
 
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
 }
 
 // ── 7. Reject bet on expired market ──────────────────────────────────────────
@@ -444,10 +493,14 @@ fn test_cancel_market_claim_style_refund() {
     let alice_refund = t.client.cancel_refund(&alice, &id);
     assert_eq!(alice_refund, 100_0000000); // full gross (100 XLM)
     assert_eq!(t.xlm.balance(&alice), alice_before);
+    assert_eq!(t.client.get_bet(&id, &alice).amount, 0);
+    assert_eq!(t.client.get_bet_gross(&id, &alice), 0);
 
     let bob_refund = t.client.cancel_refund(&bob, &id);
     assert_eq!(bob_refund, 50_0000000); // full gross (50 XLM)
     assert_eq!(t.xlm.balance(&bob), bob_before);
+    assert_eq!(t.client.get_bet(&id, &bob).amount, 0);
+    assert_eq!(t.client.get_bet_gross(&id, &bob), 0);
 }
 
 // ── 18. Cancel refund is idempotent — double refund rejected ──────────────────
@@ -832,6 +885,10 @@ fn test_bettor_index_enumeration() {
 #[test]
 fn test_bettor_index_legacy_read_is_bounded() {
     let t = setup();
+    // Simulating a 101-entry legacy index legitimately reads 100 slots in one
+    // call, which exceeds the default mainnet-like resource limits — this test
+    // proves read boundedness, not gas, so lift the limits like other suites.
+    t.env.cost_estimate().disable_resource_limits();
     let id = create_test_market(&t);
     let first = Address::generate(&t.env);
     let beyond_first_page = Address::generate(&t.env);
@@ -873,6 +930,12 @@ fn test_referrer_bonus_points_per_bet() {
     let referrer = Address::generate(&t.env);
     fund_user(&t, &user, 500_0000000);
 
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Fan"),
@@ -882,7 +945,7 @@ fn test_referrer_bonus_points_per_bet() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &50_0000000_i128);
 
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 }
 
 // ── 31. Spam guard: TooManyBets ──────────────────────────────────────────────
@@ -895,8 +958,10 @@ fn test_reject_too_many_bets() {
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 100_000_000_000);
 
+    // 1.1 XLM gross clears the net minimum (net = 1.078 XLM >= MIN_BET) so the
+    // 21st bet actually trips the TooManyBets guard instead of BetTooSmall.
     for _ in 0..=20u32 {
-        t.client.place_bet(&user, &id, &true, &1_0000000_i128);
+        t.client.place_bet(&user, &id, &true, &11_0000000_i128);
     }
 }
 
@@ -1187,6 +1252,12 @@ fn test_e2e_full_inter_contract_flow() {
     fund_user(&t, &alice, 1000_0000000);
     fund_user(&t, &bob, 1000_0000000);
 
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
     t.referral_client.register_referral(
         &alice,
         &String::from_str(&t.env, "Alice"),
@@ -1209,7 +1280,7 @@ fn test_e2e_full_inter_contract_flow() {
         .place_bet(&alice, &market_id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
     // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
     assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
     assert_eq!(t.client.get_market(&market_id).total_yes, 98_0000000);
@@ -1231,7 +1302,7 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 150_0000000);
     assert_eq!(t.client.get_market(&market_id).total_yes, 147_0000000);
     assert_eq!(t.client.get_market(&market_id).bet_count, 2);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 
     // Add a resolver and resolve via them
     let resolver = Address::generate(&t.env);

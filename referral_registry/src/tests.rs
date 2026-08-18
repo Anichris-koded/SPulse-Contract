@@ -86,6 +86,9 @@ fn test_register_with_referrer() {
     let t = setup();
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
 
     t.client.register_referral(
         &user,
@@ -202,6 +205,10 @@ fn test_credit_with_referrer() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
     // Register user with referrer
     t.client.register_referral(
         &user,
@@ -225,7 +232,7 @@ fn test_credit_with_referrer() {
 
     // Referrer got 3 leaderboard bonus points
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 3);
+    assert_eq!(lb_client.get_points(&referrer), 8);
 
     // Earnings tracked
     assert_eq!(t.client.get_earnings(&referrer), referral_fee);
@@ -287,6 +294,10 @@ fn test_earnings_accumulation() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -313,6 +324,10 @@ fn test_referrer_bonus_points_accumulate() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -329,7 +344,7 @@ fn test_referrer_bonus_points_accumulate() {
     t.client.credit(&t.market, &user, &5_000_000_i128);
 
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 9); // 3 × 3 pts
+    assert_eq!(lb_client.get_points(&referrer), 14); // welcome bonus + 3 × 3 pts
 }
 
 // ── 11. Referral count tracking ──────────────────────────────────────────────
@@ -338,6 +353,9 @@ fn test_referrer_bonus_points_accumulate() {
 fn test_referral_count_tracking() {
     let t = setup();
     let referrer = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
 
     // 3 users register with the same referrer
     for _ in 0..3 {
@@ -352,7 +370,23 @@ fn test_referral_count_tracking() {
     assert_eq!(t.client.get_referral_count(&referrer), 3);
 }
 
-// ── 12. Double initialization rejected ───────────────────────────────────────
+// ── 12. Unregistered referrers are rejected ─────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reject_unregistered_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let unregistered_referrer = Address::generate(&t.env);
+
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Bettor"),
+        &Some(unregistered_referrer),
+    );
+}
+
+// ── 13. Double initialization rejected ───────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "Error(Contract, #1)")]

@@ -38,6 +38,7 @@ pub enum ReferralError {
     /// order/count/type, changed return type) always increments
     /// INTERFACE_VERSION in the same commit. See EXPECTED_LEADERBOARD_INTERFACE_VERSION.
     IncompatibleInterface = 7,
+    ReferrerNotRegistered = 7,
 }
 
 #[contracttype]
@@ -146,6 +147,9 @@ impl ReferralRegistryContract {
         if let Some(ref ref_addr) = referrer {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
+            }
+            if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                return Err(ReferralError::ReferrerNotRegistered);
             }
         }
         // Lever A: write ONE packed Profile entry (display_name + referrer)

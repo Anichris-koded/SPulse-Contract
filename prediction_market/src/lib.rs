@@ -34,6 +34,7 @@ const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated f
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
+const MAX_TTL_REFRESH_PAGE: u32 = 20;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -67,7 +68,7 @@ pub enum MarketError {
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
     ContractPaused = 26,
-    InvalidDuration = 26, // issue #10: duration below the minimum
+    InvalidDuration = 27, // issue #10: duration below the minimum
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -199,6 +200,7 @@ impl PredictionMarketContract {
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -632,9 +634,9 @@ impl PredictionMarketContract {
         market.outcome = outcome;
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
-        env.storage()
-            .persistent()
-            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        // Issue #54: keep every fund-bearing key for this market alive at
+        // settlement so later claims cannot observe an expired Bet/Payout.
+        let _ = Self::refresh_market_keys(&env, market_id);
         Ok(())
     }
 
@@ -656,9 +658,7 @@ impl PredictionMarketContract {
         market.cancelled = true;
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
-        env.storage()
-            .persistent()
-            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        let _ = Self::refresh_market_keys(&env, market_id);
 
         // Reclaim fees — net * fee_rate / (1 - fee_rate)
         let net_pool = market.total_yes + market.total_no;
@@ -764,12 +764,12 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
-        // Read-time TTL refresh (issue #9): a claim must not be able to observe
-        // an expired market/bet record — keep the market entry alive here too
-        // so late claims on a long-lived market keep working.
+        // Read-time TTL refresh (issue #9 / #54): keep market + payout alive
+        // so a late claim on a long-lived market still pays out.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
+        Self::bump_if_present(&env, &DataKey::Payout(market_id, user.clone()));
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         let this = env.current_contract_address();
@@ -1038,6 +1038,49 @@ impl PredictionMarketContract {
             .unwrap_or(0)
     }
 
+    /// Remaining TTL (ledgers) of the Market key. 0 means missing/expired —
+    /// integrators can warn before funds become unrecoverable (issue #54).
+    pub fn get_market_ttl(env: Env, market_id: u64) -> u32 {
+        let key = DataKey::Market(market_id);
+        if !env.storage().persistent().has(&key) {
+            return 0;
+        }
+        env.storage().persistent().get_ttl(&key)
+    }
+
+    /// Permissionless keeper: anyone may pay to extend this market's
+    /// Market/Bet/Payout/bettor-index keys. Does not resurrect expired entries.
+    pub fn refresh_market_ttl(env: Env, market_id: u64) -> Result<u32, MarketError> {
+        Self::refresh_market_keys(&env, market_id)
+    }
+
+    /// Permissionless migration: bump existing markets in
+    /// `[start_id, start_id + limit)`. After a WASM upgrade this is how
+    /// pre-existing entries get a fresh TTL without waiting for a user claim.
+    pub fn refresh_markets(
+        env: Env,
+        start_id: u64,
+        limit: u32,
+    ) -> Result<u32, MarketError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketCount)
+            .unwrap_or(0);
+        let limit = limit.min(MAX_TTL_REFRESH_PAGE).max(1);
+        let mut bumped: u32 = 0;
+        let mut id = if start_id == 0 { 1 } else { start_id };
+        let end = id.saturating_add(limit as u64);
+        while id < end && id <= count {
+            if Self::refresh_market_keys(&env, id).is_ok() {
+                bumped += 1;
+            }
+            id += 1;
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(bumped)
+    }
+
     pub fn is_fee_recipient(env: Env, recipient: Address) -> bool {
         env.storage()
             .persistent()
@@ -1082,6 +1125,45 @@ impl PredictionMarketContract {
             .persistent()
             .get(&DataKey::Market(market_id))
             .ok_or(MarketError::MarketNotFound)
+    }
+
+    fn bump_if_present(env: &Env, key: &DataKey) {
+        if env.storage().persistent().has(key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(key, TTL_BUMP, TTL_HIGH);
+        }
+    }
+
+    /// Extend every live fund-bearing key for `market_id`. Used by resolve
+    /// (read-bump), the permissionless keeper, and the upgrade migration.
+    fn refresh_market_keys(env: &Env, market_id: u64) -> Result<u32, MarketError> {
+        let mkt_key = DataKey::Market(market_id);
+        if !env.storage().persistent().has(&mkt_key) {
+            return Err(MarketError::MarketNotFound);
+        }
+        Self::bump_if_present(env, &mkt_key);
+
+        let bettors: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BettorCount(market_id))
+            .unwrap_or(0);
+        Self::bump_if_present(env, &DataKey::BettorCount(market_id));
+        for i in 0..bettors {
+            let slot_key = DataKey::BettorAt(market_id, i);
+            if let Some(addr) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&slot_key)
+            {
+                Self::bump_if_present(env, &slot_key);
+                Self::bump_if_present(env, &DataKey::Bet(market_id, addr.clone()));
+                Self::bump_if_present(env, &DataKey::Payout(market_id, addr));
+            }
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(bettors)
     }
 
     #[inline]

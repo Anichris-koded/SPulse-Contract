@@ -1,6 +1,6 @@
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{storage::Persistent as _, Address as _},
     token::{Client as TokenClient, StellarAssetClient},
     Env, String,
 };
@@ -372,7 +372,7 @@ fn test_referral_count_tracking() {
 // ── 12. Unregistered referrers are rejected ─────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "Error(Contract, #8)")]
 fn test_reject_unregistered_referrer() {
     let t = setup();
     let user = Address::generate(&t.env);
@@ -535,4 +535,30 @@ fn test_view_functions_work_while_paused() {
 
     t.client.pause(&t.admin);
     assert!(t.client.is_registered(&user));
+}
+
+#[test]
+fn test_register_and_refresh_extend_referrer_ttl() {
+    let t = setup();
+    let referrer = Address::generate(&t.env);
+    t.client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Ref"),
+        &None,
+    );
+    let user = Address::generate(&t.env);
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Bettor"),
+        &Some(referrer.clone()),
+    );
+
+    let count_ttl = t.env.as_contract(&t.referral_id, || {
+        t.env.storage()
+            .persistent()
+            .get_ttl(&DataKey::ReferralCount(referrer.clone()))
+    });
+    assert!(count_ttl >= TTL_BUMP);
+    t.client.refresh_referrer_ttl(&referrer);
+    assert_eq!(t.client.get_referral_count(&referrer), 1);
 }

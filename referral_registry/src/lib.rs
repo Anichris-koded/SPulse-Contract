@@ -8,6 +8,8 @@ use soroban_sdk::{
 const WELCOME_BONUS_POINTS: u64 = 5;
 const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
+const TTL_BUMP: u32 = 3_153_600;
+const TTL_HIGH: u32 = 6_307_200;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -20,7 +22,7 @@ pub enum ReferralError {
     SelfReferral = 5,
     NotAdmin = 6,
     ContractPaused = 7,
-    ReferrerNotRegistered = 7,
+    ReferrerNotRegistered = 8,
 }
 
 #[contracttype]
@@ -85,6 +87,7 @@ impl ReferralRegistryContract {
         env.storage()
             .instance()
             .set(&DataKey::XlmSacContract, &xlm_sac);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -165,6 +168,11 @@ impl ReferralRegistryContract {
                 referrer: referrer.clone(),
             },
         );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Profile(user.clone()),
+            TTL_BUMP,
+            TTL_HIGH,
+        );
         // The referrer's counter is a DIFFERENT user's entry — update in place.
         if let Some(ref ref_addr) = referrer {
             let count: u32 = env
@@ -172,9 +180,13 @@ impl ReferralRegistryContract {
                 .persistent()
                 .get(&DataKey::ReferralCount(ref_addr.clone()))
                 .unwrap_or(0);
+            let count_key = DataKey::ReferralCount(ref_addr.clone());
             env.storage()
                 .persistent()
-                .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
+                .set(&count_key, &(count + 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&count_key, TTL_BUMP, TTL_HIGH);
         }
 
         let this = env.current_contract_address();
@@ -240,10 +252,13 @@ impl ReferralRegistryContract {
                     .persistent()
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
-                env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr),
-                    &(earnings + referral_fee),
-                );
+                let earn_key = DataKey::ReferralEarnings(ref_addr);
+                env.storage()
+                    .persistent()
+                    .set(&earn_key, &(earnings + referral_fee));
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&earn_key, TTL_BUMP, TTL_HIGH);
                 Ok(true)
             }
             None => {
@@ -307,17 +322,54 @@ impl ReferralRegistryContract {
     }
 
     pub fn get_referral_count(env: Env, user: Address) -> u32 {
-        env.storage()
+        let key = DataKey::ReferralCount(user);
+        let count = env
+            .storage()
             .persistent()
-            .get(&DataKey::ReferralCount(user))
-            .unwrap_or(0)
+            .get(&key)
+            .unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        }
+        count
     }
 
     pub fn get_earnings(env: Env, user: Address) -> i128 {
-        env.storage()
+        let key = DataKey::ReferralEarnings(user);
+        let earnings = env
+            .storage()
             .persistent()
-            .get(&DataKey::ReferralEarnings(user))
-            .unwrap_or(0)
+            .get(&key)
+            .unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        }
+        earnings
+    }
+
+    /// Permissionless keeper: extend a referrer's count/earnings + profile
+    /// so inactive referrers do not lose history (issue #28 / #54).
+    pub fn refresh_referrer_ttl(env: Env, user: Address) {
+        let keys = [
+            DataKey::Profile(user.clone()),
+            DataKey::ReferralCount(user.clone()),
+            DataKey::ReferralEarnings(user.clone()),
+            DataKey::Registered(user.clone()),
+            DataKey::Referrer(user.clone()),
+            DataKey::DisplayName(user),
+        ];
+        for key in keys {
+            if env.storage().persistent().has(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+            }
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
     }
 
     pub fn has_referrer(env: Env, user: Address) -> bool {

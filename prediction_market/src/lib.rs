@@ -11,6 +11,7 @@ const MIN_BET: i128 = 10_000_000; // minimum net stake: 1 XLM in stroops
 
 const MAX_BETS_PER_USER: u32 = 20;
 const MAX_MARKETS_PER_HOUR: u32 = 10;
+const MIN_MARKET_DURATION_SECS: u64 = 60; // issue #10: no instantly-expired markets
 const MAX_BETTORS_PER_PAGE: u32 = 100;
 
 // Fee constants — multiply before divide to avoid precision loss
@@ -66,6 +67,7 @@ pub enum MarketError {
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
     ContractPaused = 26,
+    InvalidDuration = 26, // issue #10: duration below the minimum
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -343,6 +345,9 @@ impl PredictionMarketContract {
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
+        if duration_secs < MIN_MARKET_DURATION_SECS {
+            return Err(MarketError::InvalidDuration);
+        }
         Self::check_rate(&env)?;
 
         // OPT: single instance read for count (was already one read)
@@ -696,7 +701,8 @@ impl PredictionMarketContract {
         }
 
         let gross = entry.gross;
-        entry.gross = 0; // idempotency guard
+        entry.gross = 0;
+        entry.net = 0;
         env.storage().persistent().set(&bet_key, &entry);
         // Read-time TTL refresh (issue #9): a refund must not be able to observe
         // an expired bet/market record — keep both alive so a user who returns

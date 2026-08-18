@@ -20,6 +20,7 @@ pub enum ReferralError {
     SelfReferral = 5,
     NotAdmin = 6,
     ContractPaused = 7,
+    ReferrerNotRegistered = 7,
 }
 
 #[contracttype]
@@ -149,6 +150,9 @@ impl ReferralRegistryContract {
         if let Some(ref ref_addr) = referrer {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
+            }
+            if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                return Err(ReferralError::ReferrerNotRegistered);
             }
         }
         // Lever A: write ONE packed Profile entry (display_name + referrer)

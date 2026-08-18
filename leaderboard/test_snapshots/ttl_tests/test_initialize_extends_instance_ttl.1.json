@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 2,
+    "address": 4,
     "nonce": 0,
     "mux_id": 0
   },
@@ -19,13 +19,10 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "string": "PULSE"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "string": "PLSE"
-                },
-                {
-                  "u32": 7
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                 }
               ]
             }
@@ -34,9 +31,6 @@
         }
       ]
     ],
-    [],
-    [],
-    [],
     []
   ],
   "ledger": {
@@ -80,48 +74,60 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Decimals"
+                            "symbol": "MarketContract"
                           }
                         ]
                       },
                       "val": {
-                        "u32": 7
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                       }
                     },
                     {
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Name"
+                            "symbol": "MinPoints"
                           }
                         ]
                       },
                       "val": {
-                        "string": "PULSE"
+                        "u64": "0"
                       }
                     },
                     {
                       "key": {
                         "vec": [
                           {
-                            "symbol": "Symbol"
+                            "symbol": "MinSlot"
                           }
                         ]
                       },
                       "val": {
-                        "string": "PLSE"
+                        "u32": 0
                       }
                     },
                     {
                       "key": {
                         "vec": [
                           {
-                            "symbol": "TotalSupply"
+                            "symbol": "ReferralContract"
                           }
                         ]
                       },
                       "val": {
-                        "i128": "0"
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TopPlayerCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 0
                       }
                     }
                   ]
@@ -131,7 +137,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       },
       {
         "entry": {
@@ -165,7 +171,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       }
     ]
   },

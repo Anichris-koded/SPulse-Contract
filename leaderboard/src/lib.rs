@@ -253,6 +253,48 @@ impl LeaderboardContract {
             .unwrap_or(0)
     }
 
+    /// Recompute the `MinPoints`/`MinSlot` cache from the actual top-list
+    /// entries rather than maintaining it incrementally.
+    ///
+    /// The previous incremental maintenance was unsound under ties: it tracked
+    /// a single (points, slot) pair and could not represent two players that
+    /// share the minimum score, so the cached `MinSlot` could point at the
+    /// wrong entry and equal-scoring players corrupted the cache. Scanning the
+    /// (bounded, `MAX_TOP_PLAYERS`) list and picking the lowest slot on ties
+    /// keeps the cache correct in all cases.
+    fn recompute_min(env: &Env) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TopPlayerCount)
+            .unwrap_or(0);
+        if count == 0 {
+            env.storage().instance().set(&DataKey::MinPoints, &0_u64);
+            env.storage().instance().set(&DataKey::MinSlot, &0_u32);
+            return;
+        }
+
+        let mut min_points = u64::MAX;
+        let mut min_slot = 0u32;
+        for slot in 0..count {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(slot))
+            {
+                // Strict `<` keeps the lowest slot index as the canonical min on
+                // ties, making tie-breaking deterministic.
+                if entry.points < min_points {
+                    min_points = entry.points;
+                    min_slot = slot;
+                }
+            }
+        }
+
+        env.storage().instance().set(&DataKey::MinPoints, &min_points);
+        env.storage().instance().set(&DataKey::MinSlot, &min_slot);
+    }
+
     // ── Internal: maintain a persistent sorted top list ──────────────────────
 
     fn update_top_players(env: &Env, user: Address, new_points: u64) {
@@ -294,16 +336,7 @@ impl LeaderboardContract {
             }
 
             // Update min points/slot if this was the last slot.
-            if count > 0 {
-                let min_slot = count - 1;
-                let min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &min_slot);
-            }
+            Self::recompute_min(env);
             return;
         }
 
@@ -338,21 +371,16 @@ impl LeaderboardContract {
                 }
             }
 
-            // Update min if we just filled the last slot.
-            if count + 1 == MAX_TOP_PLAYERS {
-                let min_slot = MAX_TOP_PLAYERS - 1;
-                let min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &min_slot);
-            }
+            // Keep the min cache correct after every append.
+            Self::recompute_min(env);
         } else {
-            // List full: replace the minimum if the new points beat it.
+            // List full: replace the minimum if the new points beat or tie it.
+            // Allowing `>=` (instead of `>`) means a player with the same score
+            // as the current minimum can displace one of the equal-min entries
+            // rather than being wrongly rejected — the min cache stays correct
+            // because `recompute_min` is tie-aware.
             let min_points: u64 = env.storage().instance().get(&DataKey::MinPoints).unwrap_or(0);
-            if new_points > min_points {
+            if new_points >= min_points {
                 let min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
                 let old_entry: PlayerEntry = env
                     .storage()
@@ -390,15 +418,8 @@ impl LeaderboardContract {
                     }
                 }
 
-                // Recompute min (now at the last slot after bubbling).
-                let new_min_slot = MAX_TOP_PLAYERS - 1;
-                let new_min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(new_min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &new_min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &new_min_slot);
+                // Recompute the min cache from the actual entries (tie-aware).
+                Self::recompute_min(env);
             }
         }
     }

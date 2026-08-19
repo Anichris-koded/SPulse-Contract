@@ -8,6 +8,12 @@ use soroban_sdk::{
 const WELCOME_BONUS_POINTS: u64 = 5;
 const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
+<<<<<<< HEAD
+=======
+// Cap on lifetime earnings a single referrer can accrue (issue #77).
+const MAX_REFERRAL_EARNINGS: i128 = 500_000_000_000;
+
+>>>>>>> 5a8d426 (fix(referral_registry): cap referrer lifetime earnings)
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
@@ -72,6 +78,9 @@ pub enum DataKey {
     // updated in place — kept as separate keys (not part of the registrant pack).
     ReferralCount(Address),
     ReferralEarnings(Address),
+    // Fees that cannot be paid out (no referrer, or referrer at cap) — held
+    // here and withdrawable by admin (issues #76/#77).
+    SurplusFees,
     TokenContract,
     LeaderboardContract,
     XlmSacContract,
@@ -327,6 +336,7 @@ impl ReferralRegistryContract {
         let referrer: Option<Address> = Self::load_profile(&env, &user).and_then(|p| p.referrer);
         match referrer {
             Some(ref_addr) => {
+<<<<<<< HEAD
                 // Issue #99 defense-in-depth: even if a referral relationship
                 // exists in storage (e.g. written by pre-validation legacy code
                 // or malformed state), never pay out to — or accrue counters
@@ -349,6 +359,19 @@ impl ReferralRegistryContract {
                     return Ok(false);
                 }
 
+=======
+                // Issue #77: check earnings cap before transferring.
+                let earnings: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::ReferralEarnings(ref_addr.clone()))
+                    .unwrap_or(0);
+                if earnings + referral_fee > MAX_REFERRAL_EARNINGS {
+                    // Cap reached — fall through to surplus accumulator.
+                    Self::add_surplus(&env, referral_fee);
+                    return Ok(false);
+                }
+>>>>>>> 5a8d426 (fix(referral_registry): cap referrer lifetime earnings)
                 let xlm_sac: Address = env
                     .storage()
                     .instance()
@@ -396,17 +419,9 @@ impl ReferralRegistryContract {
                 Ok(true)
             }
             None => {
+                // Keep the fee locally (no referrer to pay).
                 if referral_fee > 0 {
-                    let xlm_sac: Address = env
-                        .storage()
-                        .instance()
-                        .get(&DataKey::XlmSacContract)
-                        .unwrap();
-                    token::Client::new(&env, &xlm_sac).transfer(
-                        &env.current_contract_address(),
-                        &caller,
-                        &referral_fee,
-                    );
+                    Self::add_surplus(&env, referral_fee);
                 }
                 env.events().publish(
                     (Symbol::new(&env, "referral_missed"), user),
@@ -417,10 +432,32 @@ impl ReferralRegistryContract {
         }
     }
 
+<<<<<<< HEAD
     /// Issue #78: Admin-callable legacy migration. Reads old Registered/DisplayName/Referrer keys,
     /// writes the packed Profile entry, and removes the legacy keys. Idempotent — no-op if
     /// Profile already exists.
     pub fn migrate_user(env: Env, admin: Address, user: Address) -> Result<(), ReferralError> {
+=======
+    fn add_surplus(env: &Env, amount: i128) {
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SurplusFees, &(current + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SurplusFees, TTL_BUMP, TTL_HIGH);
+    }
+
+    pub fn withdraw_surplus_fees(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+    ) -> Result<i128, ReferralError> {
+>>>>>>> 5a8d426 (fix(referral_registry): cap referrer lifetime earnings)
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -430,6 +467,7 @@ impl ReferralRegistryContract {
             return Err(ReferralError::NotAdmin);
         }
         admin.require_auth();
+<<<<<<< HEAD
         // Already migrated — Profile exists, nothing to do
         if env
             .storage()
@@ -480,6 +518,35 @@ impl ReferralRegistryContract {
         env.storage().persistent().remove(&DataKey::DisplayName(user.clone()));
         env.storage().persistent().remove(&DataKey::Referrer(user));
         Ok(())
+=======
+        let amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0);
+        if amount <= 0 {
+            return Ok(0);
+        }
+        let xlm_sac: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::XlmSacContract)
+            .unwrap();
+        token::Client::new(&env, &xlm_sac).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+        env.storage().persistent().set(&DataKey::SurplusFees, &0);
+        Ok(amount)
+    }
+
+    pub fn get_surplus_fees(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0)
+>>>>>>> 5a8d426 (fix(referral_registry): cap referrer lifetime earnings)
     }
 
     fn load_profile(env: &Env, user: &Address) -> Option<UserProfile> {

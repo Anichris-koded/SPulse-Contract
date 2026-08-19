@@ -838,6 +838,7 @@ fn test_view_functions_work_while_paused() {
     assert!(t.client.is_registered(&user));
 }
 
+<<<<<<< HEAD
 // ── Issue #78: legacy key migration ───────────────────────────────────────────
 
 #[test]
@@ -932,12 +933,26 @@ fn test_register_and_refresh_extend_referrer_ttl() {
         &None,
     );
     let user = Address::generate(&t.env);
+=======
+// ── Issue #77: referral earnings cap ──────────────────────────────────────────
+
+#[test]
+fn test_earnings_cap_rejects_excess() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "BigRef"), &no_ref);
+>>>>>>> 5a8d426 (fix(referral_registry): cap referrer lifetime earnings)
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
         &Some(referrer.clone()),
     );
 
+<<<<<<< HEAD
     let count_ttl = t.env.as_contract(&t.referral_id, || {
         t.env.storage()
             .persistent()
@@ -962,4 +977,22 @@ fn test_register_referral_emits_event() {
     let topic0 = Val::try_from_val(&t.env, &body.topics[0]).unwrap();
     let name = Symbol::try_from_val(&t.env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&t.env, "referral_registered"));
+=======
+    let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
+    sac_admin.mint(&t.referral_id, &1_000_000_000_000_i128); // 100,000 XLM
+
+    // Credit up to just under the cap
+    let under_cap = 499_000_000_000_i128;
+    t.client.credit(&t.market, &user, &under_cap);
+    assert_eq!(t.client.get_earnings(&referrer), under_cap);
+
+    // One more credit that would exceed the cap
+    let would_overflow = 2_000_000_000_i128;
+    let result = t.client.credit(&t.market, &user, &would_overflow);
+
+    // Earnings should be capped — credit returns false, fee goes to surplus
+    assert!(!result);
+    assert_eq!(t.client.get_earnings(&referrer), under_cap); // unchanged
+    assert_eq!(t.client.get_surplus_fees(), would_overflow);
+>>>>>>> 5a8d426 (fix(referral_registry): cap referrer lifetime earnings)
 }

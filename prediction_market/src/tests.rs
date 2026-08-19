@@ -259,7 +259,9 @@ fn test_fee_full_2_percent_no_referrer() {
     fund_user(&t, &user, 200_0000000);
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
-    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    // Issue #78: only platform_fee is tracked in AccumulatedFees;
+    // referral fee stays in referral contract as surplus.
+    assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
 }
 
 // ── 6. Fee split with referrer ────────────────────────────────────────────────
@@ -1181,7 +1183,7 @@ fn test_empty_side_resolution_pool_to_fees() {
     // Only YES bets — no one bets NO
     t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
     let fees_before = t.client.get_accumulated_fees();
-    assert_eq!(fees_before, 2_0000000); // 2% platform fee
+    assert_eq!(fees_before, 1_5000000); // 1.5% platform fee (referral fee goes to surplus)
 
     // Advance past end_time and resolve NO (empty winning side)
     advance_time(&t.env, 3601);
@@ -1224,10 +1226,10 @@ fn test_cancel_fees_zeroed_correctly() {
     fund_user(&t, &alice, 200_0000000);
     fund_user(&t, &bob, 200_0000000);
 
-    // Two bets accumulate fees
-    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 2 XLM fee
-    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 2 XLM fee
-    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+    // Two bets accumulate fees (only platform_fee tracked; referral fee goes to surplus)
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 1.5 XLM platform fee
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 1.5 XLM platform fee
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000);
 
     // Cancel zeroes out those fees
     t.client.cancel_market(&t.admin, &id);
@@ -1289,7 +1291,9 @@ fn test_e2e_full_inter_contract_flow() {
     // Bob bets NO 200 XLM — no referrer
     t.client
         .place_bet(&bob, &market_id, &false, &200_0000000_i128);
-    assert_eq!(t.client.get_accumulated_fees(), 5_5000000);
+    // Issue #78: only platform_fee tracked per bet; referral fee goes to surplus.
+    // Alice: 1.5M, Bob: 3M platform fee → total 4.5M
+    assert_eq!(t.client.get_accumulated_fees(), 4_5000000);
     // Bob never registered, so no bonus: total_bets = won(0) + lost(0) + bonus(0).
     assert_eq!(t.leaderboard_client.get_stats(&bob).total_bets, 0);
     assert_eq!(t.client.get_market(&market_id).total_no, 196_0000000);

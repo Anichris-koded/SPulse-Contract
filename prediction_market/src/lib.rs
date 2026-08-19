@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env, IntoVal,
-    String, Symbol, Val, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, vec, Address,
+    BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -30,6 +30,12 @@ const LOSE_TOKENS: i128 = 2_0000000;
 // accumulator to an arbitrary address in one call.
 const WITHDRAW_DELAY_SECS: u64 = 86_400; // 24h timelock between request and payout
 const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated fees
+
+// Issue #93: config changes are staged and only take effect after this delay.
+// A compromised admin key can no longer redirect all fund flows instantly:
+// off-chain monitors get a window to detect the change (via the emitted
+// ConfigChangeStaged event) and the admin can cancel it before it lands.
+const CONFIG_CHANGE_DELAY_SECS: u64 = 86_400; // 24h timelock
 
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
@@ -88,6 +94,12 @@ pub enum MarketError {
     /// changed return type) always increments INTERFACE_VERSION in the same
     /// commit. See EXPECTED_REFERRAL_INTERFACE_VERSION / EXPECTED_LEADERBOARD_INTERFACE_VERSION.
     IncompatibleInterface = 28,
+    /// execute_set_config / cancel_set_config called without a staged config
+    /// change (issue #93).
+    NoPendingConfig = 29,
+    /// A staged config change has not yet matured past
+    /// CONFIG_CHANGE_DELAY_SECS (issue #93).
+    ConfigChangeTooSoon = 30,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -97,6 +109,7 @@ pub enum DataKey {
     Admin,
     // Config addresses — all in instance storage (shared, cheap)
     Cfg, // single packed Config struct — 1 read instead of 5
+    PendingConfig, // staged, timelocked config change (issue #93)
     MarketCount,
     AccumulatedFees,
     Market(u64),
@@ -119,6 +132,29 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
+    pub token: Address,
+    pub referral: Address,
+    pub leaderboard: Address,
+    pub xlm_sac: Address,
+}
+
+// ── Staged config change with a maturation timestamp (issue #93) ────────────
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingConfig {
+    pub token: Address,
+    pub referral: Address,
+    pub leaderboard: Address,
+    pub xlm_sac: Address,
+    pub pending_at: u64,
+}
+
+// Issue #93: emitted when set_config stages a change, so off-chain indexers
+// can alert on suspicious address redirects before the timelock matures.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChangeStaged {
+    pub pending_at: u64,
     pub token: Address,
     pub referral: Address,
     pub leaderboard: Address,
@@ -235,8 +271,11 @@ impl PredictionMarketContract {
         Ok(())
     }
 
-    /// Update the packed Config (token / referral / leaderboard / xlm_sac). Admin only.
-    /// Used to correct an address set at initialize time.
+    /// Stage a config change (token / referral / leaderboard / xlm_sac). Admin
+    /// only. The change does NOT take effect immediately: it must mature past
+    /// CONFIG_CHANGE_DELAY_SECS via execute_set_config, giving off-chain
+    /// monitors time to detect it (via the ConfigChangeStaged event) and the
+    /// admin time to cancel it with cancel_set_config (issue #93).
     pub fn set_config(
         env: Env,
         admin: Address,
@@ -247,16 +286,72 @@ impl PredictionMarketContract {
     ) -> Result<(), MarketError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
+
+        let pending_at = env.ledger().timestamp();
+        let pending = PendingConfig {
+            token: token_contract,
+            referral: referral_contract,
+            leaderboard: leaderboard_contract,
+            xlm_sac,
+            pending_at,
+        };
+        env.storage().instance().set(&DataKey::PendingConfig, &pending);
+
+        ConfigChangeStaged {
+            pending_at,
+            token: pending.token.clone(),
+            referral: pending.referral.clone(),
+            leaderboard: pending.leaderboard.clone(),
+            xlm_sac: pending.xlm_sac.clone(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Apply a previously staged config change once its timelock has matured.
+    /// Admin only (issue #93).
+    pub fn execute_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+
+        let pending: PendingConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfig)
+            .ok_or(MarketError::NoPendingConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.pending_at || now - pending.pending_at < CONFIG_CHANGE_DELAY_SECS {
+            return Err(MarketError::ConfigChangeTooSoon);
+        }
+
         env.storage().instance().set(
             &DataKey::Cfg,
             &Config {
-                token: token_contract,
-                referral: referral_contract,
-                leaderboard: leaderboard_contract,
-                xlm_sac,
+                token: pending.token,
+                referral: pending.referral,
+                leaderboard: pending.leaderboard,
+                xlm_sac: pending.xlm_sac,
             },
         );
+        env.storage().instance().remove(&DataKey::PendingConfig);
         Ok(())
+    }
+
+    /// Cancel a staged config change before it matures. Admin only (issue #93).
+    pub fn cancel_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if !env.storage().instance().has(&DataKey::PendingConfig) {
+            return Err(MarketError::NoPendingConfig);
+        }
+        env.storage().instance().remove(&DataKey::PendingConfig);
+        Ok(())
+    }
+
+    /// Read the currently staged (not yet effective) config change, if any.
+    pub fn get_pending_config(env: Env) -> Option<PendingConfig> {
+        env.storage().instance().get(&DataKey::PendingConfig)
     }
 
     /// Read the current Config (for verification/admin tooling).

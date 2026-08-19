@@ -623,14 +623,17 @@ impl PredictionMarketContract {
 
             for i in 0..bettors {
                 let slot_key = DataKey::BettorAt(market_id, i);
-                let bettor: Address =
-                    if let Some(a) = env.storage().persistent().get(&slot_key) {
-                        a
-                    } else {
-                        continue;
-                    };
+                let bettor: Address = if let Some(a) = env.storage().persistent().get(&slot_key) {
+                    a
+                } else {
+                    continue;
+                };
                 let bet_key = DataKey::Bet(market_id, bettor.clone());
-                if let Some(entry) = env.storage().persistent().get::<DataKey, BetEntry>(&bet_key) {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, BetEntry>(&bet_key)
+                {
                     if entry.is_yes == outcome {
                         let payout = (entry.net * total_pool) / winning_side;
                         let payout_key = DataKey::Payout(market_id, bettor.clone());
@@ -777,7 +780,6 @@ impl PredictionMarketContract {
         }
 
         let is_winner = entry.is_yes == market.outcome;
-        let total_pool = market.total_yes + market.total_no;
         let winning_side = if market.outcome {
             market.total_yes
         } else {
@@ -803,15 +805,11 @@ impl PredictionMarketContract {
         // XLM payout straight from the settlement-time payout ledger.
         // Winners are exactly the bettors who own a Payout entry; everyone
         // else (losers, empty winning side) has no payout key at all.
-        let payout: i128 = if let Some(p) = env
+        let payout: i128 = env
             .storage()
             .persistent()
             .get::<DataKey, i128>(&DataKey::Payout(market_id, user.clone()))
-        {
-            p
-        } else {
-            0
-        };
+            .unwrap_or_default();
         if is_winner && payout > 0 {
             token::Client::new(&env, &cfg.xlm_sac).transfer(&this, &user, &payout);
         }
@@ -1235,9 +1233,9 @@ impl PredictionMarketContract {
             .unwrap_or((now, 0));
 
         // A timestamp regression must remain in the existing window. Using
-        // checked subtraction prevents underflow from resetting the limit and
+        // saturating subtraction prevents underflow from resetting the limit and
         // allowing an extra burst of market creations.
-        let elapsed = now.checked_sub(ws).unwrap_or(0);
+        let elapsed = now.saturating_sub(ws);
         let (new_ws, new_cnt) = if elapsed < 3600 {
             if cnt >= MAX_MARKETS_PER_HOUR {
                 return Err(MarketError::RateLimitExceeded);

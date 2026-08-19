@@ -534,10 +534,13 @@ fn test_register_referral_rejects_incompatible_leaderboard() {
     let t = setup_with_incompatible_leaderboard();
 
     let user = Address::generate(&t.env);
-    let result =
-        t.client
-            .try_register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
-    assert_eq!(result.unwrap_err().unwrap(), ReferralError::IncompatibleInterface);
+    let result = t
+        .client
+        .try_register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        ReferralError::IncompatibleInterface
+    );
     // The registration itself must not have partially applied.
     assert!(!t.client.is_registered(&user));
 }
@@ -567,7 +570,10 @@ fn test_credit_rejects_incompatible_leaderboard() {
     sac_admin.mint(&t.referral_id, &100_0000000_i128);
 
     let result = t.client.try_credit(&t.market, &user, &1_0000000_i128);
-    assert_eq!(result.unwrap_err().unwrap(), ReferralError::IncompatibleInterface);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        ReferralError::IncompatibleInterface
+    );
 }
 
 // A stand-in for a leaderboard deployment that reports the EXPECTED version

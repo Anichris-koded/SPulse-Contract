@@ -384,7 +384,10 @@ impl ReferralRegistryContract {
     // turns what would otherwise be an opaque invoke_contract failure (or,
     // worse, a type-compatible-but-semantically-different call) into a clear
     // IncompatibleInterface error.
-    fn require_compatible_leaderboard(env: &Env, leaderboard: &Address) -> Result<(), ReferralError> {
+    fn require_compatible_leaderboard(
+        env: &Env,
+        leaderboard: &Address,
+    ) -> Result<(), ReferralError> {
         let version: u32 = env.invoke_contract(
             leaderboard,
             &Symbol::new(env, "interface_version"),

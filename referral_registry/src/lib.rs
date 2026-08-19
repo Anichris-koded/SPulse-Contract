@@ -9,6 +9,9 @@ const WELCOME_BONUS_POINTS: u64 = 5;
 const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
 
+const TTL_BUMP: u32 = 3_153_600;
+const TTL_HIGH: u32 = 6_307_200;
+
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
 pub const INTERFACE_VERSION: u32 = 1;
@@ -189,6 +192,9 @@ impl ReferralRegistryContract {
                 referrer: referrer.clone(),
             },
         );
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Profile(user), TTL_BUMP, TTL_HIGH);
         // The referrer's counter is a DIFFERENT user's entry — update in place.
         if let Some(ref ref_addr) = referrer {
             let count: u32 = env
@@ -199,6 +205,9 @@ impl ReferralRegistryContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::ReferralCount(ref_addr), TTL_BUMP, TTL_HIGH);
         }
 
         let this = env.current_contract_address();
@@ -269,6 +278,11 @@ impl ReferralRegistryContract {
                 env.storage().persistent().set(
                     &DataKey::ReferralEarnings(ref_addr),
                     &(earnings + referral_fee),
+                );
+                env.storage().persistent().extend_ttl(
+                    &DataKey::ReferralEarnings(ref_addr),
+                    TTL_BUMP,
+                    TTL_HIGH,
                 );
                 Ok(true)
             }

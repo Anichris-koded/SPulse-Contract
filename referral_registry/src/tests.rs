@@ -373,7 +373,7 @@ fn test_referral_count_tracking() {
 // ── 12. Unregistered referrers are rejected ─────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "Error(Contract, #8)")]
 fn test_reject_unregistered_referrer() {
     let t = setup();
     let user = Address::generate(&t.env);
@@ -644,4 +644,75 @@ fn test_matching_version_does_not_guarantee_call_succeeds() {
     // function doesn't exist on the callee.
     t.client
         .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+}
+
+// ── Emergency Pause (issue #83) ───────────────────────────────────────────────
+
+#[test]
+fn test_pause_unpause_admin_only() {
+    let t = setup();
+    assert!(!t.client.is_paused());
+    t.client.pause(&t.admin);
+    assert!(t.client.is_paused());
+    t.client.unpause(&t.admin);
+    assert!(!t.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_pause_rejects_non_admin() {
+    let t = setup();
+    let not_admin = Address::generate(&t.env);
+    t.client.pause(&not_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_paused_rejects_register_referral() {
+    let t = setup();
+    t.client.pause(&t.admin);
+    let user = Address::generate(&t.env);
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_paused_rejects_credit() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    // Write the profile directly rather than via register_referral, so this
+    // test only exercises the pause gate on credit() (register_referral's
+    // leaderboard cross-call has an unrelated, pre-existing ABI mismatch).
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Bettor"),
+                referrer: Some(referrer.clone()),
+            },
+        );
+    });
+
+    t.client.pause(&t.admin);
+    t.client.credit(&t.market, &user, &1_0000000_i128);
+}
+
+#[test]
+fn test_view_functions_work_while_paused() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Someone"),
+                referrer: None,
+            },
+        );
+    });
+
+    t.client.pause(&t.admin);
+    assert!(t.client.is_registered(&user));
 }

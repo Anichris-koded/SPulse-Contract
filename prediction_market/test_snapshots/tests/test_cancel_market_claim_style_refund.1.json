@@ -449,6 +449,8 @@
       ]
     ],
     [],
+    [],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5",
@@ -471,6 +473,8 @@
         }
       ]
     ],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -1181,7 +1185,7 @@
                       "symbol": "net"
                     },
                     "val": {
-                      "i128": "980000000"
+                      "i128": "0"
                     }
                   }
                 ]
@@ -1252,7 +1256,7 @@
                       "symbol": "net"
                     },
                     "val": {
-                      "i128": "490000000"
+                      "i128": "0"
                     }
                   }
                 ]

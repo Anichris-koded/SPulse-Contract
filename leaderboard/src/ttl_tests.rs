@@ -175,3 +175,51 @@ fn test_interface_version_reported() {
     let (_env, client, _admin, _market, _referral) = setup();
     assert_eq!(client.interface_version(), 1);
 }
+
+// ── Emergency Pause (issue #83) ───────────────────────────────────────────────
+
+#[test]
+fn test_pause_unpause_admin_only() {
+    let (_env, client, admin, _market, _referral) = setup();
+    assert!(!client.is_paused());
+    client.pause(&admin);
+    assert!(client.is_paused());
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_pause_rejects_non_admin() {
+    let (env, client, _admin, _market, _referral) = setup();
+    let not_admin = Address::generate(&env);
+    client.pause(&not_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_paused_rejects_add_pts() {
+    let (env, client, admin, market, _referral) = setup();
+    client.pause(&admin);
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &10_u64, &true);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_paused_rejects_add_bonus_pts() {
+    let (env, client, admin, _market, referral) = setup();
+    client.pause(&admin);
+    let user = Address::generate(&env);
+    client.add_bonus_pts(&referral, &user, &5_u64);
+}
+
+#[test]
+fn test_view_functions_work_while_paused() {
+    let (env, client, admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &10_u64, &true);
+
+    client.pause(&admin);
+    assert_eq!(client.get_points(&user), 10);
+}

@@ -308,3 +308,103 @@ fn test_interface_version_reported() {
 
     assert_eq!(client.interface_version(), 1);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  17. Emergency Pause (issue #83)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_pause_unpause_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    assert!(!client.is_paused());
+    client.pause(&_admin);
+    assert!(client.is_paused());
+    client.unpause(&_admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_pause_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let not_admin = Address::generate(&env);
+    client.pause(&not_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_paused_rejects_mint() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    client.pause(&admin);
+
+    let recipient = Address::generate(&env);
+    client.mint(&minter, &recipient, &10_0000000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_paused_rejects_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.mint(&minter, &alice, &50_0000000_i128);
+
+    client.pause(&admin);
+    client.transfer(&alice, &bob, &10_0000000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_paused_rejects_burn() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &50_0000000_i128);
+
+    client.pause(&admin);
+    client.burn(&user, &10_0000000_i128);
+}
+
+#[test]
+fn test_view_functions_work_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &50_0000000_i128);
+
+    client.pause(&admin);
+
+    assert_eq!(client.balance(&user), 50_0000000_i128);
+    assert_eq!(client.total_supply(), 50_0000000_i128);
+}

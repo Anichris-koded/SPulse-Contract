@@ -21,6 +21,7 @@ pub enum TokenError {
     NotAdmin = 6,
     InsufficientAllowance = 7,
     InvalidExpirationLedger = 8,
+    ContractPaused = 9,
 }
 
 #[contracttype]
@@ -34,6 +35,7 @@ pub enum DataKey {
     Symbol,
     Decimals,
     Allowance(Address, Address),
+    Paused,
 }
 
 #[contracttype]
@@ -87,6 +89,37 @@ impl PULSETokenContract {
         INTERFACE_VERSION
     }
 
+    /// Halt mint/transfer/burn in an emergency. Admin only. View functions
+    /// (balance, total_supply, ...) keep working so integrators can still
+    /// read state while the contract is paused.
+    pub fn pause(env: Env, admin: Address) -> Result<(), TokenError> {
+        let stored = Self::require_admin(&env)?;
+        if admin != stored {
+            return Err(TokenError::NotAdmin);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Resume mint/transfer/burn. Admin only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), TokenError> {
+        let stored = Self::require_admin(&env)?;
+        if admin != stored {
+            return Err(TokenError::NotAdmin);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     pub fn set_minter(env: Env, minter: Address) -> Result<(), TokenError> {
         let admin: Address = Self::require_admin(&env)?;
         admin.require_auth();
@@ -106,6 +139,7 @@ impl PULSETokenContract {
     }
 
     pub fn mint(env: Env, minter: Address, to: Address, amount: i128) -> Result<(), TokenError> {
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TokenError::InvalidAmount);
         }
@@ -134,6 +168,7 @@ impl PULSETokenContract {
     }
 
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) -> Result<(), TokenError> {
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TokenError::InvalidAmount);
         }
@@ -256,6 +291,7 @@ impl PULSETokenContract {
     }
 
     pub fn burn(env: Env, from: Address, amount: i128) -> Result<(), TokenError> {
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TokenError::InvalidAmount);
         }
@@ -318,6 +354,13 @@ impl PULSETokenContract {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(TokenError::NotInitialized)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), TokenError> {
+        if Self::is_paused(env.clone()) {
+            return Err(TokenError::ContractPaused);
+        }
+        Ok(())
     }
 }
 

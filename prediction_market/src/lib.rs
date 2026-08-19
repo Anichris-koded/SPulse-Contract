@@ -855,6 +855,12 @@ impl PredictionMarketContract {
             .get(&key)
             .ok_or(MarketError::NoWithdrawalRequest)?;
 
+        // Re-validate at payout time: the caller's fee-recipient role and the
+        // destination can both be revoked/changed during the timelock, so a
+        // compromised recipient removed mid-window must not be able to collect.
+        Self::require_admin_or_fee_recipient(&env, &caller)?;
+        Self::require_valid_fee_recipient(&env, &caller, &req.recipient)?;
+
         let now = env.ledger().timestamp();
         if now < req.requested_at || now - req.requested_at < WITHDRAW_DELAY_SECS {
             return Err(MarketError::WithdrawalTooSoon);

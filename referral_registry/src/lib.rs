@@ -11,6 +11,9 @@ const REFERRAL_BET_POINTS: u64 = 3;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+const TTL_BUMP: u32 = 3_153_600;
+const TTL_HIGH: u32 = 6_307_200;
+
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
 pub const INTERFACE_VERSION: u32 = 1;
@@ -72,6 +75,9 @@ pub enum DataKey {
     // updated in place — kept as separate keys (not part of the registrant pack).
     ReferralCount(Address),
     ReferralEarnings(Address),
+    // Fees that cannot be paid out (no referrer, or referrer at cap) — held
+    // here and withdrawable by admin (issues #76/#77).
+    SurplusFees,
     TokenContract,
     LeaderboardContract,
     XlmSacContract,
@@ -396,17 +402,11 @@ impl ReferralRegistryContract {
                 Ok(true)
             }
             None => {
+                // Issue #76: keep the fee locally instead of round-tripping
+                // it back to the caller — the market never escrowed it, so
+                // refunding looks like a payment and is exploitable.
                 if referral_fee > 0 {
-                    let xlm_sac: Address = env
-                        .storage()
-                        .instance()
-                        .get(&DataKey::XlmSacContract)
-                        .unwrap();
-                    token::Client::new(&env, &xlm_sac).transfer(
-                        &env.current_contract_address(),
-                        &caller,
-                        &referral_fee,
-                    );
+                    Self::add_surplus(&env, referral_fee);
                 }
                 env.events().publish(
                     (Symbol::new(&env, "referral_missed"), user),
@@ -417,10 +417,32 @@ impl ReferralRegistryContract {
         }
     }
 
+<<<<<<< HEAD
     /// Issue #78: Admin-callable legacy migration. Reads old Registered/DisplayName/Referrer keys,
     /// writes the packed Profile entry, and removes the legacy keys. Idempotent — no-op if
     /// Profile already exists.
     pub fn migrate_user(env: Env, admin: Address, user: Address) -> Result<(), ReferralError> {
+=======
+    fn add_surplus(env: &Env, amount: i128) {
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SurplusFees, &(current + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SurplusFees, TTL_BUMP, TTL_HIGH);
+    }
+
+    pub fn withdraw_surplus_fees(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+    ) -> Result<i128, ReferralError> {
+>>>>>>> 7cfb065 (fix(referral_registry): hold no-referrer fees as admin-withdrawable surplus)
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -430,6 +452,7 @@ impl ReferralRegistryContract {
             return Err(ReferralError::NotAdmin);
         }
         admin.require_auth();
+<<<<<<< HEAD
         // Already migrated — Profile exists, nothing to do
         if env
             .storage()
@@ -480,6 +503,35 @@ impl ReferralRegistryContract {
         env.storage().persistent().remove(&DataKey::DisplayName(user.clone()));
         env.storage().persistent().remove(&DataKey::Referrer(user));
         Ok(())
+=======
+        let amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0);
+        if amount <= 0 {
+            return Ok(0);
+        }
+        let xlm_sac: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::XlmSacContract)
+            .unwrap();
+        token::Client::new(&env, &xlm_sac).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+        env.storage().persistent().set(&DataKey::SurplusFees, &0);
+        Ok(amount)
+    }
+
+    pub fn get_surplus_fees(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0)
+>>>>>>> 7cfb065 (fix(referral_registry): hold no-referrer fees as admin-withdrawable surplus)
     }
 
     fn load_profile(env: &Env, user: &Address) -> Option<UserProfile> {

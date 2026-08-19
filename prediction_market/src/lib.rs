@@ -100,6 +100,12 @@ pub enum DataKey {
     MarketCount,
     AccumulatedFees,
     Market(u64),
+    // Per-market ledger of the fees this market actually contributed to
+    // AccumulatedFees: platform fee for every bet, plus referral fee only
+    // when it was NOT paid out to a referrer. cancel_market reclaims this
+    // exact amount instead of reverse-engineering fees from the net pool
+    // (issue #87).
+    MarketAccumulatedFees(u64),
     Bet(u64, Address), // net + gross + count packed; see BetEntry
     BettorCount(u64),
     BettorAt(u64, u32),
@@ -512,6 +518,24 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
 
+        // ── Per-market fee ledger (issue #87) ──────────────────────────────
+        // Record exactly what this bet added to the accumulator for this
+        // market. Referral fees transferred to a referrer at bet time are
+        // excluded — they are already gone and must never be reclaimed.
+        let retained_fee = platform_fee + if paid_referrer { 0 } else { referral_fee };
+        let market_fee_key = DataKey::MarketAccumulatedFees(market_id);
+        let market_fees: i128 = env
+            .storage()
+            .persistent()
+            .get(&market_fee_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&market_fee_key, &(market_fees + retained_fee));
+        env.storage()
+            .persistent()
+            .extend_ttl(&market_fee_key, TTL_BUMP, TTL_HIGH);
+
         // ── Write BetEntry (net + gross + count in one write) ─────────────
         let new_entry = match existing {
             Some(mut e) => {
@@ -686,22 +710,34 @@ impl PredictionMarketContract {
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
 
-        // Reclaim fees — net * fee_rate / (1 - fee_rate)
-        let net_pool = market.total_yes + market.total_no;
-        let fees_in_pool = net_pool * TOTAL_FEE_BPS / (BPS_DENOM - TOTAL_FEE_BPS);
+        // Reclaim the fees this market actually contributed to the
+        // accumulator (issue #87). Referral fees already transferred to
+        // referrers at bet time are not in the accumulator, so we read the
+        // per-market ledger rather than reverse-engineering a fee from the
+        // net pool — the old net_pool * 200 bps / (10000 - 200) formula
+        // reclaimed referral fees that were never held, silently eating the
+        // platform fees of other (unrelated) markets.
+        let market_fee_key = DataKey::MarketAccumulatedFees(market_id);
+        let reclaim: i128 = env
+            .storage()
+            .persistent()
+            .get(&market_fee_key)
+            .unwrap_or(0);
         let mut acc_fees: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        acc_fees = if fees_in_pool < acc_fees {
-            acc_fees - fees_in_pool
+        acc_fees = if reclaim < acc_fees {
+            acc_fees - reclaim
         } else {
             0
         };
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
+        // The market is cancelled and refunded in full — drop its fee ledger.
+        env.storage().persistent().remove(&market_fee_key);
 
         Ok(())
     }

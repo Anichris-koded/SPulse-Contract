@@ -9,6 +9,17 @@ const MAX_TOP_PLAYERS: u32 = 50;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+// Issue #84: bump whenever a function signature, argument order, or return
+// type that a caller relies on changes. Callers pin the version they were
+// built against and check it before invoking, so an incompatible upgrade
+// fails with a clear error instead of a silently broken cross-contract call.
+pub const INTERFACE_VERSION: u32 = 1;
+
+// Issue #84: the version of pulse_token's ABI that reward()/reward_bonus()
+// were built against. Bump this whenever a breaking change is made to the
+// mint() signature/argument order/return type that this contract relies on.
+const EXPECTED_TOKEN_INTERFACE_VERSION: u32 = 1;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -18,6 +29,18 @@ pub enum LeaderboardError {
     UnauthorizedCaller = 3,
     InvalidPoints = 4,
     NotAdmin = 5,
+    ContractPaused = 6,
+    /// pulse_token reported an interface_version this contract wasn't built
+    /// against (issue #84). Note: a matching version number alone does not
+    /// prove the callee's actual function shape still matches; it only
+    /// proves the callee's author intended it to. The guarantee only holds
+    /// if every breaking ABI change (renamed function, changed argument
+    /// order/count/type, changed return type) always increments
+    /// INTERFACE_VERSION in the same commit. See EXPECTED_TOKEN_INTERFACE_VERSION.
+    IncompatibleInterface = 7,
+    /// reward()/reward_bonus() called with tokens > 0 but no TokenContract
+    /// has been set via set_token_contract.
+    TokenNotConfigured = 8,
 }
 
 // OPT: was 4 separate keys per user (Points, TotalBets, WonBets, LostBets).
@@ -38,8 +61,11 @@ pub enum DataKey {
     TopPlayerAt(u32),
     TopPlayerCount,
     TopPlayerSlot(Address),
+    TopPlayerSeqAt(u32), // u64 — FIFO insertion sequence for the player at a slot
+    SeqCounter,          // u64 — monotonic counter feeding TopPlayerSeqAt
     MinPoints, // u64 — points of the weakest entry currently in the top list
     MinSlot,   // u32 — slot index of that weakest entry
+    Paused,
 }
 
 // OPT: PlayerEntry now embeds points directly (avoids a Stats read during sort)
@@ -105,6 +131,52 @@ impl LeaderboardContract {
         Ok(())
     }
 
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    /// Callers that invoke add_pts/add_bonus_pts/reward/reward_bonus should
+    /// check this before calling so an upgrade with a breaking signature
+    /// change fails loudly instead of misbehaving.
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
+    /// Halt point/reward accrual in an emergency. Admin only. View functions
+    /// (get_points, get_top_players, ...) keep working.
+    pub fn pause(env: Env, admin: Address) -> Result<(), LeaderboardError> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if admin != stored {
+            return Err(LeaderboardError::NotAdmin);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Resume point/reward accrual. Admin only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), LeaderboardError> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if admin != stored {
+            return Err(LeaderboardError::NotAdmin);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Original ABI name — kept for callers that deploy against the pre-#23
     /// interface (prediction_market and referral_registry tests use it).
     pub fn set_token(
@@ -122,6 +194,7 @@ impl LeaderboardContract {
         pts: u64,
         is_won: bool,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         let market: Address = env
             .storage()
             .instance()
@@ -177,6 +250,7 @@ impl LeaderboardContract {
         tokens: i128,
         is_winner: bool,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let market: Address = env
             .storage()
@@ -214,7 +288,7 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user, tokens);
+            Self::mint_reward(&env, &user, tokens)?;
         }
         Ok(())
     }
@@ -226,6 +300,7 @@ impl LeaderboardContract {
         points: u64,
         tokens: i128,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let referral: Address = env
             .storage()
@@ -258,7 +333,7 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user, tokens);
+            Self::mint_reward(&env, &user, tokens)?;
         }
         Ok(())
     }
@@ -284,6 +359,7 @@ impl LeaderboardContract {
         user: Address,
         pts: u64,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         let referral: Address = env
             .storage()
             .instance()
@@ -673,18 +749,70 @@ impl LeaderboardContract {
         }
     }
 
-    fn mint_pulse(env: &Env, user: Address, amount: i128) {
+    #[inline]
+    fn require_market_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
+        let mkt: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if *caller != mkt {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn require_referral_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
+        let ref_: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferralContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if *caller != ref_ {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn require_not_paused(env: &Env) -> Result<(), LeaderboardError> {
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            return Err(LeaderboardError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    // Issue #84: check pulse_token's reported ABI version before invoking
+    // mint(), so an incompatible token upgrade fails with a clear error
+    // instead of an opaque invoke_contract failure or, worse, a call that
+    // still type-checks against a changed signature and silently misbehaves.
+    // A matching version number alone does not prove the callee's shape is
+    // still compatible; see IncompatibleInterface's doc comment.
+    fn require_compatible_token(env: &Env, token: &Address) -> Result<(), LeaderboardError> {
+        let version: u32 =
+            env.invoke_contract(token, &Symbol::new(env, "interface_version"), vec![env]);
+        if version != EXPECTED_TOKEN_INTERFACE_VERSION {
+            return Err(LeaderboardError::IncompatibleInterface);
+        }
+        Ok(())
+    }
+
+    fn mint_reward(env: &Env, user: &Address, tokens: i128) -> Result<(), LeaderboardError> {
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::TokenContract)
-            .unwrap_or_else(|| panic!("token contract not set"));
+            .ok_or(LeaderboardError::TokenNotConfigured)?;
+        Self::require_compatible_token(env, &token)?;
+
         let this = env.current_contract_address();
         let _: Val = env.invoke_contract(
             &token,
             &Symbol::new(env, "mint"),
-            vec![env, this.into_val(env), user.into_val(env), amount.into_val(env)],
+            vec![env, this.into_val(env), user.into_val(env), tokens.into_val(env)],
         );
+        Ok(())
     }
 }
 

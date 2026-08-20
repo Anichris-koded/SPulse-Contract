@@ -219,6 +219,11 @@ fn test_fee_full_2_percent_no_referrer() {
 }
 
 // ── 6. Fee split with referrer ────────────────────────────────────────────────
+//
+// Issue #86: credit() now queues the referral bonus rather than applying it
+// inline. The referrer must call claim_pending_rewards() in a separate tx to
+// receive their leaderboard points. The XLM fee distribution is unchanged
+// (still immediate).
 
 #[test]
 fn test_fee_split_with_referrer() {
@@ -237,7 +242,12 @@ fn test_fee_split_with_referrer() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
 
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
+    // XLM fee paid to referrer immediately (critical path unchanged).
     assert_eq!(t.xlm.balance(&referrer), 5000000);
+    // Leaderboard bonus is queued — not yet applied.
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 0);
+    // Referrer claims in a separate tx.
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
 }
 
@@ -863,6 +873,9 @@ fn test_bettor_index_legacy_read_is_bounded() {
 }
 
 // ── 30. Referrer earns 3 bonus points per referred bet ───────────────────────
+//
+// Issue #86: each place_bet→credit() queues 3 pts for the referrer; they are
+// accumulated in a single PendingReward entry and claimed in one call.
 
 #[test]
 fn test_referrer_bonus_points_per_bet() {
@@ -881,6 +894,9 @@ fn test_referrer_bonus_points_per_bet() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &50_0000000_i128);
 
+    // 2 bets → 2 × 3 = 6 pts queued; claim to apply.
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 0);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
 }
 
@@ -1175,6 +1191,12 @@ fn test_cancel_fees_zeroed_correctly() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // 42. COMPREHENSIVE END-TO-END INTEGRATION TEST
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// Issue #86: welcome bonuses (register_referral) and per-bet referral bonuses
+// (place_bet → credit) are now queued in the leaderboard rather than applied
+// inline.  Users call leaderboard.claim_pending_rewards() in a separate
+// transaction to receive their points and tokens.  The XLM distributions
+// (referrer fee payout) remain on the critical path and are unchanged.
 
 #[test]
 fn test_e2e_full_inter_contract_flow() {
@@ -1191,6 +1213,12 @@ fn test_e2e_full_inter_contract_flow() {
         &String::from_str(&t.env, "Alice"),
         &Some(referrer.clone()),
     );
+    // Welcome bonus is queued — not yet visible.
+    assert_eq!(t.leaderboard_client.get_points(&alice), 0);
+    assert_eq!(t.token_client.balance(&alice), 0);
+
+    // Alice claims her welcome bonus in a separate tx.
+    t.leaderboard_client.claim_pending_rewards(&alice);
     assert_eq!(t.leaderboard_client.get_points(&alice), 5);
     assert_eq!(t.token_client.balance(&alice), 1_0000000);
 
@@ -1207,12 +1235,18 @@ fn test_e2e_full_inter_contract_flow() {
     t.client
         .place_bet(&alice, &market_id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
+    // Referrer received XLM immediately (critical path unchanged).
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
-    // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
+    // Referrer bonus is queued — not yet applied.
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 0);
+    // Alice's welcome bonus was claimed above: total_bets = 1 (bonus award).
     assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
     assert_eq!(t.client.get_market(&market_id).total_yes, 98_0000000);
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 100_0000000);
+
+    // Referrer claims their first bonus in a separate tx.
+    t.leaderboard_client.claim_pending_rewards(&referrer);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
 
     // Bob bets NO 200 XLM — no referrer
     t.client
@@ -1230,6 +1264,10 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 150_0000000);
     assert_eq!(t.client.get_market(&market_id).total_yes, 147_0000000);
     assert_eq!(t.client.get_market(&market_id).bet_count, 2);
+    // Second referral bonus queued; referrer has 3 pts from first claim.
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
+    // Referrer claims second bonus.
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
 
     // Add a resolver and resolve via them
@@ -1239,12 +1277,14 @@ fn test_e2e_full_inter_contract_flow() {
     t.client.resolve_market(&resolver, &market_id, &true);
     assert!(t.client.get_market(&market_id).resolved);
 
-    // Alice claims as winner
+    // Alice claims as winner — leaderboard.reward() applied inline (not queued).
     let alice_xlm_before = t.xlm.balance(&alice);
     t.client.claim(&alice, &market_id);
     let alice_payout = t.xlm.balance(&alice) - alice_xlm_before;
     assert_eq!(alice_payout, 343_0000000);
+    // 5 (welcome, claimed above) + 30 (win reward, inline) = 35
     assert_eq!(t.leaderboard_client.get_points(&alice), 35);
+    // 1_0000000 (welcome) + 10_0000000 (win tokens) = 11_0000000
     assert_eq!(t.token_client.balance(&alice), 11_0000000);
 
     // Bob claims as loser

@@ -511,6 +511,30 @@ impl LeaderboardContract {
             .unwrap_or(0)
     }
 
+    /// Permissionless keeper: extend a player's Stats + top-list mapping and
+    /// the instance cache so idle entries cannot vanish (issue #21 / #54).
+    pub fn refresh_player_ttl(env: Env, user: Address) {
+        let stats_key = DataKey::Stats(user.clone());
+        if env.storage().persistent().has(&stats_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&stats_key, TTL_BUMP, TTL_HIGH);
+        }
+        if let Some((slot, _)) = Self::top_slot_entry(&env, &user) {
+            env.storage().persistent().extend_ttl(
+                &DataKey::TopPlayerAt(slot),
+                TTL_BUMP,
+                TTL_HIGH,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::TopPlayerSlot(user),
+                TTL_BUMP,
+                TTL_HIGH,
+            );
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+    }
+
     // ── Internal: maintain a persistent sorted top list ──────────────────────
 
     /// Validated reverse lookup. Returns the user's slot together with the
@@ -802,6 +826,7 @@ impl LeaderboardContract {
         Ok(())
     }
 
+    fn mint_pulse(env: &Env, user: Address, amount: i128) {
     // Issue #84: check pulse_token's reported ABI version before invoking
     // mint(), so an incompatible token upgrade fails with a clear error
     // instead of an opaque invoke_contract failure or, worse, a call that

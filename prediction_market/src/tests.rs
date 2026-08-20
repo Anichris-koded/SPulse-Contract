@@ -1531,6 +1531,18 @@ fn test_cancel_refund_rebumps_ttl_entries() {
     assert!(ttl(&market_key) > market_before);
 }
 
+// ── #54: permissionless refresh + per-market expiry tracking + migration ─────
+
+#[test]
+fn test_get_market_ttl_tracks_live_entry() {
+    let t = setup();
+    assert_eq!(t.client.get_market_ttl(&99_u64), 0);
+    let id = create_test_market(&t);
+    assert!(t.client.get_market_ttl(&id) >= TTL_BUMP);
+}
+
+#[test]
+fn test_refresh_market_ttl_rebumps_bet_and_market() {
 // ── Cross-contract interface versioning (issue #84) ───────────────────────────
 
 // Stands in for a referral_registry/leaderboard deployment upgraded to an
@@ -1559,6 +1571,47 @@ fn test_place_bet_rejects_incompatible_referral() {
     let id = create_test_market(&t);
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let bet_before = ttl(&bet_key);
+    let market_before = ttl(&market_key);
+
+    // Anyone can pay to keep the keys alive — no auth required.
+    assert_eq!(t.client.refresh_market_ttl(&id), 1);
+    assert!(ttl(&bet_key) > bet_before);
+    assert!(ttl(&market_key) > market_before);
+    assert!(t.client.get_market_ttl(&id) > market_before);
+}
+
+#[test]
+fn test_refresh_markets_migrates_existing_entries() {
+    let t = setup();
+    let a = create_test_market(&t);
+    let b = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 400_0000000);
+    t.client.place_bet(&user, &a, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &b, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+    let before_a = t.client.get_market_ttl(&a);
+    let bumped = t.client.refresh_markets(&1_u64, &20_u32);
+    assert_eq!(bumped, 2);
+    assert!(t.client.get_market_ttl(&a) > before_a);
+    assert!(t.client.get_market_ttl(&b) >= TTL_BUMP);
+}
+
+#[test]
+fn test_resolve_market_rebumps_payout_entry() {
 
     let fake_referral = t.env.register(MockIncompatibleDependency, ());
     let cfg = t.client.get_config();
@@ -1625,6 +1678,18 @@ fn test_matching_version_does_not_guarantee_claim_succeeds() {
     fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     advance_time(&t.env, 3601);
+
+    advance_ledgers(&t.env, 6_000_000);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let market_contract = t.client.address.clone();
+    let payout_ttl = t.env.as_contract(&market_contract, || {
+        t.env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Payout(id, user.clone()))
+    });
+    assert!(payout_ttl >= TTL_BUMP);
+}
     t.client.resolve_market(&t.admin, &id, &true);
 
     let fake_leaderboard = t.env.register(MockLeaderboardMissingReward, ());

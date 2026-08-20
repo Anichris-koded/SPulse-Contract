@@ -1,5 +1,6 @@
 use super::*;
 use soroban_sdk::{
+    testutils::{storage::Persistent as _, Address as _},
     testutils::{Address as _, Events},
     contract, contractimpl,
     testutils::Address as _,
@@ -719,6 +720,29 @@ fn test_view_functions_work_while_paused() {
 }
 
 #[test]
+fn test_register_and_refresh_extend_referrer_ttl() {
+    let t = setup();
+    let referrer = Address::generate(&t.env);
+    t.client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Ref"),
+        &None,
+    );
+    let user = Address::generate(&t.env);
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Bettor"),
+        &Some(referrer.clone()),
+    );
+
+    let count_ttl = t.env.as_contract(&t.referral_id, || {
+        t.env.storage()
+            .persistent()
+            .get_ttl(&DataKey::ReferralCount(referrer.clone()))
+    });
+    assert!(count_ttl >= TTL_BUMP);
+    t.client.refresh_referrer_ttl(&referrer);
+    assert_eq!(t.client.get_referral_count(&referrer), 1);
 fn test_register_referral_emits_event() {
     let t = setup();
     let user = Address::generate(&t.env);

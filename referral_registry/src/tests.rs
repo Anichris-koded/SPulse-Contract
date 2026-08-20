@@ -115,11 +115,6 @@ fn test_register_no_referrer() {
 }
 
 // ── 3. Welcome bonus: 5 pts + 1 PULSE on registration ─────────────────────
-//
-// Issue #86: register_referral() now queues the welcome bonus rather than
-// applying it inline, decoupling the registration critical path from the
-// leaderboard side-effect.  The user calls claim_pending_rewards() in a
-// separate transaction to receive their points + tokens.
 
 #[test]
 fn test_welcome_bonus() {
@@ -130,20 +125,8 @@ fn test_welcome_bonus() {
     t.client
         .register_referral(&user, &String::from_str(&t.env, "NewUser"), &no_ref);
 
+    // Leaderboard: 5 welcome points, no win/loss impact
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-
-    // Before claiming: reward is queued, not yet applied.
-    assert_eq!(lb_client.get_points(&user), 0);
-    let pending = lb_client.get_pending_reward(&user);
-    assert!(pending.is_some());
-    let p = pending.unwrap();
-    assert_eq!(p.points, 5);
-    assert_eq!(p.tokens, 1_0000000);
-
-    // Claim the pending reward in a separate tx.
-    lb_client.claim_pending_rewards(&user);
-
-    // After claiming: 5 welcome points, no win/loss impact.
     assert_eq!(lb_client.get_points(&user), 5);
     let stats = lb_client.get_stats(&user);
     assert_eq!(stats.won_bets, 0);
@@ -211,10 +194,6 @@ fn test_display_name() {
 }
 
 // ── 7. Credit routes fee to referrer + 3 bonus points ────────────────────────
-//
-// Issue #86: credit() now queues the leaderboard bonus rather than applying
-// it inline.  The referrer must call claim_pending_rewards() in a separate
-// transaction to receive their points.
 
 #[test]
 fn test_credit_with_referrer() {
@@ -239,19 +218,12 @@ fn test_credit_with_referrer() {
     let result = t.client.credit(&t.market, &user, &referral_fee);
     assert!(result);
 
-    // Referrer received the XLM immediately (critical path is unchanged).
+    // Referrer received the XLM
     let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
     assert_eq!(xlm_client.balance(&referrer), referral_fee);
 
-    // Leaderboard bonus is queued — not yet applied.
+    // Referrer got 3 leaderboard bonus points
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 0);
-    let pending = lb_client.get_pending_reward(&referrer);
-    assert!(pending.is_some());
-    assert_eq!(pending.unwrap().points, 3);
-
-    // Referrer claims the pending bonus in a separate tx.
-    lb_client.claim_pending_rewards(&referrer);
     assert_eq!(lb_client.get_points(&referrer), 3);
 
     // Earnings tracked
@@ -333,10 +305,6 @@ fn test_earnings_accumulation() {
 }
 
 // ── 10. Referrer bonus points accumulate (3 per referred bet) ────────────────
-//
-// Issue #86: each credit() call queues 3 bonus pts for the referrer rather
-// than applying them inline.  Multiple queued rewards accumulate in the
-// PendingReward entry and are all applied in one claim_pending_rewards() call.
 
 #[test]
 fn test_referrer_bonus_points_accumulate() {
@@ -354,21 +322,12 @@ fn test_referrer_bonus_points_accumulate() {
     let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
     sac_admin.mint(&t.referral_id, &1000_0000000_i128);
 
-    // 3 credits → 3 × 3 = 9 bonus pts queued for referrer
+    // 3 credits → 3 × 3 = 9 bonus pts for referrer
     t.client.credit(&t.market, &user, &5_000_000_i128);
     t.client.credit(&t.market, &user, &5_000_000_i128);
     t.client.credit(&t.market, &user, &5_000_000_i128);
 
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-
-    // Before claiming: 9 pts pending, 0 pts applied.
-    assert_eq!(lb_client.get_points(&referrer), 0);
-    let pending = lb_client.get_pending_reward(&referrer);
-    assert!(pending.is_some());
-    assert_eq!(pending.unwrap().points, 9); // 3 × 3 pts accumulated
-
-    // Claim once to receive all accumulated bonus pts.
-    lb_client.claim_pending_rewards(&referrer);
     assert_eq!(lb_client.get_points(&referrer), 9); // 3 × 3 pts
 }
 

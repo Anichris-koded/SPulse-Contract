@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal};
 
 fn setup() -> (
     Env,
@@ -736,4 +736,12 @@ fn test_inplace_upgrade_bubbles_to_first_place() {
 
     // Minimum points should now be p_mid (200)
     assert_eq!(client.get_min_points(), 200);
+fn test_add_pts_emits_leaderboard_updated() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &100_u64, &true);
+    let events = env.events().all();
+    let last = events.get(events.len() - 1).unwrap();
+    let name = Symbol::try_from_val(&env, &last.1.get_unchecked(0)).unwrap();
+    assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }

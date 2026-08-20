@@ -9,6 +9,17 @@ const MAX_TOP_PLAYERS: u32 = 50;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
+// Issue #84: bump whenever a function signature, argument order, or return
+// type that a caller relies on changes. Callers pin the version they were
+// built against and check it before invoking, so an incompatible upgrade
+// fails with a clear error instead of a silently broken cross-contract call.
+pub const INTERFACE_VERSION: u32 = 1;
+
+// Issue #84: the version of pulse_token's ABI that reward()/reward_bonus()
+// were built against. Bump this whenever a breaking change is made to the
+// mint() signature/argument order/return type that this contract relies on.
+const EXPECTED_TOKEN_INTERFACE_VERSION: u32 = 1;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -19,6 +30,17 @@ pub enum LeaderboardError {
     InvalidPoints = 4,
     NotAdmin = 5,
     ContractPaused = 6,
+    /// pulse_token reported an interface_version this contract wasn't built
+    /// against (issue #84). Note: a matching version number alone does not
+    /// prove the callee's actual function shape still matches; it only
+    /// proves the callee's author intended it to. The guarantee only holds
+    /// if every breaking ABI change (renamed function, changed argument
+    /// order/count/type, changed return type) always increments
+    /// INTERFACE_VERSION in the same commit. See EXPECTED_TOKEN_INTERFACE_VERSION.
+    IncompatibleInterface = 7,
+    /// reward()/reward_bonus() called with tokens > 0 but no TokenContract
+    /// has been set via set_token_contract.
+    TokenNotConfigured = 8,
 }
 
 // OPT: was 4 separate keys per user (Points, TotalBets, WonBets, LostBets).
@@ -109,6 +131,14 @@ impl LeaderboardContract {
         Ok(())
     }
 
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    /// Callers that invoke add_pts/add_bonus_pts/reward/reward_bonus should
+    /// check this before calling so an upgrade with a breaking signature
+    /// change fails loudly instead of misbehaving.
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
     /// Halt point/reward accrual in an emergency. Admin only. View functions
     /// (get_points, get_top_players, ...) keep working.
     pub fn pause(env: Env, admin: Address) -> Result<(), LeaderboardError> {
@@ -122,6 +152,7 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -137,6 +168,7 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -197,11 +229,15 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user, stats.points);
+        Self::update_top_players(&env, user.clone(), stats.points);
         // Instance storage (TopPlayerCount, MinPoints, MinSlot, Admin, etc.)
         // has its own TTL that is never bumped by persistent-key writes above —
         // refresh it on every write so the leaderboard's cached min survives.
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            (stats.points, stats.won_bets, stats.lost_bets),
+        );
         Ok(())
     }
 
@@ -220,6 +256,7 @@ impl LeaderboardContract {
         tokens: i128,
         is_winner: bool,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let market: Address = env
             .storage()
@@ -257,8 +294,13 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user, tokens);
+            Self::mint_pulse(&env, user.clone(), tokens);
+            Self::mint_reward(&env, &user, tokens)?;
         }
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            (stats.points, is_winner, tokens),
+        );
         Ok(())
     }
 
@@ -269,6 +311,7 @@ impl LeaderboardContract {
         points: u64,
         tokens: i128,
     ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         let referral: Address = env
             .storage()
@@ -291,7 +334,7 @@ impl LeaderboardContract {
                 total_bets: 0,
                 won_bets: 0,
                 lost_bets: 0,
-            });
+            });https://github.com/SPulse-Org/SPulse-Contract/pull/130/conflict?name=leaderboard%252Fsrc%252Flib.rs&ancestor_oid=7a7b4038a30cf18254c768dec1b0e925e99a2524&base_oid=0f8e07db85d70716277718fbad02702bff8b9c5b&head_oid=c7b44b6d2c85aa76e0a7a3edd62090eaf86845af
         stats.points += points;
         stats.total_bets += 1; // bonus awards count as activity
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
@@ -301,8 +344,13 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user, tokens);
+            Self::mint_pulse(&env, user.clone(), tokens);
+            Self::mint_reward(&env, &user, tokens)?;
         }
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            (stats.points, tokens),
+        );
         Ok(())
     }
 
@@ -355,8 +403,12 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user, stats.points);
+        Self::update_top_players(&env, user.clone(), stats.points);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "leaderboard_updated"), user),
+            stats.points,
+        );
         Ok(())
     }
 
@@ -457,6 +509,30 @@ impl LeaderboardContract {
             .instance()
             .get(&DataKey::MinSlot)
             .unwrap_or(0)
+    }
+
+    /// Permissionless keeper: extend a player's Stats + top-list mapping and
+    /// the instance cache so idle entries cannot vanish (issue #21 / #54).
+    pub fn refresh_player_ttl(env: Env, user: Address) {
+        let stats_key = DataKey::Stats(user.clone());
+        if env.storage().persistent().has(&stats_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&stats_key, TTL_BUMP, TTL_HIGH);
+        }
+        if let Some((slot, _)) = Self::top_slot_entry(&env, &user) {
+            env.storage().persistent().extend_ttl(
+                &DataKey::TopPlayerAt(slot),
+                TTL_BUMP,
+                TTL_HIGH,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::TopPlayerSlot(user),
+                TTL_BUMP,
+                TTL_HIGH,
+            );
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
     }
 
     // ── Internal: maintain a persistent sorted top list ──────────────────────
@@ -751,17 +827,36 @@ impl LeaderboardContract {
     }
 
     fn mint_pulse(env: &Env, user: Address, amount: i128) {
+    // Issue #84: check pulse_token's reported ABI version before invoking
+    // mint(), so an incompatible token upgrade fails with a clear error
+    // instead of an opaque invoke_contract failure or, worse, a call that
+    // still type-checks against a changed signature and silently misbehaves.
+    // A matching version number alone does not prove the callee's shape is
+    // still compatible; see IncompatibleInterface's doc comment.
+    fn require_compatible_token(env: &Env, token: &Address) -> Result<(), LeaderboardError> {
+        let version: u32 =
+            env.invoke_contract(token, &Symbol::new(env, "interface_version"), vec![env]);
+        if version != EXPECTED_TOKEN_INTERFACE_VERSION {
+            return Err(LeaderboardError::IncompatibleInterface);
+        }
+        Ok(())
+    }
+
+    fn mint_reward(env: &Env, user: &Address, tokens: i128) -> Result<(), LeaderboardError> {
         let token: Address = env
             .storage()
             .instance()
             .get(&DataKey::TokenContract)
-            .unwrap_or_else(|| panic!("token contract not set"));
+            .ok_or(LeaderboardError::TokenNotConfigured)?;
+        Self::require_compatible_token(env, &token)?;
+
         let this = env.current_contract_address();
         let _: Val = env.invoke_contract(
             &token,
             &Symbol::new(env, "mint"),
-            vec![env, this.into_val(env), user.into_val(env), amount.into_val(env)],
+            vec![env, this.into_val(env), user.into_val(env), tokens.into_val(env)],
         );
+        Ok(())
     }
 }
 

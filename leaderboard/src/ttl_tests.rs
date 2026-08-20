@@ -8,7 +8,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{storage::Instance as _, Address as _, Ledger as _},
+    testutils::{storage::Instance as _, storage::Persistent as _, Address as _, Ledger as _},
     Env,
 };
 
@@ -168,6 +168,14 @@ fn test_instance_ttl_not_bumped_again_while_above_threshold() {
     assert_eq!(instance_ttl(&env, &client.address), TTL_HIGH - 10);
 }
 
+// ── Cross-contract interface versioning (issue #84) ───────────────────────────
+
+#[test]
+fn test_interface_version_reported() {
+    let (_env, client, _admin, _market, _referral) = setup();
+    assert_eq!(client.interface_version(), 1);
+}
+
 // ── Emergency Pause (issue #83) ───────────────────────────────────────────────
 
 #[test]
@@ -213,5 +221,22 @@ fn test_view_functions_work_while_paused() {
     client.add_pts(&market, &user, &10_u64, &true);
 
     client.pause(&admin);
+    assert_eq!(client.get_points(&user), 10);
+}
+
+#[test]
+fn test_refresh_player_ttl_rebumps_stats() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &10_u64, &true);
+
+    let ttl = || {
+        env.as_contract(&client.address, || {
+            env.storage().persistent().get_ttl(&DataKey::Stats(user.clone()))
+        })
+    };
+    assert!(ttl() >= TTL_BUMP);
+    client.refresh_player_ttl(&user);
+    assert!(ttl() >= TTL_BUMP);
     assert_eq!(client.get_points(&user), 10);
 }

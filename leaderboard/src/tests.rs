@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal};
 
 fn setup() -> (
     Env,
@@ -108,7 +108,7 @@ fn test_top_players_capped_at_50() {
     assert_eq!(page3.len(), 10);
     assert_eq!(page3.get(9).unwrap().points, 6);
 
-    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_top_player_count(), 50);
 }
 
 #[test]
@@ -118,18 +118,6 @@ fn test_pagination_offset_beyond_count() {
     client.add_pts(&market, &user, &100_u64, &true);
     let result = client.get_top_players(&10_u32, &20_u32);
     assert_eq!(result.len(), 0);
-}
-
-// OPT: record_bet is now a no-op — total_bets = won_bets + lost_bets + bonus_bets
-#[test]
-fn test_record_bet_is_noop() {
-    let (env, client, _admin, market, _referral) = setup();
-    let user = Address::generate(&env);
-    // record_bet is a no-op — should not change any stats
-    client.record_bet(&market, &user);
-    client.record_bet(&market, &user);
-    let stats = client.get_stats(&user);
-    assert_eq!(stats.total_bets, 0); // no wins/losses yet
 }
 
 // OPT: total_bets now = won_bets + lost_bets + bonus_bets (derived at read time)
@@ -212,16 +200,16 @@ fn test_double_init_rejected() {
 #[test]
 fn test_player_count() {
     let (env, client, _admin, market, _referral) = setup();
-    assert_eq!(client.get_player_count(), 0);
+    assert_eq!(client.get_top_player_count(), 0);
 
     let u1 = Address::generate(&env);
     let u2 = Address::generate(&env);
     client.add_pts(&market, &u1, &10_u64, &true);
-    assert_eq!(client.get_player_count(), 1);
+    assert_eq!(client.get_top_player_count(), 1);
     client.add_pts(&market, &u2, &20_u64, &true);
-    assert_eq!(client.get_player_count(), 2);
+    assert_eq!(client.get_top_player_count(), 2);
     client.add_pts(&market, &u1, &5_u64, &false);
-    assert_eq!(client.get_player_count(), 2);
+    assert_eq!(client.get_top_player_count(), 2);
 }
 
 // ── Lever E: O(1) eviction correctness ────────────────────────────────────────
@@ -235,13 +223,13 @@ fn test_eviction_replaces_lowest_when_full() {
         let user = Address::generate(&env);
         client.add_pts(&market, &user, &(100 + i), &true);
     }
-    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_top_player_count(), 50);
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
 
     // Still capped at 50; newcomer is now #1; the old min (100) is gone.
-    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_top_player_count(), 50);
     let top = client.get_top_players(&0_u32, &20_u32);
     assert_eq!(top.get(0).unwrap().points, 500);
 
@@ -264,7 +252,7 @@ fn test_low_scorer_rejected_when_full() {
     // Weak user has stats/points recorded, but is NOT in the top list (rank 0).
     assert_eq!(client.get_points(&weak), 5);
     assert_eq!(client.get_rank(&weak), 0);
-    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_top_player_count(), 50);
 }
 
 #[test]
@@ -279,7 +267,7 @@ fn test_bottom_player_rising_updates_min() {
         let user = Address::generate(&env);
         client.add_pts(&market, &user, &(100 + i * 10), &true);
     }
-    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_top_player_count(), 50);
 
     // Boost the weakest (100 -> 1000) so it is no longer the min.
     client.add_pts(&market, &weakest, &900_u64, &true);
@@ -291,7 +279,7 @@ fn test_bottom_player_rising_updates_min() {
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &105_u64, &true);
     assert_eq!(client.get_rank(&newcomer), 0);
-    assert_eq!(client.get_player_count(), 50);
+    assert_eq!(client.get_top_player_count(), 50);
 }
 
 // ── Issue #25: tie-aware min cache ────────────────────────────────────────────
@@ -609,4 +597,15 @@ fn test_stale_min_rejected_before_eviction() {
     assert_eq!(client.get_player_count(), 50);
     let last = client.get_top_players(&40_u32, &20_u32);
     assert_eq!(last.get(9).unwrap().points, 50);
+}
+
+#[test]
+fn test_add_pts_emits_leaderboard_updated() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &100_u64, &true);
+    let events = env.events().all();
+    let last = events.get(events.len() - 1).unwrap();
+    let name = Symbol::try_from_val(&env, &last.1.get_unchecked(0)).unwrap();
+    assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }

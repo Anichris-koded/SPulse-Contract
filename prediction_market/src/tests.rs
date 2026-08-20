@@ -1,9 +1,11 @@
 use super::*;
 use soroban_sdk::{
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     contract, contractimpl,
     testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
     BytesN, Env, String,
+    Env, String, Symbol, TryFromVal, Val,
 };
 
 use leaderboard::LeaderboardContract;
@@ -1999,4 +2001,41 @@ fn test_set_config_non_governor_rejected() {
         &cfg.leaderboard,
         &cfg.xlm_sac,
     );
+fn last_event_name(env: &Env) -> Symbol {
+    let events = env.events().all();
+    let last = events.get(events.len() - 1).unwrap();
+    let topic0: Val = last.1.get_unchecked(0);
+    Symbol::try_from_val(env, &topic0).unwrap()
+}
+
+#[test]
+fn test_create_market_emits_event() {
+    let t = setup();
+    let _id = create_test_market(&t);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_created"));
+}
+
+#[test]
+fn test_place_bet_emits_event() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "bet_placed"));
+}
+
+#[test]
+fn test_resolve_market_emits_event() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_resolved"));
 }

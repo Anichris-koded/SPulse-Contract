@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contractimpl,
     testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
+    BytesN, Env, String,
     Env, String, Symbol, TryFromVal, Val,
 };
 
@@ -1826,6 +1827,180 @@ fn test_cancel_withdrawal_request_still_works_while_paused() {
     assert!(t.client.get_pending_withdrawal(&recipient).is_none());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION — issue #51 (set_config pinning / governance)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn second_leaderboard(t: &TestSetup) -> Address {
+    let id = t.env.register(LeaderboardContract, ());
+    let client = leaderboard::LeaderboardContractClient::new(&t.env, &id);
+    client.initialize(&t.admin, &t.client.address, &t.referral_client.address);
+    id
+}
+
+#[test]
+fn test_set_config_does_not_apply_immediately() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+
+    // Live config is unchanged until execute_set_config after the delay.
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+    let pending = t.client.get_pending_config().expect("pending change");
+    assert_eq!(pending.cfg.leaderboard, new_lb);
+    assert_eq!(pending.approvers.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_arbitrary_address() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let attacker = Address::generate(&t.env);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &attacker,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_wasm_as_xlm_sac() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    // A WASM/native contract must not be installable as the XLM SAC.
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.token,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn test_set_config_execute_before_delay() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_execute_after_delay_and_pin() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+    assert!(t.client.get_pending_config().is_none());
+    let pins = t.client.get_pinned_hashes().expect("pins");
+    assert_eq!(pins.xlm_sac, BytesN::from_array(&t.env, &[0u8; 32]));
+}
+
+#[test]
+fn test_cancel_set_config_during_dispute_window() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.cancel_set_config(&t.admin);
+    assert!(t.client.get_pending_config().is_none());
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn test_set_config_multisig_requires_threshold() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    // Only the proposer approved (1 of 2).
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_multisig_execute_with_second_approval() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.approve_set_config(&g2);
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&g2);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_config_non_governor_rejected() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let stranger = Address::generate(&t.env);
+    t.client.set_config(
+        &stranger,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
 fn last_event_name(env: &Env) -> Symbol {
     let events = env.events().all();
     let last = events.get(events.len() - 1).unwrap();

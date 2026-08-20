@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol,
 };
 
 // Issue #84: bump whenever a function signature, argument order, or return
@@ -77,6 +77,10 @@ impl PULSETokenContract {
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
         env.storage().instance().set(&DataKey::TotalSupply, &0_i128);
+        env.events().publish(
+            (Symbol::new(&env, "initialized"), admin),
+            (name, symbol, decimals),
+        );
         Ok(())
     }
 
@@ -110,6 +114,7 @@ impl PULSETokenContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -121,6 +126,7 @@ impl PULSETokenContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -166,6 +172,7 @@ impl PULSETokenContract {
         env.storage()
             .instance()
             .set(&DataKey::MinterCount, &(count + 1));
+        env.events().publish((Symbol::new(&env, "minter_added"), minter), true);
         Ok(())
     }
 
@@ -221,15 +228,20 @@ impl PULSETokenContract {
         let is_minter: bool = env
             .storage()
             .persistent()
-            .get(&DataKey::AuthorizedMinter(minter))
+            .get(&DataKey::AuthorizedMinter(minter.clone()))
             .unwrap_or(false);
         if !is_minter {
             return Err(TokenError::UnauthorizedMinter);
         }
         let balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(to), &(balance + amount));
+            .set(&to_key, &(balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
+            .set(&DataKey::Balance(to.clone()), &(balance + amount));
         let supply: i128 = env
             .storage()
             .instance()
@@ -238,6 +250,10 @@ impl PULSETokenContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply + amount));
+        env.events().publish(
+            (Symbol::new(&env, "mint"), minter, to),
+            amount,
+        );
         Ok(())
     }
 
@@ -251,13 +267,27 @@ impl PULSETokenContract {
         if from_balance < amount {
             return Err(TokenError::InsufficientBalance);
         }
+        let from_key = DataKey::Balance(from.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(from), &(from_balance - amount));
+            .set(&from_key, &(from_balance - amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
+            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let to_balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(to), &(to_balance + amount));
+            .set(&to_key, &(to_balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
+            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+        env.events().publish(
+            (Symbol::new(&env, "transfer"), from, to),
+            amount,
+        );
         Ok(())
     }
 
@@ -356,11 +386,23 @@ impl PULSETokenContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(from), &(from_balance - amount));
+            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let to_balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(to), &(to_balance + amount));
+            .set(&to_key, &(to_balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Balance(from), TTL_BUMP, TTL_HIGH);
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
+            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+        env.events().publish(
+            (Symbol::new(&env, "transfer"), from, to),
+            amount,
+        );
         Ok(())
     }
 
@@ -374,9 +416,14 @@ impl PULSETokenContract {
         if from_balance < amount {
             return Err(TokenError::InsufficientBalance);
         }
+        let from_key = DataKey::Balance(from.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(from), &(from_balance - amount));
+            .set(&from_key, &(from_balance - amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
+            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let supply: i128 = env
             .storage()
             .instance()
@@ -385,6 +432,7 @@ impl PULSETokenContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply - amount));
+        env.events().publish((Symbol::new(&env, "burn"), from), amount);
         Ok(())
     }
 

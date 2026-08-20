@@ -146,11 +146,6 @@ impl ReferralRegistryContract {
                 .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
         }
 
-        // Issue #86: decouple the leaderboard side-effect from the critical
-        // registration path.  We queue the welcome bonus rather than applying
-        // it inline — if the leaderboard's update_top_players consumes excess
-        // gas this call will not revert the registration.  The user (or any
-        // caller) can claim it later via leaderboard.claim_pending_rewards().
         let this = env.current_contract_address();
         let leaderboard: Address = env
             .storage()
@@ -159,7 +154,7 @@ impl ReferralRegistryContract {
             .unwrap();
         let _: Val = env.invoke_contract(
             &leaderboard,
-            &Symbol::new(&env, "queue_bonus_reward"),
+            &Symbol::new(&env, "reward_bonus"),
             vec![
                 &env,
                 this.into_val(&env),
@@ -198,18 +193,14 @@ impl ReferralRegistryContract {
                     .instance()
                     .get(&DataKey::LeaderboardContract)
                     .unwrap();
-                // Issue #86: queue the leaderboard bonus rather than applying
-                // it inline — decouples the referral fee distribution (critical
-                // XLM transfer) from the optional leaderboard side-effect.
                 let _: Val = env.invoke_contract(
                     &leaderboard,
-                    &Symbol::new(&env, "queue_bonus_reward"),
+                    &Symbol::new(&env, "add_bonus_pts"),
                     vec![
                         &env,
                         env.current_contract_address().into_val(&env),
                         ref_addr.clone().into_val(&env),
                         REFERRAL_BET_POINTS.into_val(&env),
-                        0_i128.into_val(&env),
                     ],
                 );
                 let earnings: i128 = env

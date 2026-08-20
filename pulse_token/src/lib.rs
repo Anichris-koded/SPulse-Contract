@@ -4,6 +4,11 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol,
 };
 
+// Issue #84: bump whenever a function signature, argument order, or return
+// type that a caller relies on changes, so a caller pinning this version can
+// detect an incompatible upgrade before invoking.
+pub const INTERFACE_VERSION: u32 = 1;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -81,6 +86,11 @@ impl PULSETokenContract {
         admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
+    }
+
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
     }
 
     /// Halt mint/transfer/burn in an emergency. Admin only. View functions

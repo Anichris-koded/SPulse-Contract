@@ -9,6 +9,17 @@ const WELCOME_BONUS_POINTS: u64 = 5;
 const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
 
+// Issue #84: bump whenever a function signature, argument order, or return
+// type that a caller relies on changes.
+pub const INTERFACE_VERSION: u32 = 1;
+
+// The leaderboard interface_version this contract was built against. If a
+// deployed leaderboard reports a different version, its add_bonus_pts ABI
+// may no longer match what we send — refuse the call instead of invoking
+// blind and either panicking deep in argument decoding or silently
+// misbehaving (issue #84).
+const EXPECTED_LEADERBOARD_INTERFACE_VERSION: u32 = 1;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -20,7 +31,15 @@ pub enum ReferralError {
     SelfReferral = 5,
     NotAdmin = 6,
     ContractPaused = 7,
-    ReferrerNotRegistered = 7,
+    ReferrerNotRegistered = 8,
+    /// leaderboard reported an interface_version this contract wasn't built
+    /// against (issue #84). Note: a matching version number alone does not
+    /// prove the callee's actual function shape still matches, it only
+    /// proves the callee's author intended it to. The guarantee only holds
+    /// if every breaking ABI change (renamed function, changed argument
+    /// order/count/type, changed return type) always increments
+    /// INTERFACE_VERSION in the same commit. See EXPECTED_LEADERBOARD_INTERFACE_VERSION.
+    IncompatibleInterface = 9,
 }
 
 #[contracttype]
@@ -86,6 +105,11 @@ impl ReferralRegistryContract {
             .instance()
             .set(&DataKey::XlmSacContract, &xlm_sac);
         Ok(())
+    }
+
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
     }
 
     // ── Upgradeability & Config (admin only) ──────────────────────────────────
@@ -186,6 +210,7 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
+        Self::require_compatible_leaderboard(&env, &leaderboard)?;
         let _: Val = env.invoke_contract(
             &leaderboard,
             &Symbol::new(&env, "reward_bonus"),
@@ -232,6 +257,7 @@ impl ReferralRegistryContract {
                     .instance()
                     .get(&DataKey::LeaderboardContract)
                     .unwrap();
+                Self::require_compatible_leaderboard(&env, &leaderboard)?;
                 let _: Val = env.invoke_contract(
                     &leaderboard,
                     &Symbol::new(&env, "add_bonus_pts"),
@@ -363,6 +389,24 @@ impl ReferralRegistryContract {
             .ok_or(ReferralError::NotInitialized)?;
         if *caller != admin {
             return Err(ReferralError::NotAdmin);
+        }
+        Ok(())
+    }
+
+    // Issue #84: verify the configured leaderboard contract reports the ABI
+    // version we were built against before invoking it. Catches a unilateral
+    // leaderboard upgrade that changed add_pts/add_bonus_pts's signature and
+    // turns what would otherwise be an opaque invoke_contract failure (or,
+    // worse, a type-compatible-but-semantically-different call) into a clear
+    // IncompatibleInterface error.
+    fn require_compatible_leaderboard(env: &Env, leaderboard: &Address) -> Result<(), ReferralError> {
+        let version: u32 = env.invoke_contract(
+            leaderboard,
+            &Symbol::new(env, "interface_version"),
+            vec![env],
+        );
+        if version != EXPECTED_LEADERBOARD_INTERFACE_VERSION {
+            return Err(ReferralError::IncompatibleInterface);
         }
         Ok(())
     }

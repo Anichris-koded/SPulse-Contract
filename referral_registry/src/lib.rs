@@ -133,6 +133,7 @@ impl ReferralRegistryContract {
         env.storage()
             .instance()
             .set(&DataKey::XlmSacContract, &xlm_sac);
+        env.events().publish((Symbol::new(&env, "xlm_sac_set"), admin), xlm_sac);
         Ok(())
     }
 
@@ -142,6 +143,7 @@ impl ReferralRegistryContract {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -150,6 +152,7 @@ impl ReferralRegistryContract {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -214,10 +217,14 @@ impl ReferralRegistryContract {
             vec![
                 &env,
                 this.into_val(&env),
-                user.into_val(&env),
+                user.clone().into_val(&env),
                 WELCOME_BONUS_POINTS.into_val(&env),
                 WELCOME_BONUS_TOKENS.into_val(&env),
             ],
+        );
+        env.events().publish(
+            (Symbol::new(&env, "referral_registered"), user),
+            referrer,
         );
         Ok(())
     }
@@ -267,8 +274,12 @@ impl ReferralRegistryContract {
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
                 env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr),
+                    &DataKey::ReferralEarnings(ref_addr.clone()),
                     &(earnings + referral_fee),
+                );
+                env.events().publish(
+                    (Symbol::new(&env, "referral_credited"), user, ref_addr),
+                    referral_fee,
                 );
                 Ok(true)
             }
@@ -285,6 +296,10 @@ impl ReferralRegistryContract {
                         &referral_fee,
                     );
                 }
+                env.events().publish(
+                    (Symbol::new(&env, "referral_missed"), user),
+                    referral_fee,
+                );
                 Ok(false)
             }
         }

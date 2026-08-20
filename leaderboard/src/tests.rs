@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal};
 
 fn setup() -> (
     Env,
@@ -597,4 +597,15 @@ fn test_stale_min_rejected_before_eviction() {
     assert_eq!(client.get_player_count(), 50);
     let last = client.get_top_players(&40_u32, &20_u32);
     assert_eq!(last.get(9).unwrap().points, 50);
+}
+
+#[test]
+fn test_add_pts_emits_leaderboard_updated() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &100_u64, &true);
+    let events = env.events().all();
+    let last = events.get(events.len() - 1).unwrap();
+    let name = Symbol::try_from_val(&env, &last.1.get_unchecked(0)).unwrap();
+    assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }

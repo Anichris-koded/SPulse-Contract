@@ -1,9 +1,11 @@
 use super::*;
 use soroban_sdk::{
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     contract, contractimpl,
     testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String,
+    BytesN, Env, String,
+    Env, String, Symbol, TryFromVal, Val,
 };
 
 use leaderboard::LeaderboardContract;
@@ -1888,4 +1890,217 @@ fn test_cancel_withdrawal_request_still_works_while_paused() {
     t.client.cancel_withdrawal_request(&t.admin, &recipient);
 
     assert!(t.client.get_pending_withdrawal(&recipient).is_none());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION — issue #51 (set_config pinning / governance)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn second_leaderboard(t: &TestSetup) -> Address {
+    let id = t.env.register(LeaderboardContract, ());
+    let client = leaderboard::LeaderboardContractClient::new(&t.env, &id);
+    client.initialize(&t.admin, &t.client.address, &t.referral_client.address);
+    id
+}
+
+#[test]
+fn test_set_config_does_not_apply_immediately() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+
+    // Live config is unchanged until execute_set_config after the delay.
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+    let pending = t.client.get_pending_config().expect("pending change");
+    assert_eq!(pending.cfg.leaderboard, new_lb);
+    assert_eq!(pending.approvers.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_arbitrary_address() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let attacker = Address::generate(&t.env);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &attacker,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_wasm_as_xlm_sac() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    // A WASM/native contract must not be installable as the XLM SAC.
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.token,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn test_set_config_execute_before_delay() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_execute_after_delay_and_pin() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+    assert!(t.client.get_pending_config().is_none());
+    let pins = t.client.get_pinned_hashes().expect("pins");
+    assert_eq!(pins.xlm_sac, BytesN::from_array(&t.env, &[0u8; 32]));
+}
+
+#[test]
+fn test_cancel_set_config_during_dispute_window() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.cancel_set_config(&t.admin);
+    assert!(t.client.get_pending_config().is_none());
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn test_set_config_multisig_requires_threshold() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    // Only the proposer approved (1 of 2).
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_multisig_execute_with_second_approval() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.approve_set_config(&g2);
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&g2);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_config_non_governor_rejected() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let stranger = Address::generate(&t.env);
+    t.client.set_config(
+        &stranger,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+fn last_event_name(env: &Env) -> Symbol {
+    let events = env.events().all();
+    let last = events.get(events.len() - 1).unwrap();
+    let topic0: Val = last.1.get_unchecked(0);
+    Symbol::try_from_val(env, &topic0).unwrap()
+}
+
+#[test]
+fn test_create_market_emits_event() {
+    let t = setup();
+    let _id = create_test_market(&t);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_created"));
+}
+
+#[test]
+fn test_place_bet_emits_event() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "bet_placed"));
+}
+
+#[test]
+fn test_resolve_market_emits_event() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_resolved"));
 }

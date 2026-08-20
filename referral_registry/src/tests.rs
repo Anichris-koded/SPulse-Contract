@@ -1,10 +1,11 @@
 use super::*;
 use soroban_sdk::{
     testutils::{storage::Persistent as _, Address as _},
+    testutils::{Address as _, Events},
     contract, contractimpl,
     testutils::Address as _,
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String,
+    Env, String, Symbol, TryFromVal,
 };
 
 // Import sibling contracts for inter-contract testing
@@ -742,4 +743,14 @@ fn test_register_and_refresh_extend_referrer_ttl() {
     assert!(count_ttl >= TTL_BUMP);
     t.client.refresh_referrer_ttl(&referrer);
     assert_eq!(t.client.get_referral_count(&referrer), 1);
+fn test_register_referral_emits_event() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Alice"), &no_ref);
+    let events = t.env.events().all();
+    let last = events.get(events.len() - 1).unwrap();
+    let name = Symbol::try_from_val(&t.env, &last.1.get_unchecked(0)).unwrap();
+    assert_eq!(name, Symbol::new(&t.env, "referral_registered"));
 }

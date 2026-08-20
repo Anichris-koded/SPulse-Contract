@@ -147,6 +147,8 @@ pub enum DataKey {
     PinnedHashes,
     // ── Emergency circuit-breaker (issue #83) ─────────────────────────────
     Paused,
+    // ── Reentrancy guard (issue #89) ─────────────────────────────────────
+    BetLock(u64, Address), // market_id+user -> bool: prevents reentrant place_bet
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -732,20 +734,31 @@ impl PredictionMarketContract {
         Self::require_not_paused(&env)?;
         user.require_auth();
 
+        // Issue 89: reentrancy guard — set lock before any external call
+        let lock_key = DataKey::BetLock(market_id, user.clone());
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            return Err(MarketError::NotAuthorized); // reentrancy attempt
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
         let net = amount * NET_NUMERATOR / BPS_DENOM;
         if net < MIN_BET {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::BetTooSmall);
         }
 
         // OPT: load market first — cheapest early-exit if not found
         let mut market = Self::load_market(&env, market_id)?;
         if market.cancelled {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::MarketCancelled);
         }
         if market.resolved {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::MarketResolved);
         }
         if env.ledger().timestamp() >= market.end_time {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::MarketExpired);
         }
 
@@ -756,9 +769,11 @@ impl PredictionMarketContract {
         // Spam guard + side check combined from single read
         if let Some(ref e) = existing {
             if e.count >= MAX_BETS_PER_USER {
+                env.storage().persistent().remove(&lock_key);
                 return Err(MarketError::TooManyBets);
             }
             if e.is_yes != is_yes {
+                env.storage().persistent().remove(&lock_key);
                 return Err(MarketError::OppositeSideBet);
             }
         }
@@ -773,50 +788,17 @@ impl PredictionMarketContract {
         // OPT: one Config read instead of 4 separate instance reads
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
 
-        // ── XLM transfer user → this contract ────────────────────────────
-        let xlm = token::Client::new(&env, &cfg.xlm_sac);
-        let this = env.current_contract_address();
-        xlm.transfer(&user, &this, &amount);
+        // ── Issue 89: Write ALL state BEFORE external calls (check-effects-interaction) ──
 
-        // ── Accumulated fees ──────────────────────────────────────────────
+        // Accumulate only the platform fee — the referral fee is either sent to
+        // the referrer or held by the referral contract as surplus (issue #78),
+        // so the market contract never holds it for withdrawal.
         let mut acc_fees: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
         acc_fees += platform_fee;
-
-        // ── Referral (skip if cached no-referrer) ─────────────────────────
-        let hr_key = DataKey::HasReferrer(user.clone());
-        let cached: Option<bool> = env.storage().persistent().get(&hr_key);
-
-        let paid_referrer = if cached == Some(false) {
-            false
-        } else {
-            Self::require_compatible_referral(&env, &cfg.referral)?;
-            xlm.transfer(&this, &cfg.referral, &referral_fee);
-            let result: bool = env.invoke_contract(
-                &cfg.referral,
-                &Symbol::new(&env, "credit"),
-                vec![
-                    &env,
-                    this.clone().into_val(&env),
-                    user.clone().into_val(&env),
-                    referral_fee.into_val(&env),
-                ],
-            );
-            if cached.is_none() {
-                env.storage().persistent().set(&hr_key, &result);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&hr_key, TTL_BUMP, TTL_HIGH);
-            }
-            result
-        };
-
-        if !paid_referrer {
-            acc_fees += referral_fee;
-        }
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
@@ -847,8 +829,7 @@ impl PredictionMarketContract {
             let cnt_key = DataKey::BettorCount(market_id);
             let count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
             let slot_key = DataKey::BettorAt(market_id, count);
-            // OPT: no clone — user is moved here and we don't need it after
-            env.storage().persistent().set(&slot_key, &user);
+            env.storage().persistent().set(&slot_key, &user.clone());
             env.storage()
                 .persistent()
                 .extend_ttl(&slot_key, TTL_BUMP, TTL_HIGH);
@@ -871,6 +852,45 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        // ── HasReferrer cache write ───────────────────────────────────────
+        let hr_key = DataKey::HasReferrer(user.clone());
+        let cached: Option<bool> = env.storage().persistent().get(&hr_key);
+
+        // ── External calls (issue 89: after ALL state writes) ─────────────
+
+        // ── XLM transfer user → this contract ────────────────────────────
+        let xlm = token::Client::new(&env, &cfg.xlm_sac);
+        let this = env.current_contract_address();
+        xlm.transfer(&user, &this, &amount);
+
+        // ── Referral (skip if cached no-referrer) ─────────────────────────
+        let paid_referrer = if cached == Some(false) {
+            false
+        } else {
+            Self::require_compatible_referral(&env, &cfg.referral)?;
+            xlm.transfer(&this, &cfg.referral, &referral_fee);
+            let result: bool = env.invoke_contract(
+                &cfg.referral,
+                &Symbol::new(&env, "credit"),
+                vec![
+                    &env,
+                    this.clone().into_val(&env),
+                    user.clone().into_val(&env),
+                    referral_fee.into_val(&env),
+                ],
+            );
+            if cached.is_none() {
+                env.storage().persistent().set(&hr_key, &result);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&hr_key, TTL_BUMP, TTL_HIGH);
+            }
+            result
+        };
+
+        // ── Release reentrancy lock ──────────────────────────────────────
+        env.storage().persistent().remove(&lock_key);
         env.events().publish(
             (Symbol::new(&env, "bet_placed"), user, market_id),
             (is_yes, amount, net),

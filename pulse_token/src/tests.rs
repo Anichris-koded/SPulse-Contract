@@ -1,7 +1,7 @@
 use crate::{PULSETokenContract, PULSETokenContractClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events, Ledger as _},
+    Address, Env, String, Symbol, TryFromVal,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -407,4 +407,78 @@ fn test_view_functions_work_while_paused() {
 
     assert_eq!(client.balance(&user), 50_0000000_i128);
     assert_eq!(client.total_supply(), 50_0000000_i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Issue #80: minter audit list
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_set_minter_idempotent() {
+#[test]
+fn test_mint_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    // Second call with same address must fail with AlreadyMinter (#10)
+    client.set_minter(&minter);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_remove_minter_not_minter() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let not_minter = Address::generate(&env);
+    // Must fail with NotMinter (#11)
+    client.remove_minter(&not_minter);
+}
+
+#[test]
+fn test_get_authorized_minters() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter1 = Address::generate(&env);
+    let minter2 = Address::generate(&env);
+    let minter3 = Address::generate(&env);
+
+    client.set_minter(&minter1);
+    client.set_minter(&minter2);
+    client.set_minter(&minter3);
+
+    let minters = client.get_authorized_minters();
+    assert_eq!(minters.len(), 3);
+    assert!(minters.contains(&minter1));
+    assert!(minters.contains(&minter2));
+    assert!(minters.contains(&minter3));
+
+    // Remove one and verify the list shrinks
+    client.remove_minter(&minter2);
+    let minters = client.get_authorized_minters();
+    assert_eq!(minters.len(), 2);
+    assert!(minters.contains(&minter1));
+    assert!(!minters.contains(&minter2));
+    assert!(minters.contains(&minter3));
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &10_0000000_i128);
+
+    let events = env.events().all();
+    assert!(events.len() > 0);
+    let last = events.get(events.len() - 1).unwrap();
+    let topic0 = last.1.get_unchecked(0);
+    let name = Symbol::try_from_val(&env, &topic0).unwrap();
+    assert_eq!(name, Symbol::new(&env, "mint"));
 }

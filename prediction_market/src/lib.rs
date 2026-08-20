@@ -1,9 +1,26 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env, IntoVal,
-    String, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env, Executable,
+    IntoVal, String, Symbol, Val, Vec,
 };
+
+// ── Event schema (issue #52) ────────────────────────────────────────────────
+// Topics: (event_name: Symbol, actor: Address [, market_id: u64])
+// Data:   state deltas so an indexer can rebuild history without polling.
+//
+// market_created     (admin, id)              (category, end_time)
+// bet_placed         (user, id)               (is_yes, amount, net)
+// market_resolved    (caller, id)             (outcome, pool, fees)
+// market_cancelled   (admin, id)              net_pool
+// cancel_refund      (user, id)               gross
+// claim_processed    (user, id)               (is_winner, payout)
+// fees_withdrawn     (caller)                 (recipient, amount)
+// withdraw_requested (caller)                 (recipient, amount)
+// withdraw_cancelled (admin)                  caller
+// config_changed     (admin)                  Config
+// paused / unpaused  (admin)                  ()
+// ────────────────────────────────────────────────────────────────────────────
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -30,10 +47,13 @@ const LOSE_TOKENS: i128 = 2_0000000;
 // accumulator to an arbitrary address in one call.
 const WITHDRAW_DELAY_SECS: u64 = 86_400; // 24h timelock between request and payout
 const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated fees
+const CONFIG_DELAY_SECS: u64 = 86_400; // issue #51: dispute window before Config is live
+const MAX_GOVERNORS: u32 = 10;
 
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
+const MAX_TTL_REFRESH_PAGE: u32 = 20;
 
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
@@ -79,6 +99,14 @@ pub enum MarketError {
     WithdrawalTooSoon = 25,
     ContractPaused = 26,
     InvalidDuration = 27, // issue #10: duration below the minimum
+    InvalidDependency = 28, // issue #51: address is not the expected executable kind
+    WasmHashMismatch = 29,  // issue #51: live WASM hash != pinned / pending hash
+    ConfigChangeExists = 30,
+    NoConfigChange = 31,
+    ConfigChangeTooSoon = 32,
+    InsufficientApprovals = 33,
+    AlreadyApproved = 34,
+    InvalidThreshold = 35,
     /// A dependency (referral_registry or leaderboard) reported an
     /// interface_version this contract wasn't built against (issue #84).
     /// Note: a matching version number alone does not prove the callee's
@@ -111,8 +139,16 @@ pub enum DataKey {
     Payout(u64, Address), // i128 — exact payout computed at resolve time
     // ── Timelocked withdrawal requests (issue #12) ───────────────────────
     PendingWithdrawal(Address), // caller -> WithdrawalRequest
+    // ── Dependency governance (issue #51) ────────────────────────────────
+    Governor(Address),
+    GovernorCount,
+    GovernorThreshold,
+    PendingConfig,
+    PinnedHashes,
     // ── Emergency circuit-breaker (issue #83) ─────────────────────────────
     Paused,
+    // ── Reentrancy guard (issue #89) ─────────────────────────────────────
+    BetLock(u64, Address), // market_id+user -> bool: prevents reentrant place_bet
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -123,6 +159,26 @@ pub struct Config {
     pub referral: Address,
     pub leaderboard: Address,
     pub xlm_sac: Address,
+}
+
+/// WASM hashes (or the SAC sentinel) pinned for each Config role.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedHashes {
+    pub token: BytesN<32>,
+    pub referral: BytesN<32>,
+    pub leaderboard: BytesN<32>,
+    pub xlm_sac: BytesN<32>,
+}
+
+/// Timelocked, multi-sig Config mutation. Inactive until execute_set_config.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingConfigChange {
+    pub cfg: Config,
+    pub hashes: PinnedHashes,
+    pub requested_at: u64,
+    pub approvers: Vec<Address>,
 }
 
 // ── BetEntry: Bet + Gross + BetCount in one slot ──────────────────────────
@@ -209,16 +265,43 @@ impl PredictionMarketContract {
         env.storage().instance().set(
             &DataKey::Cfg,
             &Config {
-                token: token_contract,
-                referral: referral_contract,
-                leaderboard: leaderboard_contract,
-                xlm_sac,
+                token: token_contract.clone(),
+                referral: referral_contract.clone(),
+                leaderboard: leaderboard_contract.clone(),
+                xlm_sac: xlm_sac.clone(),
             },
         );
         env.storage().instance().set(&DataKey::MarketCount, &0_u64);
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+
+        // Bootstrap governance: the initializer is the first governor with
+        // a 1-of-1 threshold. Production deploys should add more governors
+        // and raise the threshold before relying on set_config.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Governor(admin.clone()), &true);
+        env.storage().instance().set(&DataKey::GovernorCount, &1_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorThreshold, &1_u32);
+        if let Ok(hashes) = Self::fingerprint_config(
+            &env,
+            &token_contract,
+            &referral_contract,
+            &leaderboard_contract,
+            &xlm_sac,
+        ) {
+            env.storage()
+                .instance()
+                .set(&DataKey::PinnedHashes, &hashes);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "initialized"), admin),
+            (token_contract, referral_contract, leaderboard_contract, xlm_sac),
+        );
         Ok(())
     }
 
@@ -235,27 +318,222 @@ impl PredictionMarketContract {
         Ok(())
     }
 
-    /// Update the packed Config (token / referral / leaderboard / xlm_sac). Admin only.
-    /// Used to correct an address set at initialize time.
+    /// Propose a Config change. Does **not** take effect immediately.
+    ///
+    /// Issue #51: live WASM hashes are read on-chain (not caller-supplied),
+    /// the proposal is emitted for monitors, and it only becomes active after
+    /// `CONFIG_DELAY_SECS` **and** `GovernorThreshold` approvals via
+    /// `execute_set_config`. Any governor can `cancel_set_config` in between.
     pub fn set_config(
         env: Env,
-        admin: Address,
+        caller: Address,
         token_contract: Address,
         referral_contract: Address,
         leaderboard_contract: Address,
         xlm_sac: Address,
     ) -> Result<(), MarketError> {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        if env.storage().instance().has(&DataKey::PendingConfig) {
+            return Err(MarketError::ConfigChangeExists);
+        }
+
+        let hashes = Self::fingerprint_config(
+            &env,
+            &token_contract,
+            &referral_contract,
+            &leaderboard_contract,
+            &xlm_sac,
+        )?;
+        let mut approvers: Vec<Address> = Vec::new(&env);
+        approvers.push_back(caller.clone());
+        let pending = PendingConfigChange {
+            cfg: Config {
+                token: token_contract,
+                referral: referral_contract,
+                leaderboard: leaderboard_contract,
+                xlm_sac,
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         env.storage().instance().set(
             &DataKey::Cfg,
             &Config {
-                token: token_contract,
-                referral: referral_contract,
-                leaderboard: leaderboard_contract,
-                xlm_sac,
+                token: token_contract.clone(),
+                referral: referral_contract.clone(),
+                leaderboard: leaderboard_contract.clone(),
+                xlm_sac: xlm_sac.clone(),
             },
+            hashes,
+            requested_at: env.ledger().timestamp(),
+            approvers,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingConfig, &pending);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_req"), caller),
+            pending,
         );
+        Ok(())
+    }
+
+    /// A governor attests a pending Config change during the dispute window.
+    pub fn approve_set_config(env: Env, caller: Address) -> Result<u32, MarketError> {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        let mut pending: PendingConfigChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfig)
+            .ok_or(MarketError::NoConfigChange)?;
+        if Self::approver_index(&pending.approvers, &caller).is_some() {
+            return Err(MarketError::AlreadyApproved);
+        }
+        pending.approvers.push_back(caller.clone());
+        let count = pending.approvers.len();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingConfig, &pending);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_ok"), caller),
+            count,
+        );
+        Ok(count)
+    }
+
+    /// Activate a matured, sufficiently-approved Config change. Re-reads live
+    /// executables so a dependency cannot swap WASM during the delay.
+    pub fn execute_set_config(env: Env, caller: Address) -> Result<(), MarketError> {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        let pending: PendingConfigChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfig)
+            .ok_or(MarketError::NoConfigChange)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.requested_at || now - pending.requested_at < CONFIG_DELAY_SECS {
+            return Err(MarketError::ConfigChangeTooSoon);
+        }
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorThreshold)
+            .unwrap_or(1);
+        if pending.approvers.len() < threshold {
+            return Err(MarketError::InsufficientApprovals);
+        }
+
+        let live = Self::fingerprint_config(
+            &env,
+            &pending.cfg.token,
+            &pending.cfg.referral,
+            &pending.cfg.leaderboard,
+            &pending.cfg.xlm_sac,
+        )?;
+        if live != pending.hashes {
+            return Err(MarketError::WasmHashMismatch);
+        }
+
+        env.storage().instance().set(&DataKey::Cfg, &pending.cfg);
+        env.storage()
+            .instance()
+            .set(&DataKey::PinnedHashes, &pending.hashes);
+        env.storage().instance().remove(&DataKey::PendingConfig);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_act"), caller),
+            pending.cfg,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "config_changed"), admin),
+            (token_contract, referral_contract, leaderboard_contract, xlm_sac),
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending Config change during the dispute window.
+    pub fn cancel_set_config(env: Env, caller: Address) -> Result<(), MarketError> {
+        caller.require_auth();
+        Self::require_governor(&env, &caller)?;
+        if !env.storage().instance().has(&DataKey::PendingConfig) {
+            return Err(MarketError::NoConfigChange);
+        }
+        env.storage().instance().remove(&DataKey::PendingConfig);
+        env.events().publish(
+            (Symbol::new(&env, "cfg_can"), caller),
+            1_u32,
+        );
+        Ok(())
+    }
+
+    pub fn add_governor(env: Env, admin: Address, governor: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let key = DataKey::Governor(governor.clone());
+        if env.storage().persistent().get(&key).unwrap_or(false) {
+            return Ok(());
+        }
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0);
+        if count >= MAX_GOVERNORS {
+            return Err(MarketError::RateLimitExceeded);
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorCount, &(count + 1));
+        Ok(())
+    }
+
+    pub fn remove_governor(env: Env, admin: Address, governor: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0);
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorThreshold)
+            .unwrap_or(1);
+        if count <= threshold {
+            return Err(MarketError::InvalidThreshold);
+        }
+        let key = DataKey::Governor(governor);
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            return Err(MarketError::NotAuthorized);
+        }
+        env.storage().persistent().remove(&key);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorCount, &(count - 1));
+        Ok(())
+    }
+
+    pub fn set_governor_threshold(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+    ) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0);
+        if threshold == 0 || threshold > count {
+            return Err(MarketError::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernorThreshold, &threshold);
         Ok(())
     }
 
@@ -264,6 +542,33 @@ impl PredictionMarketContract {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
     }
 
+    pub fn get_pending_config(env: Env) -> Option<PendingConfigChange> {
+        env.storage().instance().get(&DataKey::PendingConfig)
+    }
+
+    pub fn get_pinned_hashes(env: Env) -> Option<PinnedHashes> {
+        env.storage().instance().get(&DataKey::PinnedHashes)
+    }
+
+    pub fn is_governor(env: Env, account: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Governor(account))
+            .unwrap_or(false)
+    }
+
+    pub fn get_governor_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GovernorThreshold)
+            .unwrap_or(1)
+    }
+
+    pub fn get_governor_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GovernorCount)
+            .unwrap_or(0)
     /// The cross-contract ABI version this deployment implements (issue #84).
     pub fn interface_version(_env: Env) -> u32 {
         INTERFACE_VERSION
@@ -281,6 +586,7 @@ impl PredictionMarketContract {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -288,6 +594,7 @@ impl PredictionMarketContract {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -409,6 +716,10 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::MarketCount, &market_id);
 
+        env.events().publish(
+            (Symbol::new(&env, "market_created"), market.creator.clone(), market_id),
+            (market.category.clone(), market.end_time),
+        );
         Ok(market_id)
     }
 
@@ -423,20 +734,31 @@ impl PredictionMarketContract {
         Self::require_not_paused(&env)?;
         user.require_auth();
 
+        // Issue 89: reentrancy guard — set lock before any external call
+        let lock_key = DataKey::BetLock(market_id, user.clone());
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            return Err(MarketError::NotAuthorized); // reentrancy attempt
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
         let net = amount * NET_NUMERATOR / BPS_DENOM;
         if net < MIN_BET {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::BetTooSmall);
         }
 
         // OPT: load market first — cheapest early-exit if not found
         let mut market = Self::load_market(&env, market_id)?;
         if market.cancelled {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::MarketCancelled);
         }
         if market.resolved {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::MarketResolved);
         }
         if env.ledger().timestamp() >= market.end_time {
+            env.storage().persistent().remove(&lock_key);
             return Err(MarketError::MarketExpired);
         }
 
@@ -447,9 +769,11 @@ impl PredictionMarketContract {
         // Spam guard + side check combined from single read
         if let Some(ref e) = existing {
             if e.count >= MAX_BETS_PER_USER {
+                env.storage().persistent().remove(&lock_key);
                 return Err(MarketError::TooManyBets);
             }
             if e.is_yes != is_yes {
+                env.storage().persistent().remove(&lock_key);
                 return Err(MarketError::OppositeSideBet);
             }
         }
@@ -464,50 +788,17 @@ impl PredictionMarketContract {
         // OPT: one Config read instead of 4 separate instance reads
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
 
-        // ── XLM transfer user → this contract ────────────────────────────
-        let xlm = token::Client::new(&env, &cfg.xlm_sac);
-        let this = env.current_contract_address();
-        xlm.transfer(&user, &this, &amount);
+        // ── Issue 89: Write ALL state BEFORE external calls (check-effects-interaction) ──
 
-        // ── Accumulated fees ──────────────────────────────────────────────
+        // Accumulate only the platform fee — the referral fee is either sent to
+        // the referrer or held by the referral contract as surplus (issue #78),
+        // so the market contract never holds it for withdrawal.
         let mut acc_fees: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
         acc_fees += platform_fee;
-
-        // ── Referral (skip if cached no-referrer) ─────────────────────────
-        let hr_key = DataKey::HasReferrer(user.clone());
-        let cached: Option<bool> = env.storage().persistent().get(&hr_key);
-
-        let paid_referrer = if cached == Some(false) {
-            false
-        } else {
-            Self::require_compatible_referral(&env, &cfg.referral)?;
-            xlm.transfer(&this, &cfg.referral, &referral_fee);
-            let result: bool = env.invoke_contract(
-                &cfg.referral,
-                &Symbol::new(&env, "credit"),
-                vec![
-                    &env,
-                    this.clone().into_val(&env),
-                    user.clone().into_val(&env),
-                    referral_fee.into_val(&env),
-                ],
-            );
-            if cached.is_none() {
-                env.storage().persistent().set(&hr_key, &result);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&hr_key, TTL_BUMP, TTL_HIGH);
-            }
-            result
-        };
-
-        if !paid_referrer {
-            acc_fees += referral_fee;
-        }
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
@@ -538,8 +829,7 @@ impl PredictionMarketContract {
             let cnt_key = DataKey::BettorCount(market_id);
             let count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
             let slot_key = DataKey::BettorAt(market_id, count);
-            // OPT: no clone — user is moved here and we don't need it after
-            env.storage().persistent().set(&slot_key, &user);
+            env.storage().persistent().set(&slot_key, &user.clone());
             env.storage()
                 .persistent()
                 .extend_ttl(&slot_key, TTL_BUMP, TTL_HIGH);
@@ -562,6 +852,49 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        // ── HasReferrer cache write ───────────────────────────────────────
+        let hr_key = DataKey::HasReferrer(user.clone());
+        let cached: Option<bool> = env.storage().persistent().get(&hr_key);
+
+        // ── External calls (issue 89: after ALL state writes) ─────────────
+
+        // ── XLM transfer user → this contract ────────────────────────────
+        let xlm = token::Client::new(&env, &cfg.xlm_sac);
+        let this = env.current_contract_address();
+        xlm.transfer(&user, &this, &amount);
+
+        // ── Referral (skip if cached no-referrer) ─────────────────────────
+        let paid_referrer = if cached == Some(false) {
+            false
+        } else {
+            Self::require_compatible_referral(&env, &cfg.referral)?;
+            xlm.transfer(&this, &cfg.referral, &referral_fee);
+            let result: bool = env.invoke_contract(
+                &cfg.referral,
+                &Symbol::new(&env, "credit"),
+                vec![
+                    &env,
+                    this.clone().into_val(&env),
+                    user.clone().into_val(&env),
+                    referral_fee.into_val(&env),
+                ],
+            );
+            if cached.is_none() {
+                env.storage().persistent().set(&hr_key, &result);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&hr_key, TTL_BUMP, TTL_HIGH);
+            }
+            result
+        };
+
+        // ── Release reentrancy lock ──────────────────────────────────────
+        env.storage().persistent().remove(&lock_key);
+        env.events().publish(
+            (Symbol::new(&env, "bet_placed"), user, market_id),
+            (is_yes, amount, net),
+        );
         Ok(())
     }
 
@@ -658,9 +991,16 @@ impl PredictionMarketContract {
         market.outcome = outcome;
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
+        // Issue #54: keep every fund-bearing key for this market alive at
+        // settlement so later claims cannot observe an expired Bet/Payout.
+        let _ = Self::refresh_market_keys(&env, market_id);
         env.storage()
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "market_resolved"), caller, market_id),
+            (outcome, total_pool, acc_fees),
+        );
         Ok(())
     }
 
@@ -682,9 +1022,7 @@ impl PredictionMarketContract {
         market.cancelled = true;
         let mkt_key = DataKey::Market(market_id);
         env.storage().persistent().set(&mkt_key, &market);
-        env.storage()
-            .persistent()
-            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        let _ = Self::refresh_market_keys(&env, market_id);
 
         // Reclaim fees — net * fee_rate / (1 - fee_rate)
         let net_pool = market.total_yes + market.total_no;
@@ -703,6 +1041,10 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
 
+        env.events().publish(
+            (Symbol::new(&env, "market_cancelled"), admin, market_id),
+            net_pool,
+        );
         Ok(())
     }
 
@@ -747,6 +1089,10 @@ impl PredictionMarketContract {
             &gross,
         );
 
+        env.events().publish(
+            (Symbol::new(&env, "cancel_refund"), user, market_id),
+            gross,
+        );
         Ok(gross)
     }
 
@@ -790,12 +1136,12 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
-        // Read-time TTL refresh (issue #9): a claim must not be able to observe
-        // an expired market/bet record — keep the market entry alive here too
-        // so late claims on a long-lived market keep working.
+        // Read-time TTL refresh (issue #9 / #54): keep market + payout alive
+        // so a late claim on a long-lived market still pays out.
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
+        Self::bump_if_present(&env, &DataKey::Payout(market_id, user.clone()));
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         let this = env.current_contract_address();
@@ -839,6 +1185,10 @@ impl PredictionMarketContract {
             ],
         );
 
+        env.events().publish(
+            (Symbol::new(&env, "claim_processed"), user, market_id),
+            (is_winner, payout, real_win),
+        );
         Ok(())
     }
 
@@ -878,6 +1228,10 @@ impl PredictionMarketContract {
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
+        env.events().publish(
+            (Symbol::new(&env, "fees_withdrawn"), caller, recipient.clone()),
+            fees,
+        );
         Ok(fees)
     }
 
@@ -921,7 +1275,7 @@ impl PredictionMarketContract {
         env.storage().persistent().set(
             &key,
             &WithdrawalRequest {
-                recipient,
+                recipient: recipient.clone(),
                 amount,
                 requested_at: env.ledger().timestamp(),
             },
@@ -929,6 +1283,10 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        env.events().publish(
+            (Symbol::new(&env, "withdraw_requested"), caller, recipient),
+            amount,
+        );
         Ok(())
     }
 
@@ -973,6 +1331,10 @@ impl PredictionMarketContract {
             &req.amount,
         );
 
+        env.events().publish(
+            (Symbol::new(&env, "fees_withdrawn"), caller, req.recipient.clone()),
+            req.amount,
+        );
         Ok(req.amount)
     }
 
@@ -985,11 +1347,15 @@ impl PredictionMarketContract {
     ) -> Result<(), MarketError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
-        let key = DataKey::PendingWithdrawal(caller);
+        let key = DataKey::PendingWithdrawal(caller.clone());
         if !env.storage().persistent().has(&key) {
             return Err(MarketError::NoWithdrawalRequest);
         }
         env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "withdraw_cancelled"), admin),
+            caller,
+        );
         Ok(())
     }
 
@@ -1065,6 +1431,49 @@ impl PredictionMarketContract {
             .unwrap_or(0)
     }
 
+    /// Remaining TTL (ledgers) of the Market key. 0 means missing/expired —
+    /// integrators can warn before funds become unrecoverable (issue #54).
+    pub fn get_market_ttl(env: Env, market_id: u64) -> u32 {
+        let key = DataKey::Market(market_id);
+        if !env.storage().persistent().has(&key) {
+            return 0;
+        }
+        env.storage().persistent().get_ttl(&key)
+    }
+
+    /// Permissionless keeper: anyone may pay to extend this market's
+    /// Market/Bet/Payout/bettor-index keys. Does not resurrect expired entries.
+    pub fn refresh_market_ttl(env: Env, market_id: u64) -> Result<u32, MarketError> {
+        Self::refresh_market_keys(&env, market_id)
+    }
+
+    /// Permissionless migration: bump existing markets in
+    /// `[start_id, start_id + limit)`. After a WASM upgrade this is how
+    /// pre-existing entries get a fresh TTL without waiting for a user claim.
+    pub fn refresh_markets(
+        env: Env,
+        start_id: u64,
+        limit: u32,
+    ) -> Result<u32, MarketError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketCount)
+            .unwrap_or(0);
+        let limit = limit.min(MAX_TTL_REFRESH_PAGE).max(1);
+        let mut bumped: u32 = 0;
+        let mut id = if start_id == 0 { 1 } else { start_id };
+        let end = id.saturating_add(limit as u64);
+        while id < end && id <= count {
+            if Self::refresh_market_keys(&env, id).is_ok() {
+                bumped += 1;
+            }
+            id += 1;
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(bumped)
+    }
+
     pub fn is_fee_recipient(env: Env, recipient: Address) -> bool {
         env.storage()
             .persistent()
@@ -1103,6 +1512,67 @@ impl PredictionMarketContract {
 
     // ── Internal Helpers ──────────────────────────────────────────────────
 
+    fn sac_sentinel(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[0u8; 32])
+    }
+
+    /// Live executable fingerprint for a dependency.
+    /// token / referral / leaderboard must be WASM; xlm_sac must be the SAC.
+    fn fingerprint(env: &Env, addr: &Address, expect_sac: bool) -> Result<BytesN<32>, MarketError> {
+        match addr.executable() {
+            Some(Executable::Wasm(hash)) => {
+                if expect_sac {
+                    return Err(MarketError::InvalidDependency);
+                }
+                Ok(hash)
+            }
+            Some(Executable::StellarAsset) => {
+                if !expect_sac {
+                    return Err(MarketError::InvalidDependency);
+                }
+                Ok(Self::sac_sentinel(env))
+            }
+            Some(Executable::Account) | None => Err(MarketError::InvalidDependency),
+        }
+    }
+
+    fn fingerprint_config(
+        env: &Env,
+        token: &Address,
+        referral: &Address,
+        leaderboard: &Address,
+        xlm_sac: &Address,
+    ) -> Result<PinnedHashes, MarketError> {
+        Ok(PinnedHashes {
+            token: Self::fingerprint(env, token, false)?,
+            referral: Self::fingerprint(env, referral, false)?,
+            leaderboard: Self::fingerprint(env, leaderboard, false)?,
+            xlm_sac: Self::fingerprint(env, xlm_sac, true)?,
+        })
+    }
+
+    fn approver_index(approvers: &Vec<Address>, who: &Address) -> Option<u32> {
+        let n = approvers.len();
+        for i in 0..n {
+            if approvers.get(i).unwrap() == *who {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn require_governor(env: &Env, caller: &Address) -> Result<(), MarketError> {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Governor(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        Err(MarketError::NotAuthorized)
+    }
+
     #[inline]
     fn load_market(env: &Env, market_id: u64) -> Result<Market, MarketError> {
         env.storage()
@@ -1111,6 +1581,43 @@ impl PredictionMarketContract {
             .ok_or(MarketError::MarketNotFound)
     }
 
+    fn bump_if_present(env: &Env, key: &DataKey) {
+        if env.storage().persistent().has(key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(key, TTL_BUMP, TTL_HIGH);
+        }
+    }
+
+    /// Extend every live fund-bearing key for `market_id`. Used by resolve
+    /// (read-bump), the permissionless keeper, and the upgrade migration.
+    fn refresh_market_keys(env: &Env, market_id: u64) -> Result<u32, MarketError> {
+        let mkt_key = DataKey::Market(market_id);
+        if !env.storage().persistent().has(&mkt_key) {
+            return Err(MarketError::MarketNotFound);
+        }
+        Self::bump_if_present(env, &mkt_key);
+
+        let bettors: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BettorCount(market_id))
+            .unwrap_or(0);
+        Self::bump_if_present(env, &DataKey::BettorCount(market_id));
+        for i in 0..bettors {
+            let slot_key = DataKey::BettorAt(market_id, i);
+            if let Some(addr) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&slot_key)
+            {
+                Self::bump_if_present(env, &slot_key);
+                Self::bump_if_present(env, &DataKey::Bet(market_id, addr.clone()));
+                Self::bump_if_present(env, &DataKey::Payout(market_id, addr));
+            }
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(bettors)
     // Issue #84: check a dependency's reported ABI version before invoking
     // it, so a unilateral upgrade with an incompatible credit/reward
     // signature fails with a clear error instead of an opaque

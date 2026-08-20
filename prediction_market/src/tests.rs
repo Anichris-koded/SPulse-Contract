@@ -1,5 +1,6 @@
 use super::*;
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
     BytesN, Env, String,
@@ -1526,6 +1527,118 @@ fn test_cancel_refund_rebumps_ttl_entries() {
 
     assert!(ttl(&bet_key) > bet_before);
     assert!(ttl(&market_key) > market_before);
+}
+
+// ── Cross-contract interface versioning (issue #84) ───────────────────────────
+
+// Stands in for a referral_registry/leaderboard deployment upgraded to an
+// incompatible ABI: it only implements interface_version(), reporting a
+// version this prediction_market build does not expect.
+#[contract]
+struct MockIncompatibleDependency;
+
+#[contractimpl]
+impl MockIncompatibleDependency {
+    pub fn interface_version(_env: Env) -> u32 {
+        99
+    }
+}
+
+#[test]
+fn test_interface_version_reported() {
+    let t = setup();
+    assert_eq!(t.client.interface_version(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_place_bet_rejects_incompatible_referral() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+
+    let fake_referral = t.env.register(MockIncompatibleDependency, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &fake_referral,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_claim_rejects_incompatible_leaderboard() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let fake_leaderboard = t.env.register(MockIncompatibleDependency, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &fake_leaderboard,
+        &cfg.xlm_sac,
+    );
+
+    t.client.claim(&user, &id);
+}
+
+// Stands in for a leaderboard deployment that reports the version this
+// prediction_market build expects, but is missing the actual reward()
+// function it's about to call. Proves the known limitation of the version
+// check: a matching u32 alone does not prove ABI compatibility, only that
+// the callee's author intended it to be compatible. If a breaking change to
+// reward()'s signature ever ships without bumping INTERFACE_VERSION, this is
+// exactly the failure mode that results, just past the version check instead
+// of at it.
+#[contract]
+struct MockLeaderboardMissingReward;
+
+#[contractimpl]
+impl MockLeaderboardMissingReward {
+    pub fn interface_version(_env: Env) -> u32 {
+        1
+    }
+    // No reward() here on purpose.
+}
+
+#[test]
+#[should_panic]
+fn test_matching_version_does_not_guarantee_claim_succeeds() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let fake_leaderboard = t.env.register(MockLeaderboardMissingReward, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &fake_leaderboard,
+        &cfg.xlm_sac,
+    );
+
+    // require_compatible_leaderboard passes (version 1 == version 1), then
+    // claim() panics inside the real reward() invoke_contract call because
+    // the function doesn't exist on the callee.
+    t.client.claim(&user, &id);
 }
 
 // ── Emergency Pause (issue #83) ───────────────────────────────────────────────

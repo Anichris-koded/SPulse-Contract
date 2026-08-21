@@ -238,6 +238,9 @@ fn test_fee_split_with_referrer() {
 
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
+    // Referral points are queued and settled separately from the fee transfer.
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 0);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
 }
 
@@ -511,6 +514,7 @@ fn test_claim_winner() {
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
     t.client.claim(&alice, &id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
 
     let payout = t.xlm.balance(&alice) - alice_pre_claim;
     assert_eq!(payout, 196_0000000);
@@ -538,6 +542,7 @@ fn test_claim_loser() {
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
     t.client.claim(&bob, &id);
+    t.leaderboard_client.claim_pending_rewards(&bob);
 
     assert_eq!(t.xlm.balance(&bob), bob_pre_claim);
     let stats = t.leaderboard_client.get_stats(&bob);
@@ -545,8 +550,37 @@ fn test_claim_loser() {
     assert_eq!(t.token_client.balance(&bob), 2_0000000);
 }
 
-// ── 23. Reject double claim ───────────────────────────────────────────────────
+// The reward queue is optional: a missing/unavailable leaderboard must not
+// roll back the settled XLM claim.
+#[test]
+fn test_claim_succeeds_when_reward_queue_unavailable() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
 
+    let cfg = t.client.get_config();
+    let unavailable_leaderboard = Address::generate(&t.env);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &unavailable_leaderboard,
+        &cfg.xlm_sac,
+    );
+
+    let before = t.xlm.balance(&user);
+    t.client.claim(&user, &id);
+
+    assert_eq!(t.xlm.balance(&user) - before, 98_0000000);
+    assert!(t.client.get_bet(&id, &user).claimed);
+    assert_eq!(t.leaderboard_client.get_points(&user), 0);
+}
+
+// ── 23. Reject double claim ───────────────────────────────────────────────────
 #[test]
 #[should_panic(expected = "Error(Contract, #12)")]
 fn test_reject_double_claim() {
@@ -881,6 +915,8 @@ fn test_referrer_bonus_points_per_bet() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &50_0000000_i128);
 
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 0);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
 }
 
@@ -1140,6 +1176,7 @@ fn test_empty_side_resolution_pool_to_fees() {
 
     // Alice (was YES, losing side) can still claim — gets PULSE tokens + points
     t.client.claim(&alice, &id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
     let bet = t.client.get_bet(&id, &alice);
     assert!(bet.claimed);
     // Gets lose-tier rewards because winning_side == 0
@@ -1191,6 +1228,10 @@ fn test_e2e_full_inter_contract_flow() {
         &String::from_str(&t.env, "Alice"),
         &Some(referrer.clone()),
     );
+    // Welcome reward is queued and does not run during registration.
+    assert_eq!(t.leaderboard_client.get_points(&alice), 0);
+    assert_eq!(t.token_client.balance(&alice), 0);
+    t.leaderboard_client.claim_pending_rewards(&alice);
     assert_eq!(t.leaderboard_client.get_points(&alice), 5);
     assert_eq!(t.token_client.balance(&alice), 1_0000000);
 
@@ -1208,9 +1249,11 @@ fn test_e2e_full_inter_contract_flow() {
         .place_bet(&alice, &market_id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
-    // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 0);
+    // Alice's welcome bonus was claimed above: total_bets = 1.
     assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
     assert_eq!(t.client.get_market(&market_id).total_yes, 98_0000000);
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 100_0000000);
 
@@ -1230,6 +1273,8 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 150_0000000);
     assert_eq!(t.client.get_market(&market_id).total_yes, 147_0000000);
     assert_eq!(t.client.get_market(&market_id).bet_count, 2);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
 
     // Add a resolver and resolve via them
@@ -1244,6 +1289,9 @@ fn test_e2e_full_inter_contract_flow() {
     t.client.claim(&alice, &market_id);
     let alice_payout = t.xlm.balance(&alice) - alice_xlm_before;
     assert_eq!(alice_payout, 343_0000000);
+    assert_eq!(t.leaderboard_client.get_points(&alice), 5);
+    assert_eq!(t.token_client.balance(&alice), 1_0000000);
+    t.leaderboard_client.claim_pending_rewards(&alice);
     assert_eq!(t.leaderboard_client.get_points(&alice), 35);
     assert_eq!(t.token_client.balance(&alice), 11_0000000);
 
@@ -1251,6 +1299,9 @@ fn test_e2e_full_inter_contract_flow() {
     let bob_xlm_before = t.xlm.balance(&bob);
     t.client.claim(&bob, &market_id);
     assert_eq!(t.xlm.balance(&bob), bob_xlm_before);
+    assert_eq!(t.leaderboard_client.get_points(&bob), 0);
+    assert_eq!(t.token_client.balance(&bob), 0);
+    t.leaderboard_client.claim_pending_rewards(&bob);
     assert_eq!(t.leaderboard_client.get_points(&bob), 10);
     assert_eq!(t.token_client.balance(&bob), 2_0000000);
 

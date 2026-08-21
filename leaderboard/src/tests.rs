@@ -326,3 +326,30 @@ fn test_reward_updates_points_and_winloss() {
     assert_eq!(s.lost_bets, 1);
     assert_eq!(s.total_bets, 2);
 }
+
+#[test]
+fn test_queued_rewards_accumulate_and_apply_later() {
+    // Queueing performs only bounded storage writes: points, top-list state,
+    // and token balances remain untouched until the separate pull transaction.
+    let (env, client, _admin, market, referral) = setup();
+    let user = Address::generate(&env);
+
+    client.queue_reward(&market, &user, &30_u64, &10_i128, &true);
+    client.queue_bonus_reward(&referral, &user, &5_u64, &1_i128);
+
+    assert_eq!(client.get_points(&user), 0);
+    let pending = client.get_pending_reward(&user).unwrap();
+    assert_eq!(pending.points, 35);
+    assert_eq!(pending.tokens, 11);
+    assert_eq!(pending.won_delta, 1);
+    assert_eq!(pending.lost_delta, 0);
+    assert_eq!(pending.bet_delta, 2);
+
+    client.claim_pending_rewards(&user);
+    let stats = client.get_stats(&user);
+    assert_eq!(stats.points, 35);
+    assert_eq!(stats.total_bets, 2);
+    assert_eq!(stats.won_bets, 1);
+    assert_eq!(stats.lost_bets, 0);
+    assert!(client.get_pending_reward(&user).is_none());
+}

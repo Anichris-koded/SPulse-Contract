@@ -756,9 +756,14 @@ impl PredictionMarketContract {
             (LOSE_POINTS, LOSE_TOKENS)
         };
 
-        let _: Val = env.invoke_contract(
+        // Queue points/tokens for later settlement. The expensive leaderboard
+        // sort and token mint must never be able to brick the already-completed
+        // XLM payout or claim state transition.
+        // Queueing is best-effort: a reward infrastructure failure must not
+        // roll back the already-completed claim and XLM payout.
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &cfg.leaderboard,
-            &Symbol::new(&env, "reward"),
+            &Symbol::new(&env, "queue_reward"),
             vec![
                 &env,
                 this.clone().into_val(&env),

@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal, Val};
 
 fn setup() -> (
     Env,
@@ -604,8 +604,14 @@ fn test_add_pts_emits_leaderboard_updated() {
     let (env, client, _admin, market, _referral) = setup();
     let user = Address::generate(&env);
     client.add_pts(&market, &user, &100_u64, &true);
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than an indexable Vec of
+    // (address, topics, data) tuples.
     let events = env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let name = Symbol::try_from_val(&env, &last.1.get_unchecked(0)).unwrap();
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "add_pts emitted no event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(&env, &body.topics[0]).unwrap();
+    let name = Symbol::try_from_val(&env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }

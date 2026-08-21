@@ -8,6 +8,22 @@ use soroban_sdk::{
 const WELCOME_BONUS_POINTS: u64 = 5;
 const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BET_POINTS: u64 = 3;
+const TTL_BUMP: u32 = 3_153_600;
+const TTL_HIGH: u32 = 6_307_200;
+
+const TTL_BUMP: u32 = 3_153_600;
+const TTL_HIGH: u32 = 6_307_200;
+
+// Issue #84: bump whenever a function signature, argument order, or return
+// type that a caller relies on changes.
+pub const INTERFACE_VERSION: u32 = 1;
+
+// The leaderboard interface_version this contract was built against. If a
+// deployed leaderboard reports a different version, its add_bonus_pts ABI
+// may no longer match what we send — refuse the call instead of invoking
+// blind and either panicking deep in argument decoding or silently
+// misbehaving (issue #84).
+const EXPECTED_LEADERBOARD_INTERFACE_VERSION: u32 = 1;
 
 /// Maximum allowed depth of the referral chain. A new registration whose
 /// referrer already sits at depth MAX_REFERRAL_DEPTH (i.e. has MAX_REFERRAL_DEPTH
@@ -25,11 +41,16 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
-    /// The referrer's chain already reaches MAX_REFERRAL_DEPTH ancestors.
-    ReferralDepthExceeded = 7,
-    /// The proposed referrer is already a descendant of `user`, which would
-    /// create a cycle in the referral graph.
-    ReferralCycle = 8,
+    ContractPaused = 7,
+    ReferrerNotRegistered = 8,
+    /// leaderboard reported an interface_version this contract wasn't built
+    /// against (issue #84). Note: a matching version number alone does not
+    /// prove the callee's actual function shape still matches, it only
+    /// proves the callee's author intended it to. The guarantee only holds
+    /// if every breaking ABI change (renamed function, changed argument
+    /// order/count/type, changed return type) always increments
+    /// INTERFACE_VERSION in the same commit. See EXPECTED_LEADERBOARD_INTERFACE_VERSION.
+    IncompatibleInterface = 9,
 }
 
 #[contracttype]
@@ -53,6 +74,7 @@ pub enum DataKey {
     TokenContract,
     LeaderboardContract,
     XlmSacContract,
+    Paused,
 }
 
 // Lever A: packed registrant profile — one storage slot instead of three.
@@ -93,7 +115,13 @@ impl ReferralRegistryContract {
         env.storage()
             .instance()
             .set(&DataKey::XlmSacContract, &xlm_sac);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
+    }
+
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
     }
 
     // ── Upgradeability & Config (admin only) ──────────────────────────────────
@@ -117,7 +145,34 @@ impl ReferralRegistryContract {
         env.storage()
             .instance()
             .set(&DataKey::XlmSacContract, &xlm_sac);
+        env.events().publish((Symbol::new(&env, "xlm_sac_set"), admin), xlm_sac);
         Ok(())
+    }
+
+    /// Halt registration and crediting in an emergency. Admin only. View
+    /// functions keep working so the frontend can still read state.
+    pub fn pause(env: Env, admin: Address) -> Result<(), ReferralError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"), admin), true);
+        Ok(())
+    }
+
+    /// Resume registration and crediting. Admin only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), ReferralError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     pub fn register_referral(
@@ -126,6 +181,7 @@ impl ReferralRegistryContract {
         display_name: String,
         referrer: Option<Address>,
     ) -> Result<(), ReferralError> {
+        Self::require_not_paused(&env)?;
         user.require_auth();
         if Self::is_registered(env.clone(), user.clone()) {
             return Err(ReferralError::AlreadyRegistered);
@@ -134,31 +190,8 @@ impl ReferralRegistryContract {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
             }
-
-            // ── Sybil-resistance: depth limit + cycle detection ──────────────
-            // Walk the referrer's ancestor chain up to MAX_REFERRAL_DEPTH steps.
-            // Two invariants are enforced in a single pass:
-            //
-            //  1. Depth: if the referrer's chain already has MAX_REFERRAL_DEPTH
-            //     ancestors, reject — the new node would exceed the limit.
-            //
-            //  2. Cycle: if `user` appears anywhere in the referrer's chain,
-            //     linking them would create a cycle (e.g. A→B→C, C tries to
-            //     refer A). This also handles the indirect self-referral case.
-            //
-            // The walk is bounded by MAX_REFERRAL_DEPTH, so gas usage is O(depth).
-            let mut depth: u32 = 0;
-            let mut current: Option<Address> = Some(ref_addr.clone());
-            while let Some(ancestor) = current {
-                if ancestor == user {
-                    return Err(ReferralError::ReferralCycle);
-                }
-                if depth >= MAX_REFERRAL_DEPTH {
-                    return Err(ReferralError::ReferralDepthExceeded);
-                }
-                depth += 1;
-                current = Self::load_profile(&env, &ancestor)
-                    .and_then(|p| p.referrer);
+            if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                return Err(ReferralError::ReferrerNotRegistered);
             }
         }
 
@@ -172,6 +205,14 @@ impl ReferralRegistryContract {
                 referrer: referrer.clone(),
             },
         );
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Profile(user), TTL_BUMP, TTL_HIGH);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Profile(user.clone()),
+            TTL_BUMP,
+            TTL_HIGH,
+        );
         // The referrer's counter is a DIFFERENT user's entry — update in place.
         if let Some(ref ref_addr) = referrer {
             let count: u32 = env
@@ -179,51 +220,41 @@ impl ReferralRegistryContract {
                 .persistent()
                 .get(&DataKey::ReferralCount(ref_addr.clone()))
                 .unwrap_or(0);
+            let count_key = DataKey::ReferralCount(ref_addr.clone());
+            env.storage()
+                .persistent()
+                .set(&count_key, &(count + 1));
             env.storage()
                 .persistent()
                 .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
-
-            // ── Welcome bonus: only awarded when a referrer is provided ──────
-            // Granting a bonus to every registrant (with or without a referrer)
-            // allows sybil attackers to farm WELCOME_BONUS_TOKENS by creating
-            // unlimited self-owned accounts. Restricting the bonus to referred
-            // registrations means a real referrer must be incentivised to invite
-            // someone, and the attacker earns nothing from a chain of solo
-            // registrations.
-            let this = env.current_contract_address();
-            let leaderboard: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::LeaderboardContract)
-                .unwrap();
-            let _: Val = env.invoke_contract(
-                &leaderboard,
-                &Symbol::new(&env, "add_bonus_pts"),
-                vec![
-                    &env,
-                    this.clone().into_val(&env),
-                    user.clone().into_val(&env),
-                    WELCOME_BONUS_POINTS.into_val(&env),
-                ],
-            );
-            // Mint PULSE tokens directly from the referral contract (which is
-            // an authorised minter on the token contract).
-            let token: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::TokenContract)
-                .unwrap();
-            let _: Val = env.invoke_contract(
-                &token,
-                &Symbol::new(&env, "mint"),
-                vec![
-                    &env,
-                    this.into_val(&env),
-                    user.into_val(&env),
-                    WELCOME_BONUS_TOKENS.into_val(&env),
-                ],
-            );
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::ReferralCount(ref_addr), TTL_BUMP, TTL_HIGH);
+                .extend_ttl(&count_key, TTL_BUMP, TTL_HIGH);
         }
+
+        let this = env.current_contract_address();
+        let leaderboard: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LeaderboardContract)
+            .unwrap();
+        Self::require_compatible_leaderboard(&env, &leaderboard)?;
+        let _: Val = env.invoke_contract(
+            &leaderboard,
+            &Symbol::new(&env, "reward_bonus"),
+            vec![
+                &env,
+                this.into_val(&env),
+                user.clone().into_val(&env),
+                WELCOME_BONUS_POINTS.into_val(&env),
+                WELCOME_BONUS_TOKENS.into_val(&env),
+            ],
+        );
+        env.events().publish(
+            (Symbol::new(&env, "referral_registered"), user),
+            referrer,
+        );
         Ok(())
     }
 
@@ -233,6 +264,7 @@ impl ReferralRegistryContract {
         user: Address,
         referral_fee: i128,
     ) -> Result<bool, ReferralError> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::require_market_contract(&env, &caller)?;
         // Lever A: resolve referrer via packed Profile (new) or legacy key (old).
@@ -254,6 +286,7 @@ impl ReferralRegistryContract {
                     .instance()
                     .get(&DataKey::LeaderboardContract)
                     .unwrap();
+                Self::require_compatible_leaderboard(&env, &leaderboard)?;
                 let _: Val = env.invoke_contract(
                     &leaderboard,
                     &Symbol::new(&env, "add_bonus_pts"),
@@ -269,9 +302,24 @@ impl ReferralRegistryContract {
                     .persistent()
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
+                let earn_key = DataKey::ReferralEarnings(ref_addr);
+                env.storage()
+                    .persistent()
+                    .set(&earn_key, &(earnings + referral_fee));
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&earn_key, TTL_BUMP, TTL_HIGH);
                 env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr),
+                    &DataKey::ReferralEarnings(ref_addr.clone()),
                     &(earnings + referral_fee),
+                );
+                env.storage().persistent().extend_ttl(
+                    &DataKey::ReferralEarnings(ref_addr),
+                    TTL_BUMP,
+                    TTL_HIGH,
+                env.events().publish(
+                    (Symbol::new(&env, "referral_credited"), user, ref_addr),
+                    referral_fee,
                 );
                 Ok(true)
             }
@@ -288,6 +336,10 @@ impl ReferralRegistryContract {
                         &referral_fee,
                     );
                 }
+                env.events().publish(
+                    (Symbol::new(&env, "referral_missed"), user),
+                    referral_fee,
+                );
                 Ok(false)
             }
         }
@@ -336,17 +388,54 @@ impl ReferralRegistryContract {
     }
 
     pub fn get_referral_count(env: Env, user: Address) -> u32 {
-        env.storage()
+        let key = DataKey::ReferralCount(user);
+        let count = env
+            .storage()
             .persistent()
-            .get(&DataKey::ReferralCount(user))
-            .unwrap_or(0)
+            .get(&key)
+            .unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        }
+        count
     }
 
     pub fn get_earnings(env: Env, user: Address) -> i128 {
-        env.storage()
+        let key = DataKey::ReferralEarnings(user);
+        let earnings = env
+            .storage()
             .persistent()
-            .get(&DataKey::ReferralEarnings(user))
-            .unwrap_or(0)
+            .get(&key)
+            .unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        }
+        earnings
+    }
+
+    /// Permissionless keeper: extend a referrer's count/earnings + profile
+    /// so inactive referrers do not lose history (issue #28 / #54).
+    pub fn refresh_referrer_ttl(env: Env, user: Address) {
+        let keys = [
+            DataKey::Profile(user.clone()),
+            DataKey::ReferralCount(user.clone()),
+            DataKey::ReferralEarnings(user.clone()),
+            DataKey::Registered(user.clone()),
+            DataKey::Referrer(user.clone()),
+            DataKey::DisplayName(user),
+        ];
+        for key in keys {
+            if env.storage().persistent().has(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+            }
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
     }
 
     pub fn has_referrer(env: Env, user: Address) -> bool {
@@ -377,6 +466,31 @@ impl ReferralRegistryContract {
             .ok_or(ReferralError::NotInitialized)?;
         if *caller != admin {
             return Err(ReferralError::NotAdmin);
+        }
+        Ok(())
+    }
+
+    // Issue #84: verify the configured leaderboard contract reports the ABI
+    // version we were built against before invoking it. Catches a unilateral
+    // leaderboard upgrade that changed add_pts/add_bonus_pts's signature and
+    // turns what would otherwise be an opaque invoke_contract failure (or,
+    // worse, a type-compatible-but-semantically-different call) into a clear
+    // IncompatibleInterface error.
+    fn require_compatible_leaderboard(env: &Env, leaderboard: &Address) -> Result<(), ReferralError> {
+        let version: u32 = env.invoke_contract(
+            leaderboard,
+            &Symbol::new(env, "interface_version"),
+            vec![env],
+        );
+        if version != EXPECTED_LEADERBOARD_INTERFACE_VERSION {
+            return Err(ReferralError::IncompatibleInterface);
+        }
+        Ok(())
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ReferralError> {
+        if Self::is_paused(env.clone()) {
+            return Err(ReferralError::ContractPaused);
         }
         Ok(())
     }

@@ -61,8 +61,7 @@ pub enum DataKey {
     TopPlayerAt(u32),
     TopPlayerCount,
     TopPlayerSlot(Address),
-    TopPlayerSeqAt(u32), // u64 — FIFO insertion sequence for the player at a slot
-    SeqCounter,          // u64 — monotonic counter feeding TopPlayerSeqAt
+    SeqCounter,          // u64 — monotonic counter feeding PlayerEntry::seq
     MinPoints, // u64 — points of the weakest entry currently in the top list
     MinSlot,   // u32 — slot index of that weakest entry
     Paused,
@@ -74,6 +73,10 @@ pub enum DataKey {
 pub struct PlayerEntry {
     pub address: Address,
     pub points: u64,
+    // Monotonic insertion sequence — used to break ties at the minimum score
+    // FIFO-style (oldest seq is evicted first). Travels with the entry through
+    // bubble_up, so no separate per-slot storage is needed.
+    pub seq: u64,
 }
 
 // External-facing stats struct (ABI stable)
@@ -334,7 +337,7 @@ impl LeaderboardContract {
                 total_bets: 0,
                 won_bets: 0,
                 lost_bets: 0,
-            });https://github.com/SPulse-Org/SPulse-Contract/pull/130/conflict?name=leaderboard%252Fsrc%252Flib.rs&ancestor_oid=7a7b4038a30cf18254c768dec1b0e925e99a2524&base_oid=0f8e07db85d70716277718fbad02702bff8b9c5b&head_oid=c7b44b6d2c85aa76e0a7a3edd62090eaf86845af
+            });
         stats.points += points;
         stats.total_bets += 1; // bonus awards count as activity
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
@@ -607,6 +610,7 @@ impl LeaderboardContract {
         let entry = PlayerEntry {
             address: user.clone(),
             points,
+            seq: Self::next_seq(env),
         };
         let key = DataKey::TopPlayerAt(slot);
         env.storage().persistent().set(&key, &entry);
@@ -619,18 +623,8 @@ impl LeaderboardContract {
 
         Self::bubble_up(env, &entry, slot);
 
-        // The last slot now holds the weakest entry — cache it for the
-        // full-list eviction path.
-        if slot + 1 == MAX_TOP_PLAYERS {
-            let min_slot = MAX_TOP_PLAYERS - 1;
-            let min_entry: PlayerEntry = env
-                .storage()
-                .persistent()
-                .get(&DataKey::TopPlayerAt(min_slot))
-                .unwrap();
-            env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-            env.storage().instance().set(&DataKey::MinSlot, &min_slot);
-        }
+        // Keep the min cache consistent after a (possibly first) insertion.
+        Self::recompute_min(env);
     }
 
     /// Reconciliation pass — runs only when corruption is detected (a cached
@@ -671,7 +665,8 @@ impl LeaderboardContract {
         // 3. Write the dense list back with fresh TTLs and correct reverse
         //    lookups, then drop whatever is left in the old tail slots.
         for slot in 0..n {
-            let entry = entries.get(slot).unwrap();
+            let mut entry = entries.get(slot).unwrap();
+            entry.seq = Self::next_seq(env);
             let key = DataKey::TopPlayerAt(slot);
             env.storage().persistent().set(&key, &entry);
             env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
@@ -696,6 +691,52 @@ impl LeaderboardContract {
         n
     }
 
+    /// Monotonic FIFO sequence counter — fed into `PlayerEntry::seq` so that,
+    /// when several players share the minimum score, the *oldest* (smallest
+    /// seq) is evicted first instead of whichever sits at the lowest slot.
+    fn next_seq(env: &Env) -> u64 {
+        let s: u64 = env.storage().instance().get(&DataKey::SeqCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::SeqCounter, &(s + 1));
+        s
+    }
+
+    fn recompute_min(env: &Env) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TopPlayerCount)
+            .unwrap_or(0);
+        if count == 0 {
+            env.storage().instance().set(&DataKey::MinPoints, &0_u64);
+            env.storage().instance().set(&DataKey::MinSlot, &0_u32);
+            return;
+        }
+        let mut min_slot: u32 = 0;
+        let mut min_points: u64 = u64::MAX;
+        let mut min_seq: u64 = u64::MAX;
+        let mut found = false;
+        for slot in 0..count {
+            if let Some(e) = env
+                .storage()
+                .persistent()
+                .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(slot))
+            {
+                // Among equal-min entries keep the *oldest* (smallest seq) so
+                // tie eviction is FIFO, not lowest-slot (issue #70).
+                if !found || e.points < min_points || (e.points == min_points && e.seq < min_seq) {
+                    min_points = e.points;
+                    min_slot = slot;
+                    min_seq = e.seq;
+                    found = true;
+                }
+            }
+        }
+        if found {
+            env.storage().instance().set(&DataKey::MinPoints, &min_points);
+            env.storage().instance().set(&DataKey::MinSlot, &min_slot);
+        }
+    }
+
     fn update_top_players(env: &Env, user: Address, new_points: u64) {
         // Fast path: the user is already in the list — in-place update backed
         // by a validated reverse lookup (issue #67).
@@ -707,22 +748,8 @@ impl LeaderboardContract {
 
             Self::bubble_up(env, &entry, slot);
 
-            // The weakest entry sits at the last slot — keep the min cache fresh.
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TopPlayerCount)
-                .unwrap_or(0);
-            if count > 0 {
-                let min_slot = count - 1;
-                let min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &min_slot);
-            }
+            // Keep the min cache consistent after an in-place update.
+            Self::recompute_min(env);
             return;
         }
 
@@ -755,7 +782,7 @@ impl LeaderboardContract {
         }
 
         match old_entry {
-            Some(old) if new_points > old.points => {
+            Some(old) if new_points >= old.points => {
                 // The newcomer displaces the weakest — clear the evicted
                 // player's reverse mapping so they cannot read a stale rank.
                 env.storage()
@@ -765,6 +792,7 @@ impl LeaderboardContract {
                 let new_entry = PlayerEntry {
                     address: user.clone(),
                     points: new_points,
+                    seq: Self::next_seq(env),
                 };
                 let key = DataKey::TopPlayerAt(min_slot);
                 env.storage().persistent().set(&key, &new_entry);
@@ -778,15 +806,9 @@ impl LeaderboardContract {
 
                 Self::bubble_up(env, &new_entry, min_slot);
 
-                // Recompute the min (weakest now sits at the last slot).
-                let new_min_slot = MAX_TOP_PLAYERS - 1;
-                let new_min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(new_min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &new_min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &new_min_slot);
+                // Recompute the min over the bounded list (handles ties —
+                // the weakest entry may now sit at any slot).
+                Self::recompute_min(env);
             }
             _ => {}
         }
@@ -827,12 +849,27 @@ impl LeaderboardContract {
     }
 
     fn mint_pulse(env: &Env, user: Address, amount: i128) {
-    // Issue #84: check pulse_token's reported ABI version before invoking
-    // mint(), so an incompatible token upgrade fails with a clear error
-    // instead of an opaque invoke_contract failure or, worse, a call that
-    // still type-checks against a changed signature and silently misbehaves.
-    // A matching version number alone does not prove the callee's shape is
-    // still compatible; see IncompatibleInterface's doc comment.
+        // Issue #84: check pulse_token's reported ABI version before invoking
+        // mint(), so an incompatible token upgrade fails with a clear error
+        // instead of an opaque invoke_contract failure or, worse, a call that
+        // still type-checks against a changed signature and silently misbehaves.
+        // A matching version number alone does not prove the callee's shape is
+        // still compatible; see IncompatibleInterface's doc comment.
+        let token: Address = match env.storage().instance().get(&DataKey::TokenContract) {
+            Some(t) => t,
+            None => return,
+        };
+        if Self::require_compatible_token(env, &token).is_err() {
+            return;
+        }
+        let this = env.current_contract_address();
+        let _: Val = env.invoke_contract(
+            &token,
+            &Symbol::new(env, "mint"),
+            vec![env, this.into_val(env), user.into_val(env), amount.into_val(env)],
+        );
+    }
+
     fn require_compatible_token(env: &Env, token: &Address) -> Result<(), LeaderboardError> {
         let version: u32 =
             env.invoke_contract(token, &Symbol::new(env, "interface_version"), vec![env]);

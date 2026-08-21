@@ -604,8 +604,13 @@ fn test_add_pts_emits_leaderboard_updated() {
     let (env, client, _admin, market, _referral) = setup();
     let user = Address::generate(&env);
     client.add_pts(&market, &user, &100_u64, &true);
-    let events = env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let name = Symbol::try_from_val(&env, &last.1.get_unchecked(0)).unwrap();
+    let all = env.events().all();
+    let evs = all.events();
+    let last = &evs[evs.len() - 1];
+    let topics = match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.topics,
+        _ => panic!("expected v0 contract event body"),
+    };
+    let name = Symbol::try_from_val(&env, &topics[0]).unwrap();
     assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }

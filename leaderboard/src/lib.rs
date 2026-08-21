@@ -41,6 +41,10 @@ pub enum DataKey {
     TopPlayerSlot(Address),
     MinPoints, // u64 — points of the weakest entry currently in the top list
     MinSlot,   // u32 — slot index of that weakest entry
+    // Pull-based reward queue (issue #86): reward side-effects are written
+    // here and claimed by the user in a separate transaction, decoupling
+    // critical fund paths from leaderboard sorting and token minting.
+    PendingReward(Address),
 }
 
 // OPT: PlayerEntry now embeds points directly (avoids a Stats read during sort)
@@ -62,7 +66,17 @@ pub struct PlayerStats {
     pub lost_bets: u32,
 }
 
-// Internal packed stats —
+// Pull-based pending reward. Fields accumulate so multiple rewards can be
+// collected in one later transaction without losing win/loss accounting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingReward {
+    pub points: u64,
+    pub tokens: i128,
+    pub won_delta: u32,
+    pub lost_delta: u32,
+    pub bet_delta: u32,
+}
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -103,6 +117,172 @@ impl LeaderboardContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::TokenContract, &token);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    /// Short alias retained for existing clients.
+    pub fn set_token(env: Env, admin: Address, token: Address) -> Result<(), LeaderboardError> {
+        Self::set_token_contract(env, admin, token)
+    }
+
+    // ── Pull-based reward flow (issue #86) ───────────────────────────────────
+    //
+    // These queue methods only write one bounded per-user storage record. They
+    // deliberately do not sort the top list or mint tokens. The expensive and
+    // optional side-effects happen later in claim_pending_rewards().
+
+    pub fn queue_reward(
+        env: Env,
+        caller: Address,
+        user: Address,
+        pts: u64,
+        tokens: i128,
+        is_won: bool,
+    ) -> Result<(), LeaderboardError> {
+        let market: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != market {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        caller.require_auth();
+        Self::accumulate_pending(&env, &user, pts, tokens, is_won, false);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    pub fn queue_bonus_reward(
+        env: Env,
+        caller: Address,
+        user: Address,
+        pts: u64,
+        tokens: i128,
+    ) -> Result<(), LeaderboardError> {
+        let referral: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferralContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != referral {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        caller.require_auth();
+        Self::accumulate_pending(&env, &user, pts, tokens, false, true);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    /// Apply all pending points and mint the accumulated tokens in a separate
+    /// transaction. Anyone may submit this; rewards always belong to `user`.
+    pub fn claim_pending_rewards(env: Env, user: Address) -> Result<(), LeaderboardError> {
+        let key = DataKey::PendingReward(user.clone());
+        let pending: PendingReward = match env.storage().persistent().get(&key) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        // Consume before interaction so the pending entry cannot be replayed.
+        env.storage().persistent().remove(&key);
+
+        let mut stats: PlayerStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or(PlayerStats {
+                points: 0,
+                total_bets: 0,
+                won_bets: 0,
+                lost_bets: 0,
+            });
+        stats.points += pending.points;
+        stats.total_bets += pending.bet_delta;
+        stats.won_bets += pending.won_delta;
+        stats.lost_bets += pending.lost_delta;
+        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
+        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+        Self::update_top_players(&env, user.clone(), stats.points);
+
+        if pending.tokens > 0 {
+            if let Some(token) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::TokenContract)
+            {
+                let this = env.current_contract_address();
+                let _: Val = env.invoke_contract(
+                    &token,
+                    &Symbol::new(&env, "mint"),
+                    vec![
+                        &env,
+                        this.into_val(&env),
+                        user.into_val(&env),
+                        pending.tokens.into_val(&env),
+                    ],
+                );
+            }
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    pub fn get_pending_reward(env: Env, user: Address) -> Option<PendingReward> {
+        env.storage().persistent().get(&DataKey::PendingReward(user))
+    }
+
+    // Immediate entry points remain available for ABI compatibility. Core
+    // market/referral flows use queue_reward/queue_bonus_reward instead.
+    pub fn reward(
+        env: Env,
+        caller: Address,
+        user: Address,
+        pts: u64,
+        tokens: i128,
+        is_won: bool,
+    ) -> Result<(), LeaderboardError> {
+        let market: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != market {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        caller.require_auth();
+        Self::apply_reward(&env, &user, pts, tokens, is_won, false);
+        Ok(())
+    }
+
+    pub fn reward_bonus(
+        env: Env,
+        caller: Address,
+        user: Address,
+        pts: u64,
+        tokens: i128,
+    ) -> Result<(), LeaderboardError> {
+        let referral: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferralContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != referral {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
+        caller.require_auth();
+        Self::apply_reward(&env, &user, pts, tokens, false, true);
+        Ok(())
+    }
+
+    /// Legacy no-op retained for clients that recorded bets separately.
+    pub fn record_bet(
+        env: Env,
+        _caller: Address,
+        _user: Address,
+    ) -> Result<(), LeaderboardError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(LeaderboardError::NotInitialized);
+        }
         Ok(())
     }
 
@@ -239,6 +419,19 @@ impl LeaderboardContract {
             .unwrap_or(0)
     }
 
+    pub fn get_player_count(env: Env) -> u32 {
+        Self::get_top_player_count(env)
+    }
+
+    /// Return the 1-based rank, or zero when the user is outside the top list.
+    pub fn get_rank(env: Env, user: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::TopPlayerSlot(user))
+            .map(|slot| slot + 1)
+            .unwrap_or(0)
+    }
+
     pub fn get_min_points(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -251,6 +444,94 @@ impl LeaderboardContract {
             .instance()
             .get(&DataKey::MinSlot)
             .unwrap_or(0)
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    fn apply_reward(
+        env: &Env,
+        user: &Address,
+        pts: u64,
+        tokens: i128,
+        is_won: bool,
+        is_bonus: bool,
+    ) {
+        let mut stats: PlayerStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or(PlayerStats {
+                points: 0,
+                total_bets: 0,
+                won_bets: 0,
+                lost_bets: 0,
+            });
+        stats.points += pts;
+        stats.total_bets += 1;
+        if !is_bonus {
+            if is_won {
+                stats.won_bets += 1;
+            } else {
+                stats.lost_bets += 1;
+            }
+        }
+        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
+        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+        Self::update_top_players(env, user.clone(), stats.points);
+
+        if tokens > 0 {
+            if let Some(token) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::TokenContract)
+            {
+                let this = env.current_contract_address();
+                let _: Val = env.invoke_contract(
+                    &token,
+                    &Symbol::new(env, "mint"),
+                    vec![
+                        env,
+                        this.into_val(env),
+                        user.clone().into_val(env),
+                        tokens.into_val(env),
+                    ],
+                );
+            }
+        }
+    }
+
+    fn accumulate_pending(
+        env: &Env,
+        user: &Address,
+        pts: u64,
+        tokens: i128,
+        is_won: bool,
+        is_bonus: bool,
+    ) {
+        let key = DataKey::PendingReward(user.clone());
+        let mut pending: PendingReward = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(PendingReward {
+                points: 0,
+                tokens: 0,
+                won_delta: 0,
+                lost_delta: 0,
+                bet_delta: 0,
+            });
+        pending.points += pts;
+        pending.tokens += tokens;
+        pending.bet_delta += 1;
+        if !is_bonus {
+            if is_won {
+                pending.won_delta += 1;
+            } else {
+                pending.lost_delta += 1;
+            }
+        }
+        env.storage().persistent().set(&key, &pending);
+        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
     }
 
     // ── Internal: maintain a persistent sorted top list ──────────────────────
@@ -404,5 +685,7 @@ impl LeaderboardContract {
     }
 }
 
+#[cfg(test)]
+mod tests;
 #[cfg(test)]
 mod ttl_tests;

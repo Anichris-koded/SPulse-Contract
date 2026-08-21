@@ -125,8 +125,16 @@ fn test_welcome_bonus() {
     t.client
         .register_referral(&user, &String::from_str(&t.env, "NewUser"), &no_ref);
 
-    // Leaderboard: 5 welcome points, no win/loss impact
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    // Registration only queues the welcome reward; it does not run the
+    // leaderboard's expensive sorting or token minting.
+    assert_eq!(lb_client.get_points(&user), 0);
+    let pending = lb_client.get_pending_reward(&user).unwrap();
+    assert_eq!(pending.points, 5);
+    assert_eq!(pending.tokens, 1_0000000);
+    lb_client.claim_pending_rewards(&user);
+
+    // After claiming: 5 welcome points, no win/loss impact.
     assert_eq!(lb_client.get_points(&user), 5);
     let stats = lb_client.get_stats(&user);
     assert_eq!(stats.won_bets, 0);
@@ -222,8 +230,11 @@ fn test_credit_with_referrer() {
     let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
     assert_eq!(xlm_client.balance(&referrer), referral_fee);
 
-    // Referrer got 3 leaderboard bonus points
+    // Referrer points are queued independently from the immediate XLM payout.
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    assert_eq!(lb_client.get_points(&referrer), 0);
+    assert_eq!(lb_client.get_pending_reward(&referrer).unwrap().points, 3);
+    lb_client.claim_pending_rewards(&referrer);
     assert_eq!(lb_client.get_points(&referrer), 3);
 
     // Earnings tracked
@@ -328,6 +339,9 @@ fn test_referrer_bonus_points_accumulate() {
     t.client.credit(&t.market, &user, &5_000_000_i128);
 
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    assert_eq!(lb_client.get_points(&referrer), 0);
+    assert_eq!(lb_client.get_pending_reward(&referrer).unwrap().points, 9);
+    lb_client.claim_pending_rewards(&referrer);
     assert_eq!(lb_client.get_points(&referrer), 9); // 3 × 3 pts
 }
 

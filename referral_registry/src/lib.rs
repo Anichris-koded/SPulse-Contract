@@ -152,9 +152,13 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
-        let _: Val = env.invoke_contract(
+        // Queue the welcome reward; leaderboard sorting and token minting are
+        // intentionally deferred to claim_pending_rewards().
+        // Queueing is best-effort: registration remains valid even when the
+        // optional reward infrastructure is unavailable or out of budget.
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
+            &Symbol::new(&env, "queue_bonus_reward"),
             vec![
                 &env,
                 this.into_val(&env),
@@ -193,14 +197,19 @@ impl ReferralRegistryContract {
                     .instance()
                     .get(&DataKey::LeaderboardContract)
                     .unwrap();
-                let _: Val = env.invoke_contract(
+                // Queue the points side-effect rather than sorting the
+                // leaderboard inside the fee distribution call.
+                // Queueing is best-effort: the referral fee and earnings
+                // remain critical, while leaderboard points are optional.
+                let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
                     &leaderboard,
-                    &Symbol::new(&env, "add_bonus_pts"),
+                    &Symbol::new(&env, "queue_bonus_reward"),
                     vec![
                         &env,
                         env.current_contract_address().into_val(&env),
                         ref_addr.clone().into_val(&env),
                         REFERRAL_BET_POINTS.into_val(&env),
+                        0_i128.into_val(&env),
                     ],
                 );
                 let earnings: i128 = env

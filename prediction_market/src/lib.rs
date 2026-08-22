@@ -1,6 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, token, vec, Address,
+    BytesN, Env, IntoVal, String, Symbol, Val, Vec,
     contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env, Executable,
     IntoVal, String, Symbol, Val, Vec,
 };
@@ -50,6 +52,12 @@ const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated f
 const CONFIG_DELAY_SECS: u64 = 86_400; // issue #51: dispute window before Config is live
 const MAX_GOVERNORS: u32 = 10;
 
+// Issue #93: config changes are staged and only take effect after this delay.
+// A compromised admin key can no longer redirect all fund flows instantly:
+// off-chain monitors get a window to detect the change (via the emitted
+// ConfigChangeStaged event) and the admin can cancel it before it lands.
+const CONFIG_CHANGE_DELAY_SECS: u64 = 86_400; // 24h timelock
+
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
@@ -82,6 +90,9 @@ pub enum MarketError {
     MarketCancelled = 8,
     MarketNotResolved = 9,
     BetTooSmall = 10,
+    // Retained for ABI stability — error codes must not shift on upgrade.
+    // No longer produced: users may now hold positions on both sides.
+    #[allow(dead_code)]
     OppositeSideBet = 11,
     AlreadyClaimed = 12,
     NoBetFound = 13,
@@ -97,6 +108,8 @@ pub enum MarketError {
     WithdrawalRequestExists = 23,
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
+    // Issue #95: operation blocked because the contract is paused.
+    Paused = 26,
     ContractPaused = 26,
     InvalidDuration = 27, // issue #10: duration below the minimum
     InvalidDependency = 28, // issue #51: address is not the expected executable kind
@@ -116,6 +129,13 @@ pub enum MarketError {
     /// changed return type) always increments INTERFACE_VERSION in the same
     /// commit. See EXPECTED_REFERRAL_INTERFACE_VERSION / EXPECTED_LEADERBOARD_INTERFACE_VERSION.
     IncompatibleInterface = 28,
+    /// execute_set_config / cancel_set_config called without a staged config
+    /// change (issue #93).
+    NoPendingConfig = 29,
+    /// A staged config change has not yet matured past
+    /// CONFIG_CHANGE_DELAY_SECS (issue #93).
+    ConfigChangeTooSoon = 30,
+    IncompatibleInterface = 36,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -125,15 +145,24 @@ pub enum DataKey {
     Admin,
     // Config addresses — all in instance storage (shared, cheap)
     Cfg, // single packed Config struct — 1 read instead of 5
+    PendingConfig, // staged, timelocked config change (issue #93)
     MarketCount,
     AccumulatedFees,
     Market(u64),
+    Bet(u64, Address), // two-sided net_yes/net_no + gross + count packed; see BetEntry
+    // Per-market ledger of the fees this market actually contributed to
+    // AccumulatedFees: platform fee for every bet, plus referral fee only
+    // when it was NOT paid out to a referrer. cancel_market reclaims this
+    // exact amount instead of reverse-engineering fees from the net pool
+    // (issue #87).
+    MarketAccumulatedFees(u64),
     Bet(u64, Address), // net + gross + count packed; see BetEntry
     BettorCount(u64),
     BettorAt(u64, u32),
     Resolver(Address),
     FeeRecipient(Address),
     HasReferrer(Address),
+    Paused,
     RateWindow, // packed u64: high32=window_start_hi, low32=count
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
@@ -161,6 +190,28 @@ pub struct Config {
     pub xlm_sac: Address,
 }
 
+// ── Staged config change with a maturation timestamp (issue #93) ────────────
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingConfig {
+    pub token: Address,
+    pub referral: Address,
+    pub leaderboard: Address,
+    pub xlm_sac: Address,
+    pub pending_at: u64,
+}
+
+// Issue #93: emitted when set_config stages a change, so off-chain indexers
+// can alert on suspicious address redirects before the timelock matures.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChangeStaged {
+    pub pending_at: u64,
+    pub token: Address,
+    pub referral: Address,
+    pub leaderboard: Address,
+    pub xlm_sac: Address,
+// ── BetEntry: two-sided position + Gross + BetCount in one slot ────────────
 /// WASM hashes (or the SAC sentinel) pinned for each Config role.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,9 +236,9 @@ pub struct PendingConfigChange {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BetEntry {
-    pub net: i128,   // post-fee amount bet (used for payout)
-    pub gross: i128, // pre-fee amount sent (used for cancel_refund)
-    pub is_yes: bool,
+    pub net_yes: i128, // post-fee net committed to YES (used for payout)
+    pub net_no: i128,  // post-fee net committed to NO (used for payout)
+    pub gross: i128,   // pre-fee total sent across both sides (used for cancel_refund)
     pub claimed: bool,
     pub count: u32, // how many times this user has bet on this market
 }
@@ -231,13 +282,25 @@ pub struct Market {
     pub bet_count: u32,
 }
 
-// Kept for ABI compatibility — frontend reads Bet fields
+// Kept for ABI compatibility — frontend reads Bet fields.
+// For a two-sided position, amount/is_yes report the dominant side.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bet {
     pub amount: i128,
     pub is_yes: bool,
     pub claimed: bool,
+}
+
+// Full two-sided position view — exposes both sides of a user's bet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Position {
+    pub net_yes: i128,
+    pub net_no: i128,
+    pub gross: i128,
+    pub claimed: bool,
+    pub count: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -318,6 +381,11 @@ impl PredictionMarketContract {
         Ok(())
     }
 
+    /// Stage a config change (token / referral / leaderboard / xlm_sac). Admin
+    /// only. The change does NOT take effect immediately: it must mature past
+    /// CONFIG_CHANGE_DELAY_SECS via execute_set_config, giving off-chain
+    /// monitors time to detect it (via the ConfigChangeStaged event) and the
+    /// admin time to cancel it with cancel_set_config (issue #93).
     /// Propose a Config change. Does **not** take effect immediately.
     ///
     /// Issue #51: live WASM hashes are read on-chain (not caller-supplied),
@@ -355,9 +423,52 @@ impl PredictionMarketContract {
                 xlm_sac,
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
+
+        let pending_at = env.ledger().timestamp();
+        let pending = PendingConfig {
+            token: token_contract,
+            referral: referral_contract,
+            leaderboard: leaderboard_contract,
+            xlm_sac,
+            pending_at,
+        };
+        env.storage().instance().set(&DataKey::PendingConfig, &pending);
+
+        ConfigChangeStaged {
+            pending_at,
+            token: pending.token.clone(),
+            referral: pending.referral.clone(),
+            leaderboard: pending.leaderboard.clone(),
+            xlm_sac: pending.xlm_sac.clone(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Apply a previously staged config change once its timelock has matured.
+    /// Admin only (issue #93).
+    pub fn execute_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+
+        let pending: PendingConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfig)
+            .ok_or(MarketError::NoPendingConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.pending_at || now - pending.pending_at < CONFIG_CHANGE_DELAY_SECS {
+            return Err(MarketError::ConfigChangeTooSoon);
+        }
+
         env.storage().instance().set(
             &DataKey::Cfg,
             &Config {
+                token: pending.token,
+                referral: pending.referral,
+                leaderboard: pending.leaderboard,
+                xlm_sac: pending.xlm_sac,
                 token: token_contract.clone(),
                 referral: referral_contract.clone(),
                 leaderboard: leaderboard_contract.clone(),
@@ -464,9 +575,24 @@ impl PredictionMarketContract {
             (Symbol::new(&env, "cfg_can"), caller),
             1_u32,
         );
+        env.storage().instance().remove(&DataKey::PendingConfig);
         Ok(())
     }
 
+    /// Cancel a staged config change before it matures. Admin only (issue #93).
+    pub fn cancel_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if !env.storage().instance().has(&DataKey::PendingConfig) {
+            return Err(MarketError::NoPendingConfig);
+        }
+        env.storage().instance().remove(&DataKey::PendingConfig);
+        Ok(())
+    }
+
+    /// Read the currently staged (not yet effective) config change, if any.
+    pub fn get_pending_config(env: Env) -> Option<PendingConfig> {
+        env.storage().instance().get(&DataKey::PendingConfig)
     pub fn add_governor(env: Env, admin: Address, governor: Address) -> Result<(), MarketError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
@@ -540,6 +666,40 @@ impl PredictionMarketContract {
     /// Read the current Config (for verification/admin tooling).
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
+    }
+
+    // ── Emergency circuit breaker (issue #95) ───────────────────────────────
+
+    /// Halt (or resume) all risk-creating, settlement and withdrawal
+    /// operations: place_bet, create_market, resolve_market, cancel_market,
+    /// withdraw_fees, request_withdraw_fees and execute_withdraw_fees are
+    /// blocked while paused. User recovery paths — claim() and
+    /// cancel_refund() — stay available on purpose, so an emergency pause
+    /// never locks user funds in the contract. Admin only; idempotent.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), MarketError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), MarketError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(MarketError::Paused);
+        }
+        Ok(())
     }
 
     pub fn get_pending_config(env: Env) -> Option<PendingConfigChange> {
@@ -766,7 +926,7 @@ impl PredictionMarketContract {
         let bet_key = DataKey::Bet(market_id, user.clone());
         let existing: Option<BetEntry> = env.storage().persistent().get(&bet_key);
 
-        // Spam guard + side check combined from single read
+        // Spam guard from single read (both sides share the bet counter)
         if let Some(ref e) = existing {
             if e.count >= MAX_BETS_PER_USER {
                 env.storage().persistent().remove(&lock_key);
@@ -803,18 +963,41 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
 
+        // ── Write BetEntry (two-sided net + gross + count in one write) ────
+        // ── Per-market fee ledger (issue #87) ──────────────────────────────
+        // Record exactly what this bet added to the accumulator for this
+        // market. Referral fees transferred to a referrer at bet time are
+        // excluded — they are already gone and must never be reclaimed.
+        let retained_fee = platform_fee + if paid_referrer { 0 } else { referral_fee };
+        let market_fee_key = DataKey::MarketAccumulatedFees(market_id);
+        let market_fees: i128 = env
+            .storage()
+            .persistent()
+            .get(&market_fee_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&market_fee_key, &(market_fees + retained_fee));
+        env.storage()
+            .persistent()
+            .extend_ttl(&market_fee_key, TTL_BUMP, TTL_HIGH);
+
         // ── Write BetEntry (net + gross + count in one write) ─────────────
         let new_entry = match existing {
             Some(mut e) => {
-                e.net += net;
+                if is_yes {
+                    e.net_yes += net;
+                } else {
+                    e.net_no += net;
+                }
                 e.gross += amount;
                 e.count += 1;
                 e
             }
             None => BetEntry {
-                net,
+                net_yes: if is_yes { net } else { 0 },
+                net_no: if is_yes { 0 } else { net },
                 gross: amount,
-                is_yes,
                 claimed: false,
                 count: 1,
             },
@@ -896,6 +1079,117 @@ impl PredictionMarketContract {
             (is_yes, amount, net),
         );
         Ok(())
+    }
+
+    // ── Position management (issue #98) ────────────────────────────────────
+
+    // Users may REDUCE — or fully CLOSE — an existing same-side position while
+    // the market is live, which is the accounting-consistent way to manage
+    // exposure: the payout model is one-entry-per-user (resolve_market computes
+    // per-winner payouts from the per-user single entry), so opening a hedge on
+    // the opposite side would break pool math by letting one user count toward
+    // both sides. Reduction keeps every invariant intact:
+    //   - market totals shrink by exactly the net portion being released;
+    //   - fees are released back only if they are still held by the contract
+    //     (platform always; referral only when it was never paid to a referrer);
+    //   - claim()/resolve payouts stay exact (Σ payouts + dust == pool).
+    // Comparable to cancel_refund, but scoped to a live market and a portion.
+    pub fn reduce_position(
+        env: Env,
+        user: Address,
+        market_id: u64,
+        amount: i128,
+    ) -> Result<i128, MarketError> {
+        user.require_auth();
+
+        if amount <= 0 {
+            return Err(MarketError::InvalidAmount);
+        }
+
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.cancelled {
+            return Err(MarketError::MarketCancelled);
+        }
+        if market.resolved {
+            return Err(MarketError::MarketResolved);
+        }
+        if env.ledger().timestamp() >= market.end_time {
+            return Err(MarketError::MarketExpired);
+        }
+
+        let bet_key = DataKey::Bet(market_id, user.clone());
+        let mut entry: BetEntry = env
+            .storage()
+            .persistent()
+            .get(&bet_key)
+            .ok_or(MarketError::NoBetFound)?;
+        if entry.gross < amount {
+            return Err(MarketError::InvalidAmount);
+        }
+
+        // Decompose exactly like place_bet so partial reductions stay integral.
+        let net_part = amount * NET_NUMERATOR / BPS_DENOM;
+        let plat_part = amount * PLATFORM_FEE_BPS / BPS_DENOM;
+        let ref_part = amount * TOTAL_FEE_BPS / BPS_DENOM - plat_part;
+
+        // Referral fee is refundable only when the contract still holds it: it
+        // was kept in AccumulatedFees iff the user had no referrer (HasReferrer
+        // cache == Some(false)); otherwise it already left to the referrer.
+        let ref_held: bool = !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::HasReferrer(user.clone()))
+            .unwrap_or(false);
+        let held_fees = plat_part + if ref_held { ref_part } else { 0 };
+        let refund = net_part + held_fees;
+
+        // ── State FIRST, external call last ───────────────────────────────
+        entry.net -= net_part;
+        entry.gross -= amount;
+
+        // Accumulated fees shrink by the fees being released; never below 0
+        // (same clamp discipline as cancel_market / withdraw_fees).
+        let mut acc_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        acc_fees = acc_fees.saturating_sub(held_fees);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &acc_fees);
+
+        if entry.is_yes {
+            market.total_yes -= net_part;
+        } else {
+            market.total_no -= net_part;
+        }
+
+        let fully_closed = entry.gross == 0;
+        if fully_closed {
+            // A fully-reduced position is removed entirely: no payout entry is
+            // created for it at resolution, and claim() reports NoBetFound
+            // (no free PULSE/points for an empty position).
+            env.storage().persistent().remove(&bet_key);
+        } else {
+            env.storage().persistent().set(&bet_key, &entry);
+            env.storage()
+                .persistent()
+                .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
+        }
+        let mkt_key = DataKey::Market(market_id);
+        env.storage().persistent().set(&mkt_key, &market);
+        env.storage()
+            .persistent()
+            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
+        token::Client::new(&env, &cfg.xlm_sac).transfer(
+            &env.current_contract_address(),
+            &user,
+            &refund,
+        );
+        Ok(refund)
     }
 
     // ── Resolution ────────────────────────────────────────────────────────
@@ -1024,22 +1318,34 @@ impl PredictionMarketContract {
         env.storage().persistent().set(&mkt_key, &market);
         let _ = Self::refresh_market_keys(&env, market_id);
 
-        // Reclaim fees — net * fee_rate / (1 - fee_rate)
-        let net_pool = market.total_yes + market.total_no;
-        let fees_in_pool = net_pool * TOTAL_FEE_BPS / (BPS_DENOM - TOTAL_FEE_BPS);
+        // Reclaim the fees this market actually contributed to the
+        // accumulator (issue #87). Referral fees already transferred to
+        // referrers at bet time are not in the accumulator, so we read the
+        // per-market ledger rather than reverse-engineering a fee from the
+        // net pool — the old net_pool * 200 bps / (10000 - 200) formula
+        // reclaimed referral fees that were never held, silently eating the
+        // platform fees of other (unrelated) markets.
+        let market_fee_key = DataKey::MarketAccumulatedFees(market_id);
+        let reclaim: i128 = env
+            .storage()
+            .persistent()
+            .get(&market_fee_key)
+            .unwrap_or(0);
         let mut acc_fees: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        acc_fees = if fees_in_pool < acc_fees {
-            acc_fees - fees_in_pool
+        acc_fees = if reclaim < acc_fees {
+            acc_fees - reclaim
         } else {
             0
         };
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
+        // The market is cancelled and refunded in full — drop its fee ledger.
+        env.storage().persistent().remove(&market_fee_key);
 
         env.events().publish(
             (Symbol::new(&env, "market_cancelled"), admin, market_id),
@@ -1051,7 +1357,7 @@ impl PredictionMarketContract {
     pub fn cancel_refund(env: Env, user: Address, market_id: u64) -> Result<i128, MarketError> {
         user.require_auth();
 
-        let market = Self::load_market(&env, market_id)?;
+        let mut market = Self::load_market(&env, market_id)?;
         if !market.cancelled {
             return Err(MarketError::MarketNotCancelled);
         }
@@ -1069,9 +1375,24 @@ impl PredictionMarketContract {
         }
 
         let gross = entry.gross;
+        let net = entry.net;
+        // Issue #58: zero both gross (idempotency guard) and net so that
+        // get_bet no longer reports a staked amount after the refund.
         entry.gross = 0;
         entry.net = 0;
         env.storage().persistent().set(&bet_key, &entry);
+
+        // Issue #58: decrement market totals so total_yes/total_no reflect
+        // that this bet has been refunded. BetEntry already carries is_yes
+        // and net, so no storage-model change is required.
+        let mkt_key = DataKey::Market(market_id);
+        if entry.is_yes {
+            market.total_yes = market.total_yes.saturating_sub(net);
+        } else {
+            market.total_no = market.total_no.saturating_sub(net);
+        }
+        env.storage().persistent().set(&mkt_key, &market);
+
         // Read-time TTL refresh (issue #9): a refund must not be able to observe
         // an expired bet/market record — keep both alive so a user who returns
         // late to a cancelled market can still pull their refund.
@@ -1080,7 +1401,7 @@ impl PredictionMarketContract {
             .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
+            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         token::Client::new(&env, &cfg.xlm_sac).transfer(
@@ -1123,6 +1444,14 @@ impl PredictionMarketContract {
         }
 
         let is_winner = entry.is_yes == market.outcome;
+        // Winning payout is driven by the net committed to the winning side
+        // only; the losing side's net stays in the pool for all winners.
+        let winning_net = if market.outcome {
+            entry.net_yes
+        } else {
+            entry.net_no
+        };
+        let is_winner = winning_net > 0;
         let total_pool = market.total_yes + market.total_no;
         let winning_side = if market.outcome {
             market.total_yes
@@ -1171,19 +1500,41 @@ impl PredictionMarketContract {
             (LOSE_POINTS, LOSE_TOKENS)
         };
 
-        Self::require_compatible_leaderboard(&env, &cfg.leaderboard)?;
+        // The leaderboard API was renamed reward() -> add_pts() (points only,
+        // no token amount), and add_pts no longer mints PULSE internally. The
+        // market mints the PULSE reward directly — it is the authorized minter
+        // for this legacy wiring, keeping the original mint semantics intact.
         let _: Val = env.invoke_contract(
             &cfg.leaderboard,
-            &Symbol::new(&env, "reward"),
+            &Symbol::new(&env, "add_pts"),
+        // Queue reward accounting as an optional side effect. A missing,
+        // paused, incompatible, or out-of-budget leaderboard must not roll
+        // back the already-completed claim and XLM payout.
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            &cfg.leaderboard,
+            &Symbol::new(&env, "queue_reward"),
             vec![
                 &env,
                 this.clone().into_val(&env),
                 user.clone().into_val(&env),
                 points.into_val(&env),
-                tokens.into_val(&env),
                 real_win.into_val(&env),
             ],
         );
+        if tokens > 0 {
+            // PULSE is a custom token contract (not a token::Client-compatible
+            // SAC interface): mint directly via its exported `mint` ABI.
+            let _: Val = env.invoke_contract(
+                &cfg.token,
+                &Symbol::new(&env, "mint"),
+                vec![
+                    &env,
+                    this.clone().into_val(&env),
+                    user.clone().into_val(&env),
+                    tokens.into_val(&env),
+                ],
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "claim_processed"), user, market_id),
@@ -1302,6 +1653,12 @@ impl PredictionMarketContract {
             .get(&key)
             .ok_or(MarketError::NoWithdrawalRequest)?;
 
+        // Re-validate at payout time: the caller's fee-recipient role and the
+        // destination can both be revoked/changed during the timelock, so a
+        // compromised recipient removed mid-window must not be able to collect.
+        Self::require_admin_or_fee_recipient(&env, &caller)?;
+        Self::require_valid_fee_recipient(&env, &caller, &req.recipient)?;
+
         let now = env.ledger().timestamp();
         if now < req.requested_at || now - req.requested_at < WITHDRAW_DELAY_SECS {
             return Err(MarketError::WithdrawalTooSoon);
@@ -1373,9 +1730,25 @@ impl PredictionMarketContract {
             .get(&DataKey::Bet(market_id, user))
             .ok_or(MarketError::NoBetFound)?;
         Ok(Bet {
-            amount: e.net,
-            is_yes: e.is_yes,
+            amount: e.net_yes.max(e.net_no),
+            is_yes: e.net_yes >= e.net_no,
             claimed: e.claimed,
+        })
+    }
+
+    // Full two-sided position view (0 on an untouched side)
+    pub fn get_position(env: Env, market_id: u64, user: Address) -> Result<Position, MarketError> {
+        let e: BetEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bet(market_id, user))
+            .ok_or(MarketError::NoBetFound)?;
+        Ok(Position {
+            net_yes: e.net_yes,
+            net_no: e.net_no,
+            gross: e.gross,
+            claimed: e.claimed,
+            count: e.count,
         })
     }
 

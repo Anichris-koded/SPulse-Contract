@@ -24,12 +24,11 @@ pub const INTERFACE_VERSION: u32 = 1;
 // misbehaving (issue #84).
 const EXPECTED_LEADERBOARD_INTERFACE_VERSION: u32 = 1;
 
-// Storage TTL lifecycle (mirrors the leaderboard's read/write bump strategy):
-// referrer counters are kept alive for at least TTL_BUMP ledgers on every
-// read/write so active referrers' history does not silently expire (issue #73).
-// A full storage-rental/keeper approach is tracked separately (issue #9).
-const TTL_BUMP: u32 = 3_153_600;
-const TTL_HIGH: u32 = 6_307_200;
+/// Maximum allowed depth of the referral chain. A new registration whose
+/// referrer already sits at depth MAX_REFERRAL_DEPTH (i.e. has MAX_REFERRAL_DEPTH
+/// ancestors) is rejected. This bounds both gas usage during the on-chain
+/// traversal and sybil-amplification attack surface.
+const MAX_REFERRAL_DEPTH: u32 = 5;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -41,6 +40,10 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    // Issue #95: operation blocked by the contract being paused.
+    Paused = 7,
+    // Issue #99: the address given as `referrer` has never registered.
+    ReferrerNotRegistered = 7,
     ContractPaused = 7,
     ReferrerNotRegistered = 8,
     /// leaderboard reported an interface_version this contract wasn't built
@@ -71,6 +74,9 @@ pub enum DataKey {
     // updated in place — kept as separate keys (not part of the registrant pack).
     ReferralCount(Address),
     ReferralEarnings(Address),
+    // Fees that cannot be paid out (no referrer, or referrer at cap) — held
+    // here and withdrawable by admin (issues #76/#77).
+    SurplusFees,
     TokenContract,
     LeaderboardContract,
     XlmSacContract,
@@ -168,6 +174,32 @@ impl ReferralRegistryContract {
         Ok(())
     }
 
+    /// Issue #95 circuit breaker: halt registration and credit disbursements
+    /// during an emergency. Admin only; idempotent. Read/view paths stay open.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), ReferralError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ReferralError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(ReferralError::Paused);
+        }
+        Ok(())
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -190,10 +222,16 @@ impl ReferralRegistryContract {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
             }
+            // Issue #99: a referral relationship may only point at a registered
+            // participant. Without this, anyone could name an arbitrary
+            // (attacker-controlled) address as their referrer and have it
+            // receive referral fees and accrue ReferralCount/ReferralEarnings
+            // without ever registering.
             if !Self::is_registered(env.clone(), ref_addr.clone()) {
                 return Err(ReferralError::ReferrerNotRegistered);
             }
         }
+
         // Lever A: write ONE packed Profile entry (display_name + referrer)
         // instead of the three legacy keys (Registered + DisplayName + Referrer).
         // Existence of Profile(user) is what is_registered() now checks.
@@ -204,9 +242,6 @@ impl ReferralRegistryContract {
                 referrer: referrer.clone(),
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Profile(user), TTL_BUMP, TTL_HIGH);
         env.storage().persistent().extend_ttl(
             &DataKey::Profile(user.clone()),
             TTL_BUMP,
@@ -225,10 +260,6 @@ impl ReferralRegistryContract {
                 .set(&count_key, &(count + 1));
             env.storage()
                 .persistent()
-                .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::ReferralCount(ref_addr), TTL_BUMP, TTL_HIGH);
                 .extend_ttl(&count_key, TTL_BUMP, TTL_HIGH);
         }
 
@@ -238,15 +269,47 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
-        Self::require_compatible_leaderboard(&env, &leaderboard)?;
+        // The leaderboard API renamed reward_bonus -> add_bonus_pts (which
+        // enforces caller == ReferralContract and no longer takes a token
+        // amount); keep the welcome-bonus points call in sync. The 1 PULSE
+        // welcome bonus is minted directly here — the registry is the
+        // authorized minter for this wiring.
         let _: Val = env.invoke_contract(
             &leaderboard,
             &Symbol::new(&env, "add_bonus_pts"),
             vec![
                 &env,
+                this.clone().into_val(&env),
+            vec![
+                &env,
+                this.clone().into_val(&env),
+        // Queue the welcome reward as an optional side effect. Registration
+        // remains successful if the leaderboard is paused, unavailable, or
+        // exceeds the remaining invocation budget.
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            &leaderboard,
+            &Symbol::new(&env, "queue_bonus_reward"),
+            vec![
+                &env,
                 this.into_val(&env),
                 user.clone().into_val(&env),
                 WELCOME_BONUS_POINTS.into_val(&env),
+            ],
+        );
+        let token_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenContract)
+            .unwrap();
+        // PULSE is a custom token contract; mint via its exported `mint` ABI.
+        let _: Val = env.invoke_contract(
+            &token_contract,
+            &Symbol::new(&env, "mint"),
+            vec![
+                &env,
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
+                WELCOME_BONUS_TOKENS.into_val(&env),
             ],
         );
         env.events().publish(
@@ -269,6 +332,28 @@ impl ReferralRegistryContract {
         let referrer: Option<Address> = Self::load_profile(&env, &user).and_then(|p| p.referrer);
         match referrer {
             Some(ref_addr) => {
+                // Issue #99 defense-in-depth: even if a referral relationship
+                // exists in storage (e.g. written by pre-validation legacy code
+                // or malformed state), never pay out to — or accrue counters
+                // for — an address that is not a registered participant.
+                // The fee is refunded to the caller and we report "no referral",
+                // so the market keeps it in AccumulatedFees.
+                if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                    if referral_fee > 0 {
+                        let xlm_sac: Address = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::XlmSacContract)
+                            .unwrap();
+                        token::Client::new(&env, &xlm_sac).transfer(
+                            &env.current_contract_address(),
+                            &caller,
+                            &referral_fee,
+                        );
+                    }
+                    return Ok(false);
+                }
+
                 let xlm_sac: Address = env
                     .storage()
                     .instance()
@@ -284,15 +369,17 @@ impl ReferralRegistryContract {
                     .instance()
                     .get(&DataKey::LeaderboardContract)
                     .unwrap();
-                Self::require_compatible_leaderboard(&env, &leaderboard)?;
-                let _: Val = env.invoke_contract(
+                // Queue points as an optional side effect. The XLM transfer
+                // and earnings update remain critical referral accounting.
+                let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
                     &leaderboard,
-                    &Symbol::new(&env, "add_bonus_pts"),
+                    &Symbol::new(&env, "queue_bonus_reward"),
                     vec![
                         &env,
                         env.current_contract_address().into_val(&env),
                         ref_addr.clone().into_val(&env),
                         REFERRAL_BET_POINTS.into_val(&env),
+                        0_i128.into_val(&env),
                     ],
                 );
                 let earnings: i128 = env
@@ -300,21 +387,13 @@ impl ReferralRegistryContract {
                     .persistent()
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
-                let earn_key = DataKey::ReferralEarnings(ref_addr);
+                let earn_key = DataKey::ReferralEarnings(ref_addr.clone());
                 env.storage()
                     .persistent()
                     .set(&earn_key, &(earnings + referral_fee));
                 env.storage()
                     .persistent()
                     .extend_ttl(&earn_key, TTL_BUMP, TTL_HIGH);
-                env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr.clone()),
-                    &(earnings + referral_fee),
-                );
-                env.storage().persistent().extend_ttl(
-                    &DataKey::ReferralEarnings(ref_addr),
-                    TTL_BUMP,
-                    TTL_HIGH,
                 env.events().publish(
                     (Symbol::new(&env, "referral_credited"), user, ref_addr),
                     referral_fee,
@@ -322,17 +401,11 @@ impl ReferralRegistryContract {
                 Ok(true)
             }
             None => {
+                // Issue #76: keep the fee locally instead of round-tripping
+                // it back to the caller — the market never escrowed it, so
+                // refunding looks like a payment and is exploitable.
                 if referral_fee > 0 {
-                    let xlm_sac: Address = env
-                        .storage()
-                        .instance()
-                        .get(&DataKey::XlmSacContract)
-                        .unwrap();
-                    token::Client::new(&env, &xlm_sac).transfer(
-                        &env.current_contract_address(),
-                        &caller,
-                        &referral_fee,
-                    );
+                    Self::add_surplus(&env, referral_fee);
                 }
                 env.events().publish(
                     (Symbol::new(&env, "referral_missed"), user),
@@ -341,6 +414,63 @@ impl ReferralRegistryContract {
                 Ok(false)
             }
         }
+    }
+
+    fn add_surplus(env: &Env, amount: i128) {
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SurplusFees, &(current + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SurplusFees, TTL_BUMP, TTL_HIGH);
+    }
+
+    pub fn withdraw_surplus_fees(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+    ) -> Result<i128, ReferralError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap();
+        if admin != stored_admin {
+            return Err(ReferralError::NotAdmin);
+        }
+        admin.require_auth();
+        let amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0);
+        if amount <= 0 {
+            return Ok(0);
+        }
+        let xlm_sac: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::XlmSacContract)
+            .unwrap();
+        token::Client::new(&env, &xlm_sac).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+        env.storage().persistent().set(&DataKey::SurplusFees, &0);
+        Ok(amount)
+    }
+
+    pub fn get_surplus_fees(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SurplusFees)
+            .unwrap_or(0)
     }
 
     fn load_profile(env: &Env, user: &Address) -> Option<UserProfile> {

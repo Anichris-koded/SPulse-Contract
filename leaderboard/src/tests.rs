@@ -289,13 +289,10 @@ fn test_low_scorer_rejected_when_full() {
 
     // Weak user has stats/points recorded, but is NOT in the top list.
     assert_eq!(client.get_points(&weak), 5);
-<<<<<<< HEAD
     assert_eq!(client.get_rank(&weak), None);
     assert_eq!(client.get_player_count(), 50);
-=======
     assert_eq!(client.get_rank(&weak), 0);
     assert_eq!(client.get_top_player_count(), 50);
->>>>>>> origin/main
 }
 
 #[test]
@@ -321,9 +318,7 @@ fn test_bottom_player_rising_updates_min() {
     // rather than staying stale at 100.
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &105_u64, &true);
-<<<<<<< HEAD
     assert_eq!(client.get_rank(&newcomer), None);
-=======
     assert_eq!(client.get_rank(&newcomer), 0);
     assert_eq!(client.get_top_player_count(), 50);
 }
@@ -348,7 +343,6 @@ fn test_equal_min_newcomer_displaces_min_when_full() {
         client.add_pts(&market, &user, &(100 + i), &true);
     }
     let min_player = min_player.unwrap();
->>>>>>> origin/main
     assert_eq!(client.get_player_count(), 50);
     assert_eq!(client.get_points(&min_player), 100);
 
@@ -514,11 +508,126 @@ fn test_reward_updates_points_and_winloss() {
     assert_eq!(s.total_bets, 2);
 }
 
-// ── Issue #67: TopPlayerSlot reverse-lookup consistency ───────────────────────
-//
-// The forward index (TopPlayerAt) and the reverse index (TopPlayerSlot) must
-// never disagree: an orphaned reverse lookup must not panic on update, must
-// not resurrect a player who left the list, and must not return a stale rank.
+// ── Issue #22: TopPlayerSlot ↔ TopPlayerAt integrity ─────────────────────────
+
+#[test]
+fn test_get_rank_cleans_stale_reverse_lookup() {
+    // TTL expiry deletes TopPlayerAt with no hook to clear TopPlayerSlot.
+    // get_rank must not trust the orphaned reverse key.
+    let (env, client, _admin, market, _referral) = setup();
+    let alice = Address::generate(&env);
+    client.add_pts(&market, &alice, &100_u64, &true);
+    assert_eq!(client.get_rank(&alice), 1);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::TopPlayerAt(0));
+    });
+
+    assert_eq!(client.get_rank(&alice), 0);
+    env.as_contract(&client.address, || {
+        let slot: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TopPlayerSlot(alice.clone()));
+        assert!(slot.is_none());
+    });
+}
+
+#[test]
+fn test_reconcile_compacts_ttl_holes_and_restores_slots() {
+    let (env, client, _admin, market, _referral) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let charlie = Address::generate(&env);
+    client.add_pts(&market, &alice, &50_u64, &true);
+    client.add_pts(&market, &bob, &100_u64, &true);
+    client.add_pts(&market, &charlie, &75_u64, &true);
+    assert_eq!(client.get_player_count(), 3);
+
+    // Expire the middle forward entry (charlie at slot 1 after sort: bob, charlie, alice).
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::TopPlayerAt(1));
+    });
+
+    client.reconcile_top_slots();
+
+    assert_eq!(client.get_player_count(), 2);
+    let top = client.get_top_players(&0_u32, &20_u32);
+    assert_eq!(top.len(), 2);
+    assert_eq!(top.get(0).unwrap().address, bob);
+    assert_eq!(top.get(1).unwrap().address, alice);
+    assert_eq!(client.get_rank(&bob), 1);
+    assert_eq!(client.get_rank(&alice), 2);
+    assert_eq!(client.get_rank(&charlie), 0);
+}
+
+#[test]
+fn test_upsert_repairs_stale_slot_instead_of_panicking() {
+    // In-place path used to unwrap TopPlayerAt; a TTL hole must re-insert.
+    let (env, client, _admin, market, _referral) = setup();
+    let alice = Address::generate(&env);
+    client.add_pts(&market, &alice, &100_u64, &true);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::TopPlayerAt(0));
+    });
+
+    client.add_pts(&market, &alice, &25_u64, &true);
+    assert_eq!(client.get_points(&alice), 125);
+    assert_eq!(client.get_rank(&alice), 1);
+    assert_eq!(client.get_player_count(), 1);
+}
+
+#[test]
+fn test_missing_reverse_lookup_does_not_duplicate_player() {
+    // TopPlayerSlot TTL expiry must not append a second TopPlayerAt for the same user.
+    let (env, client, _admin, market, _referral) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_pts(&market, &alice, &80_u64, &true);
+    client.add_pts(&market, &bob, &40_u64, &true);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TopPlayerSlot(alice.clone()));
+    });
+
+    client.add_pts(&market, &alice, &10_u64, &true);
+    assert_eq!(client.get_player_count(), 2);
+    assert_eq!(client.get_rank(&alice), 1);
+    let top = client.get_top_players(&0_u32, &20_u32);
+    assert_eq!(top.len(), 2);
+    assert_eq!(top.get(0).unwrap().address, alice);
+    assert_eq!(top.get(1).unwrap().address, bob);
+}
+
+#[test]
+fn test_eviction_clears_reverse_lookup() {
+    let (env, client, _admin, market, _referral) = setup();
+    let lowest = Address::generate(&env);
+    client.add_pts(&market, &lowest, &100_u64, &true);
+    for i in 1u64..50 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &(100 + i), &true);
+    }
+    assert_eq!(client.get_rank(&lowest), 50);
+
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &500_u64, &true);
+
+    assert_eq!(client.get_rank(&lowest), 0);
+    assert_eq!(client.get_rank(&newcomer), 1);
+    env.as_contract(&client.address, || {
+        let slot: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TopPlayerSlot(lowest.clone()));
+        assert!(slot.is_none());
+    });
+}
+
+// ── Issue #67: extra reverse-lookup cases kept from main ──────────────────────
 
 #[test]
 fn test_rank_is_none_for_user_not_in_list() {
@@ -538,18 +647,15 @@ fn test_stale_slot_self_heals_after_entry_expired() {
     client.add_pts(&market, &user, &100_u64, &true);
     assert_eq!(client.get_rank(&user), Some(1));
 
-    // Expire only the forward entry — the reverse mapping stays behind.
     env.as_contract(&client.address, || {
         env.storage().persistent().remove(&DataKey::TopPlayerAt(0));
     });
 
-    // The next update must not panic and must not treat the stale lookup as
-    // the player being in the list.
     client.add_pts(&market, &user, &50_u64, &true);
     assert_eq!(client.get_points(&user), 150);
+    assert_eq!(client.get_rank(&user), 1);
     assert_eq!(client.get_rank(&user), Some(1)); // re-entered the list
 
-    // Exactly one entry for the user after re-insertion — no duplicate.
     let top = client.get_top_players(&0_u32, &20_u32);
     let matches = top.iter().filter(|e| e.address == user).count();
     assert_eq!(matches, 1);
@@ -565,14 +671,13 @@ fn test_eviction_repairs_expired_min_entry() {
     for i in 0u64..50 {
         let user = Address::generate(&env);
         if i == 0 {
-            weakest = Some(user.clone()); // 100 pts — the weakest of the set
+            weakest = Some(user.clone());
         }
         client.add_pts(&market, &user, &(100 + i), &true);
     }
     assert_eq!(client.get_player_count(), 50);
     let weakest = weakest.unwrap();
 
-    // Expire the current minimum (100 pts, slot 49) — the cache is now stale.
     env.as_contract(&client.address, || {
         env.storage().persistent().remove(&DataKey::TopPlayerAt(49));
     });
@@ -580,11 +685,12 @@ fn test_eviction_repairs_expired_min_entry() {
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
 
-    // The list was reconciled: newcomer entered as #1, board is full again.
     assert_eq!(client.get_player_count(), 50);
     let top = client.get_top_players(&0_u32, &20_u32);
     assert_eq!(top.get(0).unwrap().address, newcomer);
     assert_eq!(top.get(0).unwrap().points, 500);
+    assert_eq!(client.get_rank(&newcomer), 1);
+    assert_eq!(client.get_rank(&weakest), 0);
     assert_eq!(client.get_rank(&newcomer), Some(1));
     // The expired player (100) is gone; even though their orphaned
     // TopPlayerSlot survives, get_rank must not report a stale rank.
@@ -631,13 +737,10 @@ fn test_stale_min_rejected_before_eviction() {
         let user = Address::generate(&env);
         client.add_pts(&market, &user, &(100 + i), &true);
     }
-    // Expire the minimum (100 pts) and leave the MinPoints cache stale at 100.
     env.as_contract(&client.address, || {
         env.storage().persistent().remove(&DataKey::TopPlayerAt(49));
     });
 
-    // 50 < stale min (100): a naive cache check would wrongly reject this
-    // newcomer — the repaired list has room, so they must enter.
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &50_u64, &true);
     assert_eq!(client.get_rank(&newcomer), Some(50));

@@ -38,6 +38,8 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    // Issue #99: the address given as `referrer` has never registered.
+    ReferrerNotRegistered = 7,
     ContractPaused = 7,
     ReferrerNotRegistered = 8,
     /// leaderboard reported an interface_version this contract wasn't built
@@ -187,6 +189,11 @@ impl ReferralRegistryContract {
             if *ref_addr == user {
                 return Err(ReferralError::SelfReferral);
             }
+            // Issue #99: a referral relationship may only point at a registered
+            // participant. Without this, anyone could name an arbitrary
+            // (attacker-controlled) address as their referrer and have it
+            // receive referral fees and accrue ReferralCount/ReferralEarnings
+            // without ever registering.
             if !Self::is_registered(env.clone(), ref_addr.clone()) {
                 return Err(ReferralError::ReferrerNotRegistered);
             }
@@ -289,6 +296,28 @@ impl ReferralRegistryContract {
         let referrer: Option<Address> = Self::load_profile(&env, &user).and_then(|p| p.referrer);
         match referrer {
             Some(ref_addr) => {
+                // Issue #99 defense-in-depth: even if a referral relationship
+                // exists in storage (e.g. written by pre-validation legacy code
+                // or malformed state), never pay out to — or accrue counters
+                // for — an address that is not a registered participant.
+                // The fee is refunded to the caller and we report "no referral",
+                // so the market keeps it in AccumulatedFees.
+                if !Self::is_registered(env.clone(), ref_addr.clone()) {
+                    if referral_fee > 0 {
+                        let xlm_sac: Address = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::XlmSacContract)
+                            .unwrap();
+                        token::Client::new(&env, &xlm_sac).transfer(
+                            &env.current_contract_address(),
+                            &caller,
+                            &referral_fee,
+                        );
+                    }
+                    return Ok(false);
+                }
+
                 let xlm_sac: Address = env
                     .storage()
                     .instance()

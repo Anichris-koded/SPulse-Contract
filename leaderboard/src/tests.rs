@@ -476,7 +476,7 @@ fn test_fifo_evicts_consecutive_oldest_ties_across_slot_reuse() {
     assert_eq!(client.get_rank(&e), 49);
 }
 
-// ── Lever G: reward() / reward_bonus() ────────────────────────────────────────
+// ── Lever G: reward() / add_bonus_pts() ───────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]

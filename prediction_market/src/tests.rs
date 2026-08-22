@@ -924,6 +924,52 @@ fn test_cancel_refund_double_claim_rejected() {
     t.client.cancel_refund(&user, &id); // should fail: NoBetFound (gross zeroed)
 }
 
+// ── Issue #58: cancel_refund zeroes net and decrements market totals ─────────
+
+#[test]
+fn test_cancel_refund_clears_net_and_market_totals() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+
+    // Alice bets YES 100 XLM → net = 100 * 9800/10000 = 98 XLM
+    // Bob   bets NO  50 XLM  → net = 50  * 9800/10000 = 49 XLM
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &50_0000000_i128);
+
+    let market_before = t.client.get_market(&id);
+    assert_eq!(market_before.total_yes, 98_0000000);
+    assert_eq!(market_before.total_no, 49_0000000);
+
+    // Confirm get_bet reports staked net before cancel
+    let alice_bet_before = t.client.get_bet(&id, &alice);
+    assert_eq!(alice_bet_before.amount, 98_0000000);
+
+    // Cancel the market then refund both bettors
+    t.client.cancel_market(&t.admin, &id);
+    t.client.cancel_refund(&alice, &id);
+    t.client.cancel_refund(&bob, &id);
+
+    // Issue #58 fix: get_bet must return amount == 0 after refund
+    let alice_bet_after = t.client.get_bet(&id, &alice);
+    assert_eq!(alice_bet_after.amount, 0, "net should be zeroed after cancel_refund");
+
+    let bob_bet_after = t.client.get_bet(&id, &bob);
+    assert_eq!(bob_bet_after.amount, 0, "net should be zeroed after cancel_refund");
+
+    // Issue #58 fix: market totals must be decremented to 0 after all refunds
+    let market_after = t.client.get_market(&id);
+    assert_eq!(market_after.total_yes, 0, "total_yes should be 0 after alice's refund");
+    assert_eq!(market_after.total_no, 0, "total_no should be 0 after bob's refund");
+
+    // Gross is still zeroed (idempotency guard unchanged)
+    assert_eq!(t.client.get_bet_gross(&id, &alice), 0);
+    assert_eq!(t.client.get_bet_gross(&id, &bob), 0);
+}
+
 // ── 19. cancel_refund on non-cancelled market rejected ────────────────────────
 
 #[test]

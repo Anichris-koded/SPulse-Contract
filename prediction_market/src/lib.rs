@@ -1257,7 +1257,7 @@ impl PredictionMarketContract {
     pub fn cancel_refund(env: Env, user: Address, market_id: u64) -> Result<i128, MarketError> {
         user.require_auth();
 
-        let market = Self::load_market(&env, market_id)?;
+        let mut market = Self::load_market(&env, market_id)?;
         if !market.cancelled {
             return Err(MarketError::MarketNotCancelled);
         }
@@ -1275,9 +1275,24 @@ impl PredictionMarketContract {
         }
 
         let gross = entry.gross;
+        let net = entry.net;
+        // Issue #58: zero both gross (idempotency guard) and net so that
+        // get_bet no longer reports a staked amount after the refund.
         entry.gross = 0;
         entry.net = 0;
         env.storage().persistent().set(&bet_key, &entry);
+
+        // Issue #58: decrement market totals so total_yes/total_no reflect
+        // that this bet has been refunded. BetEntry already carries is_yes
+        // and net, so no storage-model change is required.
+        let mkt_key = DataKey::Market(market_id);
+        if entry.is_yes {
+            market.total_yes = market.total_yes.saturating_sub(net);
+        } else {
+            market.total_no = market.total_no.saturating_sub(net);
+        }
+        env.storage().persistent().set(&mkt_key, &market);
+
         // Read-time TTL refresh (issue #9): a refund must not be able to observe
         // an expired bet/market record — keep both alive so a user who returns
         // late to a cancelled market can still pull their refund.
@@ -1286,7 +1301,7 @@ impl PredictionMarketContract {
             .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
+            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         token::Client::new(&env, &cfg.xlm_sac).transfer(

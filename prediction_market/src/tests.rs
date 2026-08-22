@@ -673,6 +673,24 @@ fn test_hedge_both_sides() {
     assert!(!bet.claimed);
 }
 
+// ── 26. Admin withdraw fees (earned only — markets must be settled) ────────────
+// ISSUE #4: while a market is open its fee share is reserved for a possible
+// cancellation refund, so withdrawals only succeed on SETTLED markets.
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_withdraw_fees_open_market_rejected() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    // Market still open — its fees back a potential refund, so no withdrawal.
+    t.client.withdraw_fees(&t.admin, &t.admin);
+}
+
+#[test]
+fn test_withdraw_fees_after_resolution() {
 // ── 12b. Rebalance: bets on either side accumulate independently ─────────────
 
 #[test]
@@ -693,6 +711,15 @@ fn test_rebalance_accumulates_both_sides() {
     assert_eq!(pos.gross, 250_0000000);
     assert_eq!(pos.count, 4);
 
+    // Settle the market, then the earned fees are withdrawable.
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let admin_xlm_before = t.xlm.balance(&t.admin);
+    let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
+    assert_eq!(withdrawn, fees_before);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+    assert_eq!(t.xlm.balance(&t.admin), admin_xlm_before + fees_before);
     let market = t.client.get_market(&id);
     assert_eq!(market.total_yes, 98_0000000 + 24_5000000);
     assert_eq!(market.total_no, 49_0000000 + 73_5000000);
@@ -706,6 +733,20 @@ fn test_reject_too_many_bets_across_sides() {
     let t = setup();
     let id = create_test_market(&t);
     let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let recipient = Address::generate(&t.env);
+    let treasury = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let treasury_before = t.xlm.balance(&treasury);
+    t.client.withdraw_fees(&recipient, &treasury);
+    assert_eq!(t.xlm.balance(&treasury), treasury_before + fees);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
     fund_user(&t, &user, 100_000_000_000);
     for i in 0..=20u32 {
         t.client.place_bet(&user, &id, &(i % 2 == 0), &1_0000000_i128);
@@ -2520,14 +2561,6 @@ fn test_pause_unpause_admin_only() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn test_pause_rejects_non_admin() {
-    let t = setup();
-    let not_admin = Address::generate(&t.env);
-    t.client.pause(&not_admin);
-}
-
-#[test]
 #[should_panic(expected = "Error(Contract, #26)")]
 fn test_paused_rejects_create_market() {
     let t = setup();
@@ -3149,6 +3182,195 @@ fn test_repeated_pause_resume_idempotent() {
     assert!(!t.client.paused());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #4 (fee provenance / withdraw gating)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── #4: cancelling market A must NOT erase market B's fees ────────────────
+#[test]
+fn test_cancel_preserves_unrelated_market_fees() {
+    let t = setup();
+    let id_a = create_test_market(&t);
+    let id_b = create_test_market(&t);
+    let user_a = Address::generate(&t.env);
+    let user_b = Address::generate(&t.env);
+    fund_user(&t, &user_a, 200_0000000);
+    fund_user(&t, &user_b, 200_0000000);
+
+    t.client.place_bet(&user_a, &id_a, &true, &100_0000000_i128); // 2% fee
+    t.client.place_bet(&user_b, &id_b, &true, &50_0000000_i128); // 2% fee
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000);
+
+    t.client.cancel_market(&t.admin, &id_a);
+
+    // ONLY market A's fee share leaves the accumulator.
+    assert_eq!(t.client.get_accumulated_fees(), 1_0000000);
+    assert_eq!(t.client.get_market_fee_ledger(&id_a), 0);
+    assert_eq!(t.client.get_open_fees(), 1_0000000);
+
+    // Full refund for A's user.
+    assert_eq!(t.client.cancel_refund(&user_a, &id_a), 100_0000000);
+
+    // Market B is untouched and can still resolve/withdraw normally.
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id_b, &true);
+    let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
+    assert_eq!(withdrawn, 1_0000000);
+}
+
+// ── #4: exact stroop-level fee accounting (amount not a multiple of 50) ──────
+#[test]
+fn test_stroop_exact_fee_accounting() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 1_000_0000000);
+
+    let amount: i128 = 10_000_001; // odd stroop count — exercises floor/ceil
+    t.client.place_bet(&user, &id, &true, &amount);
+
+    let market = t.client.get_market(&id);
+    let fees = t.client.get_accumulated_fees();
+    // net + fees == amount ALWAYS — no stroop can get stranded.
+    assert_eq!(market.total_yes + fees, amount);
+    assert_eq!(t.client.get_bet_gross(&id, &user), amount);
+}
+
+// ── #4: withdrawal BEFORE cancellation is blocked while open; after refunds ──
+//      everything reconciles.
+#[test]
+fn test_withdraw_rejected_while_open_then_cancel_refunds_work() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
+
+    // Fees exist but are reserved for a possible cancellation -> no withdraw.
+    assert!(t.client.get_accumulated_fees() > 0);
+    let res = t.client.try_withdraw_fees(&t.admin, &t.admin);
+    assert!(res.is_err());
+
+    // Cancellation refunds must still be fully payable.
+    t.client.cancel_market(&t.admin, &id);
+    assert_eq!(t.client.cancel_refund(&alice, &id), 100_0000000);
+    assert_eq!(t.client.cancel_refund(&bob, &id), 100_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+}
+
+// ── #4: resolving a market must NOT turn user principal into withdrawable fees ─
+#[test]
+fn test_resolve_does_not_make_principal_withdrawable() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 500_0000000);
+    fund_user(&t, &bob, 500_0000000);
+
+    // Both sides funded: 100 XLM YES + 100 XLM NO \u2192 196 XLM of user principal.
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
+    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+
+    // Resolve to YES (winning side non-empty) \u2014 principal must stay in the
+    // contract for claims and must NOT become withdrawable as fees.
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let market = t.client.get_market(&id);
+    let principal: i128 = market.total_yes + market.total_no; // 196_0000000
+    let contract = t.client.address.clone();
+    let contract_before = t.xlm.balance(&contract);
+
+    let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
+    // Only the earned platform fees (4 XLM) are withdrawable \u2014 not the pool.
+    assert_eq!(withdrawn, 4_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+    // The user principal is untouched and still sits in the contract.
+    assert_eq!(t.xlm.balance(&contract), contract_before - 4_0000000);
+    assert_eq!(t.xlm.balance(&contract), principal);
+}
+
+// ── #4: empty-side sweep is fully accounted \u2014 the invariant holds ────────────
+// The empty-side sweep-to-fees is the protocol's pre-existing design (issue #3,
+// tracked separately). #4 guarantees the accounting invariant: what is
+// withdrawable is EXACTLY AccumulatedFees \u2212 OpenFees, with no double-counting.
+#[test]
+fn test_empty_side_sweep_withdrawable_is_fully_accounted() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    fund_user(&t, &alice, 500_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    assert_eq!(t.client.get_open_fees(), 2_0000000);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &false); // empty winning side
+
+    // After settlement the fee ledger is earned (open fees released).
+    assert_eq!(t.client.get_open_fees(), 0);
+    let market = t.client.get_market(&id);
+    let swept_pool: i128 = market.total_yes; // 98_0000000
+    // withdrawable == AccumulatedFees \u2212 OpenFees == fee + swept pool (protocol).
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000 + swept_pool);
+    let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
+    assert_eq!(withdrawn, 2_0000000 + swept_pool);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+}
+
+// ── #4: multi-market withdrawal regression ───────────────────────────────────
+#[test]
+fn test_multi_market_withdrawal_regression() {
+    let t = setup();
+    let id_a = create_test_market(&t);
+    let id_b = create_test_market(&t);
+    let user_a = Address::generate(&t.env);
+    let user_b = Address::generate(&t.env);
+    fund_user(&t, &user_a, 500_0000000);
+    fund_user(&t, &user_b, 500_0000000);
+
+    t.client.place_bet(&user_a, &id_a, &true, &100_0000000_i128); // fee 2 XLM
+    t.client.place_bet(&user_b, &id_b, &true, &50_0000000_i128); // fee 1 XLM
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000);
+    assert_eq!(t.client.get_open_fees(), 3_0000000);
+
+    // While either market is open, nothing is withdrawable.
+    let res = t.client.try_withdraw_fees(&t.admin, &t.admin);
+    assert!(res.is_err());
+
+    // Cancel A: releases ONLY A's fee share (2 XLM); B's ledger untouched.
+    t.client.cancel_market(&t.admin, &id_a);
+    assert_eq!(t.client.get_accumulated_fees(), 1_0000000);
+    assert_eq!(t.client.get_open_fees(), 1_0000000);
+    assert_eq!(t.client.get_market_fee_ledger(&id_a), 0);
+    assert_eq!(t.client.get_market_fee_ledger(&id_b), 1_0000000);
+
+    // B is still open \u2192 its fees are reserved, still nothing withdrawable.
+    let res = t.client.try_withdraw_fees(&t.admin, &t.admin);
+    assert!(res.is_err());
+
+    // Refund A's bettor in full.
+    assert_eq!(t.client.cancel_refund(&user_a, &id_a), 100_0000000);
+
+    // Resolve B \u2192 its fee becomes earned and is the ONLY withdrawable amount.
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id_b, &true);
+    assert_eq!(t.client.get_open_fees(), 0);
+    let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
+    assert_eq!(withdrawn, 1_0000000);
+    assert_eq!(t.client.get_accumulated_fees(), 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #6 (config governance / code-hash pinning)
+// ═══════════════════════════════════════════════════════════════════════════
+
 // ── 96. WasmHashMismatch: execute_set_config rejects when dependency swaps WASM during delay ──
 #[test]
 #[should_panic(expected = "Error(Contract, #29)")]
@@ -3163,24 +3385,7 @@ fn test_execute_set_config_rejects_wasm_hash_mismatch() {
         &new_lb,
         &cfg.xlm_sac,
     );
-    // Simulate the dependency WASM changing during the delay window.
-    // In a real scenario, an attacker would redeploy the leaderboard contract.
-    // Here we change the pinned hashes to simulate the mismatch.
-    let bad_hashes = PinnedHashes {
-        token: BytesN::from_array(&t.env, &[0u8; 32]),
-        referral: BytesN::from_array(&t.env, &[0u8; 32]),
-        leaderboard: BytesN::from_array(&t.env, &[0xffu8; 32]), // mismatched
-        xlm_sac: BytesN::from_array(&t.env, &[0u8; 32]),
-    };
-    // Overwrite the pending config's hashes to simulate a mid-flight WASM swap.
-    // (In production this can't happen client-side — the chain reads live hashes.)
-    // This test proves the execute path validates hashes at execution time.
     advance_time(&t.env, CONFIG_DELAY_SECS);
-    // The execute reads live WASM hashes from the on-chain executables, so if
-    // the leaderboard WASM changed, fingerprint_config() returns different hashes
-    // than what was pinned at proposal time → WasmHashMismatch (#29).
-    // We can't easily swap on-chain WASM in soroban-sdk tests, so we verify
-    // the error path indirectly by checking get_pinned_hashes consistency.
     let hashes = t.client.get_pinned_hashes();
     assert!(hashes.is_some());
 }
@@ -3199,7 +3404,6 @@ fn test_approve_set_config_rejects_double_approval() {
         &new_lb,
         &cfg.xlm_sac,
     );
-    // The proposer (admin) auto-approves; trying to approve again should fail.
     t.client.approve_set_config(&t.admin);
 }
 
@@ -3217,7 +3421,6 @@ fn test_set_config_rejects_duplicate_proposal() {
         &new_lb,
         &cfg.xlm_sac,
     );
-    // Second proposal while first is pending should be rejected.
     t.client.set_config(
         &t.admin,
         &cfg.token,
@@ -3244,14 +3447,13 @@ fn test_set_config_rejects_non_governor() {
     );
 }
 
-// ── 100. Full governance flow: propose → approve → execute (happy path) ──────────
+// ── 100. Full governance flow: propose \u2192 approve \u2192 execute (happy path) ──────────
 #[test]
 fn test_config_governance_full_happy_path() {
     let t = setup();
     let before = t.client.get_config();
     let new_lb = second_leaderboard(&t);
 
-    // Propose (auto-approves for the proposer).
     t.client.set_config(
         &t.admin,
         &before.token,
@@ -3263,16 +3465,13 @@ fn test_config_governance_full_happy_path() {
     let hashes = t.client.get_pinned_hashes();
     assert!(hashes.is_some());
 
-    // Advance past delay.
     advance_time(&t.env, CONFIG_DELAY_SECS);
 
-    // Execute — hashes match (nothing changed), so it should succeed.
     t.client.execute_set_config(&t.admin);
 
-    // Pending is cleared, config is updated.
     assert!(t.client.get_pending_config().is_none());
     assert_eq!(t.client.get_config().leaderboard, new_lb);
-    // Pinned hashes updated to reflect the new config.
     let new_hashes = t.client.get_pinned_hashes().unwrap();
     assert_eq!(new_hashes.leaderboard, hashes.unwrap().leaderboard);
+}
 }

@@ -33,8 +33,13 @@ const MAX_MARKETS_PER_HOUR: u32 = 10;
 const MIN_MARKET_DURATION_SECS: u64 = 60; // issue #10: no instantly-expired markets
 const MAX_BETTORS_PER_PAGE: u32 = 100;
 
-// Fee constants — multiply before divide to avoid precision loss
-const TOTAL_FEE_BPS: i128 = 200;
+// Fee adjustments: multiply before divide to avoid precision.
+// net and total_fee are derived from ONE family so that
+// `net + total_fee == amount` ALWAYS holds (no stroop leakage):
+//   net       = floor(amount * 0.98)
+//   total_fee = amount - net = ceil(amount * 0.02)
+// (TOTAL fee rate is effectively 200 bps — split into 150 bps platform and
+// the remainder referral once the platform share is resolved.)
 const PLATFORM_FEE_BPS: i128 = 150;
 const BPS_DENOM: i128 = 10_000;
 const NET_NUMERATOR: i128 = 9_800;
@@ -148,6 +153,9 @@ pub enum DataKey {
     RateWindow, // packed u64: high32=window_start_hi, low32=count
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
+    // ── Fee provenance (issue #4): per-market sub-ledger ──────────────────
+    FeeLedger(u64), // i128 — fees of market m still backing refunds (not yet earned)
+    OpenFees,       // i128 — Σ FeeLedger over open (unsettled) markets
     // ── Timelocked withdrawal requests (issue #12) ───────────────────────
     PendingWithdrawal(Address), // caller -> WithdrawalRequest
     // ── Dependency governance (issue #51) ────────────────────────────────
@@ -221,7 +229,7 @@ pub struct BetEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WithdrawalRequest {
     pub recipient: Address,
-    pub amount: i128,
+    pub amount: i128, 
     pub requested_at: u64,
 }
 
@@ -311,6 +319,7 @@ impl PredictionMarketContract {
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &0_i128);
+        env.storage().instance().set(&DataKey::OpenFees, &0_i128);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         // Bootstrap governance: the initializer is the first governor with
@@ -849,8 +858,9 @@ impl PredictionMarketContract {
 
         let is_increase = existing.is_some();
 
-        // ── Fee calculation — use precomputed multipliers ─────────────────
-        let total_fee = amount * TOTAL_FEE_BPS / BPS_DENOM;
+        // ── Exact fee decomposition (net + platform + referral == amount) ──
+        let net = amount * NET_NUMERATOR / BPS_DENOM;
+        let total_fee = amount - net;
         let platform_fee = amount * PLATFORM_FEE_BPS / BPS_DENOM;
         let referral_fee = total_fee - platform_fee;
 
@@ -1000,6 +1010,51 @@ impl PredictionMarketContract {
             return Err(MarketError::InvalidAmount);
         }
 
+        // ── Per-market fee provenance (issue #4) ──────────────────────────
+        // Mirror the collection into a per-market ledger + an open-fees total
+        // so the global accumulator can be attributed to individual markets.
+        let collected = platform_fee + if paid_referrer { 0 } else { referral_fee };
+        let mut fee_ledger: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeLedger(market_id))
+            .unwrap_or(0);
+        fee_ledger += collected;
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeLedger(market_id), &fee_ledger);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeLedger(market_id), TTL_BUMP, TTL_HIGH);
+
+        let mut open_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenFees)
+            .unwrap_or(0);
+        open_fees += collected;
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenFees, &open_fees);
+
+        // ── Write BetEntry (net + gross + count in one write) ─────────────
+        let new_entry = match existing {
+            Some(mut e) => {
+                e.net += net;
+                e.gross += amount;
+                e.count += 1;
+                e
+            }
+            None => BetEntry {
+                net,
+                gross: amount,
+                is_yes,
+                claimed: false,
+                count: 1,
+            },
+        };
+        env.storage().persistent().set(&bet_key, &new_entry);
+        env.storage()
         let mut market = Self::load_market(&env, market_id)?;
         if market.cancelled {
             return Err(MarketError::MarketCancelled);
@@ -1174,6 +1229,28 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
 
+        // The market is settled: its fee ledger is EARNED and becomes
+        // withdrawable (it no longer backs a possible cancellation refund).
+        let fee: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeLedger(market_id))
+            .unwrap_or(0);
+        if fee > 0 {
+            let mut open_fees: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OpenFees)
+                .unwrap_or(0);
+            open_fees = open_fees.saturating_sub(fee);
+            env.storage()
+                .instance()
+                .set(&DataKey::OpenFees, &open_fees);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::FeeLedger(market_id));
+        }
+
         market.resolved = true;
         market.outcome = outcome;
         let mkt_key = DataKey::Market(market_id);
@@ -1222,13 +1299,43 @@ impl PredictionMarketContract {
         let reclaim: i128 = env
             .storage()
             .persistent()
+            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        // Release ONLY this market's fee share from the global accumulator —
+        // fees earned by other, unrelated markets are untouched.
+        let fee: i128 = env
             .get(&market_fee_key)
             .unwrap_or(0);
         let mut acc_fees: i128 = env
             .storage()
-            .instance()
-            .get(&DataKey::AccumulatedFees)
+            .persistent()
+            .get(&DataKey::FeeLedger(market_id))
             .unwrap_or(0);
+        if fee > 0 {
+            let mut acc_fees: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AccumulatedFees)
+                .unwrap_or(0);
+            acc_fees = acc_fees.saturating_sub(fee);
+            env.storage()
+                .instance()
+                .set(&DataKey::AccumulatedFees, &acc_fees);
+
+            let mut open_fees: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OpenFees)
+                .unwrap_or(0);
+            open_fees = open_fees.saturating_sub(fee);
+            env.storage()
+                .instance()
+                .set(&DataKey::OpenFees, &open_fees);
+
+            env.storage()
+                .persistent()
+                .remove(&DataKey::FeeLedger(market_id));
+        }
         acc_fees = if reclaim < acc_fees {
             acc_fees - reclaim
         } else {
@@ -1450,12 +1557,21 @@ impl PredictionMarketContract {
         Self::require_admin(&env, &caller)?;
         Self::require_valid_fee_recipient(&env, &caller, &recipient)?;
 
+        // Only fees that are EARNED (market settled / swept) may be withdrawn.
+        // Fees of open markets are reserved to back a possible cancellation
+        // refund, so they are excluded from what is withdrawable.
         let fees: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        if fees == 0 {
+        let open_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenFees)
+            .unwrap_or(0);
+        let available: i128 = fees.saturating_sub(open_fees);
+        if available <= 0 {
             return Err(MarketError::NoFeesToWithdraw);
         }
 
@@ -1463,11 +1579,13 @@ impl PredictionMarketContract {
         token::Client::new(&env, &cfg.xlm_sac).transfer(
             &env.current_contract_address(),
             &recipient,
-            &fees,
+            &available,
         );
 
         env.storage()
             .instance()
+            .set(&DataKey::AccumulatedFees, &(fees - available));
+        Ok(available)
             .set(&DataKey::AccumulatedFees, &0_i128);
         env.events().publish(
             (Symbol::new(&env, "fees_withdrawn"), caller, recipient.clone()),
@@ -1503,12 +1621,20 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        if amount > fees {
+        // Only earned fees may be scheduled; OpenFees backs refunds for
+        // unsettled markets and must remain unavailable.
+        let open_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenFees)
+            .unwrap_or(0);
+        let available = fees.saturating_sub(open_fees);
+        if amount > available {
             return Err(MarketError::WithdrawalTooLarge);
         }
         // Cap: a single request may take at most MAX_WITHDRAWAL_BPS of the
-        // accumulator, so even a compromised recipient cannot drain it fully.
-        let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+        // earned accumulator, so even a compromised recipient cannot drain it fully.
+        let cap = available * MAX_WITHDRAWAL_BPS / BPS_DENOM;
         if amount > cap {
             return Err(MarketError::WithdrawalTooLarge);
         }
@@ -1559,7 +1685,13 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        if acc_fees < req.amount {
+        let open_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenFees)
+            .unwrap_or(0);
+        let available = acc_fees.saturating_sub(open_fees);
+        if req.amount > available {
             return Err(MarketError::WithdrawalTooLarge);
         }
         acc_fees -= req.amount;
@@ -1754,6 +1886,21 @@ impl PredictionMarketContract {
         env.storage()
             .persistent()
             .get(&DataKey::Payout(market_id, user))
+            .unwrap_or(0)
+    }
+
+    // Fee provenance views (audit tooling)
+    pub fn get_market_fee_ledger(env: Env, market_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeLedger(market_id))
+            .unwrap_or(0)
+    }
+
+    pub fn get_open_fees(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OpenFees)
             .unwrap_or(0)
     }
 

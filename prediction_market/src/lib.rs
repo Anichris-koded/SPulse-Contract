@@ -110,7 +110,6 @@ pub enum MarketError {
     WithdrawalTooSoon = 25,
     // Issue #95: operation blocked because the contract is paused.
     Paused = 26,
-    ContractPaused = 26,
     InvalidDuration = 27, // issue #10: duration below the minimum
     InvalidDependency = 28, // issue #51: address is not the expected executable kind
     WasmHashMismatch = 29,  // issue #51: live WASM hash != pinned / pending hash
@@ -122,19 +121,6 @@ pub enum MarketError {
     InvalidThreshold = 35,
     /// A dependency (referral_registry or leaderboard) reported an
     /// interface_version this contract wasn't built against (issue #84).
-    /// Note: a matching version number alone does not prove the callee's
-    /// actual function shape still matches, it only proves the callee's
-    /// author intended it to. The guarantee only holds if every breaking
-    /// ABI change (renamed function, changed argument order/count/type,
-    /// changed return type) always increments INTERFACE_VERSION in the same
-    /// commit. See EXPECTED_REFERRAL_INTERFACE_VERSION / EXPECTED_LEADERBOARD_INTERFACE_VERSION.
-    IncompatibleInterface = 28,
-    /// execute_set_config / cancel_set_config called without a staged config
-    /// change (issue #93).
-    NoPendingConfig = 29,
-    /// A staged config change has not yet matured past
-    /// CONFIG_CHANGE_DELAY_SECS (issue #93).
-    ConfigChangeTooSoon = 30,
     IncompatibleInterface = 36,
 }
 
@@ -145,24 +131,20 @@ pub enum DataKey {
     Admin,
     // Config addresses — all in instance storage (shared, cheap)
     Cfg, // single packed Config struct — 1 read instead of 5
-    PendingConfig, // staged, timelocked config change (issue #93)
     MarketCount,
     AccumulatedFees,
     Market(u64),
-    Bet(u64, Address), // two-sided net_yes/net_no + gross + count packed; see BetEntry
     // Per-market ledger of the fees this market actually contributed to
     // AccumulatedFees: platform fee for every bet, plus referral fee only
     // when it was NOT paid out to a referrer. cancel_market reclaims this
     // exact amount instead of reverse-engineering fees from the net pool
     // (issue #87).
     MarketAccumulatedFees(u64),
-    Bet(u64, Address), // net + gross + count packed; see BetEntry
+    Bet(u64, Address), // two-sided net_yes/net_no + gross + count packed; see BetEntry
     BettorCount(u64),
     BettorAt(u64, u32),
     Resolver(Address),
     FeeRecipient(Address),
-    HasReferrer(Address),
-    Paused,
     RateWindow, // packed u64: high32=window_start_hi, low32=count
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
@@ -190,17 +172,6 @@ pub struct Config {
     pub xlm_sac: Address,
 }
 
-// ── Staged config change with a maturation timestamp (issue #93) ────────────
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingConfig {
-    pub token: Address,
-    pub referral: Address,
-    pub leaderboard: Address,
-    pub xlm_sac: Address,
-    pub pending_at: u64,
-}
-
 // Issue #93: emitted when set_config stages a change, so off-chain indexers
 // can alert on suspicious address redirects before the timelock matures.
 #[contractevent]
@@ -211,6 +182,8 @@ pub struct ConfigChangeStaged {
     pub referral: Address,
     pub leaderboard: Address,
     pub xlm_sac: Address,
+}
+
 // ── BetEntry: two-sided position + Gross + BetCount in one slot ────────────
 /// WASM hashes (or the SAC sentinel) pinned for each Config role.
 #[contracttype]
@@ -388,8 +361,8 @@ impl PredictionMarketContract {
     /// admin time to cancel it with cancel_set_config (issue #93).
     /// Propose a Config change. Does **not** take effect immediately.
     ///
-    /// Issue #51: live WASM hashes are read on-chain (not caller-supplied),
-    /// the proposal is emitted for monitors, and it only becomes active after
+    /// Live WASM hashes are read on-chain (not caller-supplied), the
+    /// proposal is emitted for monitors, and it only becomes active after
     /// `CONFIG_DELAY_SECS` **and** `GovernorThreshold` approvals via
     /// `execute_set_config`. Any governor can `cancel_set_config` in between.
     pub fn set_config(
@@ -421,70 +394,22 @@ impl PredictionMarketContract {
                 referral: referral_contract,
                 leaderboard: leaderboard_contract,
                 xlm_sac,
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-
-        let pending_at = env.ledger().timestamp();
-        let pending = PendingConfig {
-            token: token_contract,
-            referral: referral_contract,
-            leaderboard: leaderboard_contract,
-            xlm_sac,
-            pending_at,
-        };
-        env.storage().instance().set(&DataKey::PendingConfig, &pending);
-
-        ConfigChangeStaged {
-            pending_at,
-            token: pending.token.clone(),
-            referral: pending.referral.clone(),
-            leaderboard: pending.leaderboard.clone(),
-            xlm_sac: pending.xlm_sac.clone(),
-        }
-        .publish(&env);
-        Ok(())
-    }
-
-    /// Apply a previously staged config change once its timelock has matured.
-    /// Admin only (issue #93).
-    pub fn execute_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-
-        let pending: PendingConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingConfig)
-            .ok_or(MarketError::NoPendingConfig)?;
-
-        let now = env.ledger().timestamp();
-        if now < pending.pending_at || now - pending.pending_at < CONFIG_CHANGE_DELAY_SECS {
-            return Err(MarketError::ConfigChangeTooSoon);
-        }
-
-        env.storage().instance().set(
-            &DataKey::Cfg,
-            &Config {
-                token: pending.token,
-                referral: pending.referral,
-                leaderboard: pending.leaderboard,
-                xlm_sac: pending.xlm_sac,
-                token: token_contract.clone(),
-                referral: referral_contract.clone(),
-                leaderboard: leaderboard_contract.clone(),
-                xlm_sac: xlm_sac.clone(),
             },
             hashes,
             requested_at: env.ledger().timestamp(),
             approvers,
         };
+        let staged = ConfigChangeStaged {
+            pending_at: pending.requested_at,
+            token: pending.cfg.token.clone(),
+            referral: pending.cfg.referral.clone(),
+            leaderboard: pending.cfg.leaderboard.clone(),
+            xlm_sac: pending.cfg.xlm_sac.clone(),
+        };
         env.storage()
             .instance()
             .set(&DataKey::PendingConfig, &pending);
-        env.events().publish(
-            (Symbol::new(&env, "cfg_req"), caller),
-            pending,
-        );
+        staged.publish(&env);
         Ok(())
     }
 
@@ -536,6 +461,8 @@ impl PredictionMarketContract {
             return Err(MarketError::InsufficientApprovals);
         }
 
+        // Re-read live WASM hashes so a dependency cannot swap bytecode
+        // during the delay window.
         let live = Self::fingerprint_config(
             &env,
             &pending.cfg.token,
@@ -556,10 +483,6 @@ impl PredictionMarketContract {
             (Symbol::new(&env, "cfg_act"), caller),
             pending.cfg,
         );
-        env.events().publish(
-            (Symbol::new(&env, "config_changed"), admin),
-            (token_contract, referral_contract, leaderboard_contract, xlm_sac),
-        );
         Ok(())
     }
 
@@ -575,24 +498,14 @@ impl PredictionMarketContract {
             (Symbol::new(&env, "cfg_can"), caller),
             1_u32,
         );
-        env.storage().instance().remove(&DataKey::PendingConfig);
-        Ok(())
-    }
-
-    /// Cancel a staged config change before it matures. Admin only (issue #93).
-    pub fn cancel_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-        if !env.storage().instance().has(&DataKey::PendingConfig) {
-            return Err(MarketError::NoPendingConfig);
-        }
-        env.storage().instance().remove(&DataKey::PendingConfig);
         Ok(())
     }
 
     /// Read the currently staged (not yet effective) config change, if any.
-    pub fn get_pending_config(env: Env) -> Option<PendingConfig> {
+    pub fn get_pending_config(env: Env) -> Option<PendingConfigChange> {
         env.storage().instance().get(&DataKey::PendingConfig)
+    }
+
     pub fn add_governor(env: Env, admin: Address, governor: Address) -> Result<(), MarketError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
@@ -700,10 +613,6 @@ impl PredictionMarketContract {
             return Err(MarketError::Paused);
         }
         Ok(())
-    }
-
-    pub fn get_pending_config(env: Env) -> Option<PendingConfigChange> {
-        env.storage().instance().get(&DataKey::PendingConfig)
     }
 
     pub fn get_pinned_hashes(env: Env) -> Option<PinnedHashes> {
@@ -1036,10 +945,6 @@ impl PredictionMarketContract {
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
 
-        // ── HasReferrer cache write ───────────────────────────────────────
-        let hr_key = DataKey::HasReferrer(user.clone());
-        let cached: Option<bool> = env.storage().persistent().get(&hr_key);
-
         // ── External calls (issue 89: after ALL state writes) ─────────────
 
         // ── XLM transfer user → this contract ────────────────────────────
@@ -1047,30 +952,19 @@ impl PredictionMarketContract {
         let this = env.current_contract_address();
         xlm.transfer(&user, &this, &amount);
 
-        // ── Referral (skip if cached no-referrer) ─────────────────────────
-        let paid_referrer = if cached == Some(false) {
-            false
-        } else {
-            Self::require_compatible_referral(&env, &cfg.referral)?;
-            xlm.transfer(&this, &cfg.referral, &referral_fee);
-            let result: bool = env.invoke_contract(
-                &cfg.referral,
-                &Symbol::new(&env, "credit"),
-                vec![
-                    &env,
-                    this.clone().into_val(&env),
-                    user.clone().into_val(&env),
-                    referral_fee.into_val(&env),
-                ],
-            );
-            if cached.is_none() {
-                env.storage().persistent().set(&hr_key, &result);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&hr_key, TTL_BUMP, TTL_HIGH);
-            }
-            result
-        };
+        // ── Referral (live lookup — no stale cache) ───────────────────────
+        Self::require_compatible_referral(&env, &cfg.referral)?;
+        xlm.transfer(&this, &cfg.referral, &referral_fee);
+        let paid_referrer: bool = env.invoke_contract(
+            &cfg.referral,
+            &Symbol::new(&env, "credit"),
+            vec![
+                &env,
+                this.clone().into_val(&env),
+                user.clone().into_val(&env),
+                referral_fee.into_val(&env),
+            ],
+        );
 
         // ── Release reentrancy lock ──────────────────────────────────────
         env.storage().persistent().remove(&lock_key);
@@ -1125,26 +1019,25 @@ impl PredictionMarketContract {
             .ok_or(MarketError::NoBetFound)?;
         if entry.gross < amount {
             return Err(MarketError::InvalidAmount);
-        }
-
-        // Decompose exactly like place_bet so partial reductions stay integral.
+        }        // Decompose exactly like place_bet so partial reductions stay integral.
         let net_part = amount * NET_NUMERATOR / BPS_DENOM;
         let plat_part = amount * PLATFORM_FEE_BPS / BPS_DENOM;
-        let ref_part = amount * TOTAL_FEE_BPS / BPS_DENOM - plat_part;
 
-        // Referral fee is refundable only when the contract still holds it: it
-        // was kept in AccumulatedFees iff the user had no referrer (HasReferrer
-        // cache == Some(false)); otherwise it already left to the referrer.
-        let ref_held: bool = !env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::HasReferrer(user.clone()))
-            .unwrap_or(false);
-        let held_fees = plat_part + if ref_held { ref_part } else { 0 };
-        let refund = net_part + held_fees;
+        // With live referral lookup (no HasReferrer cache), the referral fee
+        // is always paid at bet time, so reduce_position only refunds the
+        // platform fee that the contract still holds.
+        let refund = net_part + plat_part;
+
+        // Determine which side to reduce from.
+        let is_yes = entry.net_yes >= entry.net_no;
+        let dominated_net = if is_yes {
+            &mut entry.net_yes
+        } else {
+            &mut entry.net_no
+        };
 
         // ── State FIRST, external call last ───────────────────────────────
-        entry.net -= net_part;
+        *dominated_net -= net_part;
         entry.gross -= amount;
 
         // Accumulated fees shrink by the fees being released; never below 0
@@ -1154,12 +1047,12 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        acc_fees = acc_fees.saturating_sub(held_fees);
+        acc_fees = acc_fees.saturating_sub(plat_part);
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
 
-        if entry.is_yes {
+        if is_yes {
             market.total_yes -= net_part;
         } else {
             market.total_no -= net_part;
@@ -1256,10 +1149,10 @@ impl PredictionMarketContract {
                     } else {
                         continue;
                     };
-                let bet_key = DataKey::Bet(market_id, bettor.clone());
-                if let Some(entry) = env.storage().persistent().get::<DataKey, BetEntry>(&bet_key) {
-                    if entry.is_yes == outcome {
-                        let payout = (entry.net * total_pool) / winning_side;
+                let bet_key = DataKey::Bet(market_id, bettor.clone());                    if let Some(entry) = env.storage().persistent().get::<DataKey, BetEntry>(&bet_key) {
+                    let entry_net = if outcome { entry.net_yes } else { entry.net_no };
+                    if entry_net > 0 {
+                        let payout = (entry_net * total_pool) / winning_side;
                         let payout_key = DataKey::Payout(market_id, bettor.clone());
                         env.storage().persistent().set(&payout_key, &payout);
                         env.storage()
@@ -1375,22 +1268,20 @@ impl PredictionMarketContract {
         }
 
         let gross = entry.gross;
-        let net = entry.net;
-        // Issue #58: zero both gross (idempotency guard) and net so that
+        let net_yes = entry.net_yes;
+        let net_no = entry.net_no;
+        // Issue #58: zero both gross (idempotency guard) and nets so that
         // get_bet no longer reports a staked amount after the refund.
         entry.gross = 0;
-        entry.net = 0;
+        entry.net_yes = 0;
+        entry.net_no = 0;
         env.storage().persistent().set(&bet_key, &entry);
 
         // Issue #58: decrement market totals so total_yes/total_no reflect
-        // that this bet has been refunded. BetEntry already carries is_yes
-        // and net, so no storage-model change is required.
+        // that this bet has been refunded.
         let mkt_key = DataKey::Market(market_id);
-        if entry.is_yes {
-            market.total_yes = market.total_yes.saturating_sub(net);
-        } else {
-            market.total_no = market.total_no.saturating_sub(net);
-        }
+        market.total_yes = market.total_yes.saturating_sub(net_yes);
+        market.total_no = market.total_no.saturating_sub(net_no);
         env.storage().persistent().set(&mkt_key, &market);
 
         // Read-time TTL refresh (issue #9): a refund must not be able to observe
@@ -1443,7 +1334,6 @@ impl PredictionMarketContract {
             return Err(MarketError::AlreadyClaimed);
         }
 
-        let is_winner = entry.is_yes == market.outcome;
         // Winning payout is driven by the net committed to the winning side
         // only; the losing side's net stays in the pool for all winners.
         let winning_net = if market.outcome {
@@ -2019,7 +1909,7 @@ impl PredictionMarketContract {
     #[inline]
     fn require_not_paused(env: &Env) -> Result<(), MarketError> {
         if Self::is_paused(env.clone()) {
-            return Err(MarketError::ContractPaused);
+            return Err(MarketError::Paused);
         }
         Ok(())
     }

@@ -2,10 +2,8 @@ use super::*;
 use soroban_sdk::{
     testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     contract, contractimpl,
-    testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    BytesN, Env, String,
-    Env, String, Symbol, TryFromVal, Val,
+    BytesN, Env, String, Symbol, TryIntoVal, Val,
 };
 
 use leaderboard::LeaderboardContract;
@@ -974,7 +972,7 @@ fn test_reject_too_many_bets() {
 #[test]
 fn test_market_creation_rate_limit_allows_up_to_max() {
     let t = setup();
-    // Should be able to create up to MAX_MARKETS_PER_HOUR (10) in the same window
+    // Should be able to create up to MAX_MARKETS_PER_WINDOW (10) in the same window
     for i in 0..10u32 {
         let _ = t.client.create_market(
             &t.admin,
@@ -1023,8 +1021,8 @@ fn test_market_creation_rate_limit_resets_after_window() {
             &(3600_u64 + i as u64),
         );
     }
-    // Advance past the 1-hour window
-    advance_time(&t.env, 3601);
+    // Advance past the rate-limit window (~720 ledgers ≈ 1h)
+    advance_ledgers(&t.env, RATE_WINDOW_LEDGERS);
     // Should be able to create again
     let id = t.client.create_market(
         &t.admin,
@@ -1055,6 +1053,33 @@ fn test_market_creation_rate_limit_rejects_timestamp_regression() {
     t.client.create_market(
         &t.admin,
         &String::from_str(&t.env, "Over limit after rewind"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Sports,
+        &7200_u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_market_creation_rate_limit_not_reset_by_timestamp_jump() {
+    let t = setup();
+    for i in 0..10u32 {
+        let _ = t.client.create_market(
+            &t.admin,
+            &String::from_str(&t.env, "Market"),
+            &String::from_str(&t.env, "https://x.png"),
+            &Category::Crypto,
+            &(3600_u64 + i as u64),
+        );
+    }
+
+    // A huge forward jump in wall-clock time without the corresponding ledger
+    // progression must NOT expire the window: the limit is anchored to the
+    // monotonic ledger sequence, not to timestamps.
+    advance_time(&t.env, 86_400);
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Over limit after time jump"),
         &String::from_str(&t.env, "https://x.png"),
         &Category::Sports,
         &7200_u64,
@@ -1547,30 +1572,6 @@ fn test_get_market_ttl_tracks_live_entry() {
 
 #[test]
 fn test_refresh_market_ttl_rebumps_bet_and_market() {
-// ── Cross-contract interface versioning (issue #84) ───────────────────────────
-
-// Stands in for a referral_registry/leaderboard deployment upgraded to an
-// incompatible ABI: it only implements interface_version(), reporting a
-// version this prediction_market build does not expect.
-#[contract]
-struct MockIncompatibleDependency;
-
-#[contractimpl]
-impl MockIncompatibleDependency {
-    pub fn interface_version(_env: Env) -> u32 {
-        99
-    }
-}
-
-#[test]
-fn test_interface_version_reported() {
-    let t = setup();
-    assert_eq!(t.client.interface_version(), 1);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #28)")]
-fn test_place_bet_rejects_incompatible_referral() {
     let t = setup();
     let id = create_test_market(&t);
     let user = Address::generate(&t.env);
@@ -1596,6 +1597,57 @@ fn test_place_bet_rejects_incompatible_referral() {
     assert!(t.client.get_market_ttl(&id) > market_before);
 }
 
+// ── Cross-contract interface versioning (issue #84) ───────────────────────────
+
+// Stands in for a referral_registry/leaderboard deployment upgraded to an
+// incompatible ABI: it only implements interface_version(), reporting a
+// version this prediction_market build does not expect.
+#[contract]
+struct MockIncompatibleDependency;
+
+#[contractimpl]
+impl MockIncompatibleDependency {
+    pub fn interface_version(_env: Env) -> u32 {
+        99
+    }
+}
+
+#[test]
+fn test_interface_version_reported() {
+    let t = setup();
+    assert_eq!(t.client.interface_version(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #36)")]
+fn test_place_bet_rejects_incompatible_referral() {
+    let t = setup();
+    // Long duration so the config dispute-window delay doesn't expire it.
+    let id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Market"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Crypto,
+        &1_000_000_u64,
+    );
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+
+    let fake_referral = t.env.register(MockIncompatibleDependency, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &fake_referral,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
+
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+}
+
 #[test]
 fn test_refresh_markets_migrates_existing_entries() {
     let t = setup();
@@ -1616,22 +1668,27 @@ fn test_refresh_markets_migrates_existing_entries() {
 
 #[test]
 fn test_resolve_market_rebumps_payout_entry() {
-
-    let fake_referral = t.env.register(MockIncompatibleDependency, ());
-    let cfg = t.client.get_config();
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &fake_referral,
-        &cfg.leaderboard,
-        &cfg.xlm_sac,
-    );
-
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+
+    advance_ledgers(&t.env, 6_000_000);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let market_contract = t.client.address.clone();
+    let payout_ttl = t.env.as_contract(&market_contract, || {
+        t.env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Payout(id, user.clone()))
+    });
+    assert!(payout_ttl >= TTL_BUMP);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #36)")]
 fn test_claim_rejects_incompatible_leaderboard() {
     let t = setup();
     let id = create_test_market(&t);
@@ -1650,6 +1707,8 @@ fn test_claim_rejects_incompatible_leaderboard() {
         &fake_leaderboard,
         &cfg.xlm_sac,
     );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
 
     t.client.claim(&user, &id);
 }
@@ -1682,18 +1741,6 @@ fn test_matching_version_does_not_guarantee_claim_succeeds() {
     fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     advance_time(&t.env, 3601);
-
-    advance_ledgers(&t.env, 6_000_000);
-    t.client.resolve_market(&t.admin, &id, &true);
-
-    let market_contract = t.client.address.clone();
-    let payout_ttl = t.env.as_contract(&market_contract, || {
-        t.env.storage()
-            .persistent()
-            .get_ttl(&DataKey::Payout(id, user.clone()))
-    });
-    assert!(payout_ttl >= TTL_BUMP);
-}
     t.client.resolve_market(&t.admin, &id, &true);
 
     let fake_leaderboard = t.env.register(MockLeaderboardMissingReward, ());
@@ -1705,6 +1752,8 @@ fn test_matching_version_does_not_guarantee_claim_succeeds() {
         &fake_leaderboard,
         &cfg.xlm_sac,
     );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
 
     // require_compatible_leaderboard passes (version 1 == version 1), then
     // claim() panics inside the real reward() invoke_contract call because
@@ -2070,11 +2119,21 @@ fn test_set_config_non_governor_rejected() {
         &cfg.leaderboard,
         &cfg.xlm_sac,
     );
+}
+
 fn last_event_name(env: &Env) -> Symbol {
-    let events = env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let topic0: Val = last.1.get_unchecked(0);
-    Symbol::try_from_val(env, &topic0).unwrap()
+    let all = env.events().all();
+    let last = all.events().last().expect("no events emitted");
+    let topics = match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.topics,
+    };
+    let topic0: Symbol = topics
+        .iter()
+        .next()
+        .expect("event has no topics")
+        .try_into_val(env)
+        .unwrap();
+    topic0
 }
 
 #[test]

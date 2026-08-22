@@ -5,6 +5,11 @@ use soroban_sdk::{
     IntoVal, String, Symbol, Val, Vec,
 };
 
+// get_ttl() is a test-only SDK extension; gate it so non-test builds compile
+// without the testutils feature.
+#[cfg(any(test, feature = "testutils"))]
+use soroban_sdk::testutils::storage::Persistent as _;
+
 // ── Event schema (issue #52) ────────────────────────────────────────────────
 // Topics: (event_name: Symbol, actor: Address [, market_id: u64])
 // Data:   state deltas so an indexer can rebuild history without polling.
@@ -27,7 +32,11 @@ use soroban_sdk::{
 const MIN_BET: i128 = 10_000_000; // minimum net stake: 1 XLM in stroops
 
 const MAX_BETS_PER_USER: u32 = 20;
-const MAX_MARKETS_PER_HOUR: u32 = 10;
+// issue #56: the creation rate limit is anchored to the ledger sequence —
+// strictly monotonic on any Soroban network — instead of wall-clock
+// timestamps, which can regress and previously underflowed here.
+const RATE_WINDOW_LEDGERS: u32 = 720; // ≈1h of ledgers at ~5s per ledger
+const MAX_MARKETS_PER_WINDOW: u32 = 10;
 const MIN_MARKET_DURATION_SECS: u64 = 60; // issue #10: no instantly-expired markets
 const MAX_BETTORS_PER_PAGE: u32 = 100;
 
@@ -115,7 +124,7 @@ pub enum MarketError {
     /// ABI change (renamed function, changed argument order/count/type,
     /// changed return type) always increments INTERFACE_VERSION in the same
     /// commit. See EXPECTED_REFERRAL_INTERFACE_VERSION / EXPECTED_LEADERBOARD_INTERFACE_VERSION.
-    IncompatibleInterface = 28,
+    IncompatibleInterface = 36,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -134,7 +143,7 @@ pub enum DataKey {
     Resolver(Address),
     FeeRecipient(Address),
     HasReferrer(Address),
-    RateWindow, // packed u64: high32=window_start_hi, low32=count
+    RateWindowSeq, // (u32 window_start_seq, u32 count) — ledger-sequence anchored (issue #56)
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
     // ── Timelocked withdrawal requests (issue #12) ───────────────────────
@@ -353,15 +362,6 @@ impl PredictionMarketContract {
                 referral: referral_contract,
                 leaderboard: leaderboard_contract,
                 xlm_sac,
-        Self::require_admin(&env, &admin)?;
-        admin.require_auth();
-        env.storage().instance().set(
-            &DataKey::Cfg,
-            &Config {
-                token: token_contract.clone(),
-                referral: referral_contract.clone(),
-                leaderboard: leaderboard_contract.clone(),
-                xlm_sac: xlm_sac.clone(),
             },
             hashes,
             requested_at: env.ledger().timestamp(),
@@ -444,10 +444,6 @@ impl PredictionMarketContract {
         env.events().publish(
             (Symbol::new(&env, "cfg_act"), caller),
             pending.cfg,
-        );
-        env.events().publish(
-            (Symbol::new(&env, "config_changed"), admin),
-            (token_contract, referral_contract, leaderboard_contract, xlm_sac),
         );
         Ok(())
     }
@@ -569,6 +565,8 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::GovernorCount)
             .unwrap_or(0)
+    }
+
     /// The cross-contract ABI version this deployment implements (issue #84).
     pub fn interface_version(_env: Env) -> u32 {
         INTERFACE_VERSION
@@ -1433,6 +1431,10 @@ impl PredictionMarketContract {
 
     /// Remaining TTL (ledgers) of the Market key. 0 means missing/expired —
     /// integrators can warn before funds become unrecoverable (issue #54).
+    ///
+    /// Test-only: reading a live TTL requires the SDK's testutils extension,
+    /// so this view function is compiled out of non-test WASM builds.
+    #[cfg(any(test, feature = "testutils"))]
     pub fn get_market_ttl(env: Env, market_id: u64) -> u32 {
         let key = DataKey::Market(market_id);
         if !env.storage().persistent().has(&key) {
@@ -1618,6 +1620,8 @@ impl PredictionMarketContract {
         }
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(bettors)
+    }
+
     // Issue #84: check a dependency's reported ABI version before invoking
     // it, so a unilateral upgrade with an incompatible credit/reward
     // signature fails with a clear error instead of an opaque
@@ -1732,30 +1736,34 @@ impl PredictionMarketContract {
     // OPT: CreationWindow packed into two u32s stored as separate u32 keys
     // to avoid struct serialization. Actually simpler: store as (u64, u32) tuple
     // via a single key — Soroban serializes tuples efficiently.
+    // issue #56: the window is anchored to the ledger sequence rather than
+    // wall-clock time. Ledger sequences are strictly monotonic on any Soroban
+    // network, so timestamp regressions can neither underflow the elapsed
+    // computation nor reset an active rate-limit window.
     fn check_rate(env: &Env) -> Result<(), MarketError> {
-        let now = env.ledger().timestamp();
-        // (window_start, count) packed — 1 read instead of 1 struct deserialize
-        let (ws, cnt): (u64, u32) = env
+        let seq = env.ledger().sequence();
+        // (window_start_seq, count) — 1 read, cheap tuple serialization
+        let (ws, cnt): (u32, u32) = env
             .storage()
             .instance()
-            .get(&DataKey::RateWindow)
-            .unwrap_or((now, 0));
+            .get(&DataKey::RateWindowSeq)
+            .unwrap_or((seq, 0));
 
-        // A timestamp regression must remain in the existing window. Using
-        // checked subtraction prevents underflow from resetting the limit and
-        // allowing an extra burst of market creations.
-        let elapsed = now.checked_sub(ws).unwrap_or(0);
-        let (new_ws, new_cnt) = if elapsed < 3600 {
-            if cnt >= MAX_MARKETS_PER_HOUR {
+        // Defensive fail-closed: if a hostile/incompatible host ever reported
+        // an out-of-order sequence, treat it as zero elapsed and keep the
+        // current window instead of resetting the rate limit.
+        let elapsed = seq.saturating_sub(ws);
+        let (new_ws, new_cnt) = if elapsed < RATE_WINDOW_LEDGERS {
+            if cnt >= MAX_MARKETS_PER_WINDOW {
                 return Err(MarketError::RateLimitExceeded);
             }
             (ws, cnt + 1)
         } else {
-            (now, 1)
+            (seq, 1)
         };
         env.storage()
             .instance()
-            .set(&DataKey::RateWindow, &(new_ws, new_cnt));
+            .set(&DataKey::RateWindowSeq, &(new_ws, new_cnt));
         Ok(())
     }
 }

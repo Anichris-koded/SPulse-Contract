@@ -22,7 +22,15 @@ pub enum TokenError {
     InsufficientAllowance = 7,
     InvalidExpirationLedger = 8,
     ContractPaused = 9,
+    AlreadyMinter = 10,
+    NotMinter = 11,
+    MinterListFull = 12,
 }
+
+// TTL: ~1yr threshold, ~2yr extend
+const TTL_BUMP: u32 = 3_153_600;
+const TTL_HIGH: u32 = 6_307_200;
+const MAX_MINTERS: u32 = 10;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +44,9 @@ pub enum DataKey {
     Decimals,
     Allowance(Address, Address),
     Paused,
+    MinterAt(u32),
+    MinterCount,
+    MinterIndex(Address),
 }
 
 #[contracttype]
@@ -129,9 +140,38 @@ impl PULSETokenContract {
     pub fn set_minter(env: Env, minter: Address) -> Result<(), TokenError> {
         let admin: Address = Self::require_admin(&env)?;
         admin.require_auth();
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::AuthorizedMinter(minter.clone()))
+            .unwrap_or(false)
+        {
+            return Err(TokenError::AlreadyMinter);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::AuthorizedMinter(minter.clone()), &true);
+        // Track in the audit list
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinterCount)
+            .unwrap_or(0);
+        if count >= MAX_MINTERS {
+            return Err(TokenError::MinterListFull);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinterIndex(minter.clone()), &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::MinterIndex(minter.clone()), TTL_BUMP, TTL_HIGH);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinterAt(count), &minter);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinterCount, &(count + 1));
         env.events().publish((Symbol::new(&env, "minter_added"), minter), true);
         Ok(())
     }
@@ -139,10 +179,44 @@ impl PULSETokenContract {
     pub fn remove_minter(env: Env, minter: Address) -> Result<(), TokenError> {
         let admin: Address = Self::require_admin(&env)?;
         admin.require_auth();
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::AuthorizedMinter(minter.clone()))
+            .unwrap_or(false)
+        {
+            return Err(TokenError::NotMinter);
+        }
         env.storage()
             .persistent()
             .remove(&DataKey::AuthorizedMinter(minter));
         Ok(())
+    }
+
+    pub fn get_authorized_minters(env: Env) -> soroban_sdk::Vec<Address> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinterCount)
+            .unwrap_or(0);
+        let mut result: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        for i in 0..count {
+            if let Some(addr) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::MinterAt(i))
+            {
+                if env
+                    .storage()
+                    .persistent()
+                    .get::<_, bool>(&DataKey::AuthorizedMinter(addr.clone()))
+                    .unwrap_or(false)
+                {
+                    result.push_back(addr);
+                }
+            }
+        }
+        result
     }
 
     pub fn mint(env: Env, minter: Address, to: Address, amount: i128) -> Result<(), TokenError> {
@@ -160,8 +234,13 @@ impl PULSETokenContract {
             return Err(TokenError::UnauthorizedMinter);
         }
         let balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
         env.storage()
             .persistent()
+            .set(&to_key, &(balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
             .set(&DataKey::Balance(to.clone()), &(balance + amount));
         let supply: i128 = env
             .storage()
@@ -188,12 +267,22 @@ impl PULSETokenContract {
         if from_balance < amount {
             return Err(TokenError::InsufficientBalance);
         }
+        let from_key = DataKey::Balance(from.clone());
         env.storage()
             .persistent()
+            .set(&from_key, &(from_balance - amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let to_balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
         env.storage()
             .persistent()
+            .set(&to_key, &(to_balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
             .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
@@ -299,8 +388,16 @@ impl PULSETokenContract {
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let to_balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
         env.storage()
             .persistent()
+            .set(&to_key, &(to_balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Balance(from), TTL_BUMP, TTL_HIGH);
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
             .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
@@ -319,8 +416,13 @@ impl PULSETokenContract {
         if from_balance < amount {
             return Err(TokenError::InsufficientBalance);
         }
+        let from_key = DataKey::Balance(from.clone());
         env.storage()
             .persistent()
+            .set(&from_key, &(from_balance - amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let supply: i128 = env
             .storage()

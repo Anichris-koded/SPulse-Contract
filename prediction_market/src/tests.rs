@@ -3,7 +3,7 @@ use soroban_sdk::{
     contract, contractimpl,
     testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String, Symbol, TryFromVal, Val,
+    BytesN, Env, String, Symbol, TryFromVal, Val,
 };
 
 use leaderboard::LeaderboardContract;
@@ -259,7 +259,9 @@ fn test_fee_full_2_percent_no_referrer() {
     fund_user(&t, &user, 200_0000000);
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
-    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    // Issue #78: only platform_fee is tracked in AccumulatedFees;
+    // referral fee stays in referral contract as surplus.
+    assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
 }
 
 // ── 6. Fee split with referrer ────────────────────────────────────────────────
@@ -288,6 +290,7 @@ fn test_fee_split_with_referrer() {
 
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
 }
 
@@ -565,6 +568,7 @@ fn test_claim_winner() {
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
     t.client.claim(&alice, &id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
 
     let payout = t.xlm.balance(&alice) - alice_pre_claim;
     assert_eq!(payout, 196_0000000);
@@ -592,6 +596,7 @@ fn test_claim_loser() {
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
     t.client.claim(&bob, &id);
+    t.leaderboard_client.claim_pending_rewards(&bob);
 
     assert_eq!(t.xlm.balance(&bob), bob_pre_claim);
     let stats = t.leaderboard_client.get_stats(&bob);
@@ -945,6 +950,7 @@ fn test_referrer_bonus_points_per_bet() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &50_0000000_i128);
 
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 }
 
@@ -1181,7 +1187,7 @@ fn test_empty_side_resolution_pool_to_fees() {
     // Only YES bets — no one bets NO
     t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
     let fees_before = t.client.get_accumulated_fees();
-    assert_eq!(fees_before, 2_0000000); // 2% platform fee
+    assert_eq!(fees_before, 1_5000000); // 1.5% platform fee (referral fee goes to surplus)
 
     // Advance past end_time and resolve NO (empty winning side)
     advance_time(&t.env, 3601);
@@ -1206,6 +1212,7 @@ fn test_empty_side_resolution_pool_to_fees() {
 
     // Alice (was YES, losing side) can still claim — gets PULSE tokens + points
     t.client.claim(&alice, &id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
     let bet = t.client.get_bet(&id, &alice);
     assert!(bet.claimed);
     // Gets lose-tier rewards because winning_side == 0
@@ -1224,10 +1231,10 @@ fn test_cancel_fees_zeroed_correctly() {
     fund_user(&t, &alice, 200_0000000);
     fund_user(&t, &bob, 200_0000000);
 
-    // Two bets accumulate fees
-    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 2 XLM fee
-    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 2 XLM fee
-    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+    // Two bets accumulate fees (only platform_fee tracked; referral fee goes to surplus)
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 1.5 XLM platform fee
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 1.5 XLM platform fee
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000);
 
     // Cancel zeroes out those fees
     t.client.cancel_market(&t.admin, &id);
@@ -1263,6 +1270,7 @@ fn test_e2e_full_inter_contract_flow() {
         &String::from_str(&t.env, "Alice"),
         &Some(referrer.clone()),
     );
+    t.leaderboard_client.claim_pending_rewards(&alice);
     assert_eq!(t.leaderboard_client.get_points(&alice), 5);
     assert_eq!(t.token_client.balance(&alice), 1_0000000);
 
@@ -1280,6 +1288,7 @@ fn test_e2e_full_inter_contract_flow() {
         .place_bet(&alice, &market_id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
     // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
     assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
@@ -1289,7 +1298,9 @@ fn test_e2e_full_inter_contract_flow() {
     // Bob bets NO 200 XLM — no referrer
     t.client
         .place_bet(&bob, &market_id, &false, &200_0000000_i128);
-    assert_eq!(t.client.get_accumulated_fees(), 5_5000000);
+    // Issue #78: only platform_fee tracked per bet; referral fee goes to surplus.
+    // Alice: 1.5M, Bob: 3M platform fee → total 4.5M
+    assert_eq!(t.client.get_accumulated_fees(), 4_5000000);
     // Bob never registered, so no bonus: total_bets = won(0) + lost(0) + bonus(0).
     assert_eq!(t.leaderboard_client.get_stats(&bob).total_bets, 0);
     assert_eq!(t.client.get_market(&market_id).total_no, 196_0000000);
@@ -1302,6 +1313,7 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 150_0000000);
     assert_eq!(t.client.get_market(&market_id).total_yes, 147_0000000);
     assert_eq!(t.client.get_market(&market_id).bet_count, 2);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 
     // Add a resolver and resolve via them
@@ -1314,6 +1326,7 @@ fn test_e2e_full_inter_contract_flow() {
     // Alice claims as winner
     let alice_xlm_before = t.xlm.balance(&alice);
     t.client.claim(&alice, &market_id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
     let alice_payout = t.xlm.balance(&alice) - alice_xlm_before;
     assert_eq!(alice_payout, 343_0000000);
     assert_eq!(t.leaderboard_client.get_points(&alice), 35);
@@ -1322,6 +1335,7 @@ fn test_e2e_full_inter_contract_flow() {
     // Bob claims as loser
     let bob_xlm_before = t.xlm.balance(&bob);
     t.client.claim(&bob, &market_id);
+    t.leaderboard_client.claim_pending_rewards(&bob);
     assert_eq!(t.xlm.balance(&bob), bob_xlm_before);
     assert_eq!(t.leaderboard_client.get_points(&bob), 10);
     assert_eq!(t.token_client.balance(&bob), 2_0000000);
@@ -1529,6 +1543,41 @@ fn test_cancel_refund_rebumps_ttl_entries() {
     assert!(ttl(&market_key) > market_before);
 }
 
+// ── #54: permissionless refresh + per-market expiry tracking + migration ─────
+
+#[test]
+fn test_get_market_ttl_tracks_live_entry() {
+    let t = setup();
+    assert_eq!(t.client.get_market_ttl(&99_u64), 0);
+    let id = create_test_market(&t);
+    assert!(t.client.get_market_ttl(&id) >= TTL_BUMP);
+}
+
+#[test]
+fn test_refresh_market_ttl_rebumps_bet_and_market() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let bet_before = ttl(&bet_key);
+    let market_before = ttl(&market_key);
+
+    assert_eq!(t.client.refresh_market_ttl(&id), 1);
+    assert!(ttl(&bet_key) > bet_before);
+    assert!(ttl(&market_key) > market_before);
+    assert!(t.client.get_market_ttl(&id) > market_before);
+}
+
 // ── Cross-contract interface versioning (issue #84) ───────────────────────────
 
 // Stands in for a referral_registry/leaderboard deployment upgraded to an
@@ -1551,29 +1600,74 @@ fn test_interface_version_reported() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #36)")]
 fn test_place_bet_rejects_incompatible_referral() {
     let t = setup();
     let id = create_test_market(&t);
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
-
-    let fake_referral = t.env.register(MockIncompatibleDependency, ());
-    let cfg = t.client.get_config();
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &fake_referral,
-        &cfg.leaderboard,
-        &cfg.xlm_sac,
-    );
-
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let bet_before = ttl(&bet_key);
+    let market_before = ttl(&market_key);
+
+    // Anyone can pay to keep the keys alive — no auth required.
+    assert_eq!(t.client.refresh_market_ttl(&id), 1);
+    assert!(ttl(&bet_key) > bet_before);
+    assert!(ttl(&market_key) > market_before);
+    assert!(t.client.get_market_ttl(&id) > market_before);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
-fn test_claim_rejects_incompatible_leaderboard() {
+fn test_refresh_markets_migrates_existing_entries() {
+    let t = setup();
+    let a = create_test_market(&t);
+    let b = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 400_0000000);
+    t.client.place_bet(&user, &a, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &b, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+    let before_a = t.client.get_market_ttl(&a);
+    let bumped = t.client.refresh_markets(&1_u64, &20_u32);
+    assert_eq!(bumped, 2);
+    assert!(t.client.get_market_ttl(&a) > before_a);
+    assert!(t.client.get_market_ttl(&b) >= TTL_BUMP);
+}
+
+#[test]
+fn test_resolve_market_rebumps_payout_entry() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let winner = Address::generate(&t.env);
+    let loser = Address::generate(&t.env);
+    fund_user(&t, &winner, 200_0000000);
+    fund_user(&t, &loser, 200_0000000);
+    t.client.place_bet(&winner, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&loser, &id, &false, &100_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+    let market_contract = t.client.address.clone();
+    let payout_key = DataKey::Payout(id, winner);
+    let payout_ttl = t.env.as_contract(&market_contract, || {
+        t.env.storage().persistent().get_ttl(&payout_key)
+    });
+    assert!(payout_ttl >= TTL_BUMP);
+}
+
+#[test]
+fn test_claim_survives_incompatible_leaderboard() {
     let t = setup();
     let id = create_test_market(&t);
     let user = Address::generate(&t.env);
@@ -1593,6 +1687,7 @@ fn test_claim_rejects_incompatible_leaderboard() {
     );
 
     t.client.claim(&user, &id);
+    assert!(t.client.get_bet(&id, &user).claimed);
 }
 
 // Stands in for a leaderboard deployment that reports the version this
@@ -1615,8 +1710,7 @@ impl MockLeaderboardMissingReward {
 }
 
 #[test]
-#[should_panic]
-fn test_matching_version_does_not_guarantee_claim_succeeds() {
+fn test_matching_version_does_not_block_claim_when_queue_is_missing() {
     let t = setup();
     let id = create_test_market(&t);
     let user = Address::generate(&t.env);
@@ -1635,10 +1729,10 @@ fn test_matching_version_does_not_guarantee_claim_succeeds() {
         &cfg.xlm_sac,
     );
 
-    // require_compatible_leaderboard passes (version 1 == version 1), then
-    // claim() panics inside the real reward() invoke_contract call because
-    // the function doesn't exist on the callee.
+    // The optional queue call fails, but claim state and the XLM payout remain
+    // successful because the failure is intentionally ignored.
     t.client.claim(&user, &id);
+    assert!(t.client.get_bet(&id, &user).claimed);
 }
 
 // ── Emergency Pause (issue #83) ───────────────────────────────────────────────
@@ -1825,6 +1919,180 @@ fn test_cancel_withdrawal_request_still_works_while_paused() {
     assert!(t.client.get_pending_withdrawal(&recipient).is_none());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION — issue #51 (set_config pinning / governance)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn second_leaderboard(t: &TestSetup) -> Address {
+    let id = t.env.register(LeaderboardContract, ());
+    let client = leaderboard::LeaderboardContractClient::new(&t.env, &id);
+    client.initialize(&t.admin, &t.client.address, &t.referral_client.address);
+    id
+}
+
+#[test]
+fn test_set_config_does_not_apply_immediately() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+
+    // Live config is unchanged until execute_set_config after the delay.
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+    let pending = t.client.get_pending_config().expect("pending change");
+    assert_eq!(pending.cfg.leaderboard, new_lb);
+    assert_eq!(pending.approvers.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_arbitrary_address() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let attacker = Address::generate(&t.env);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &attacker,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_wasm_as_xlm_sac() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    // A WASM/native contract must not be installable as the XLM SAC.
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.token,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn test_set_config_execute_before_delay() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_execute_after_delay_and_pin() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+    assert!(t.client.get_pending_config().is_none());
+    let pins = t.client.get_pinned_hashes().expect("pins");
+    assert_eq!(pins.xlm_sac, BytesN::from_array(&t.env, &[0u8; 32]));
+}
+
+#[test]
+fn test_cancel_set_config_during_dispute_window() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.cancel_set_config(&t.admin);
+    assert!(t.client.get_pending_config().is_none());
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn test_set_config_multisig_requires_threshold() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    // Only the proposer approved (1 of 2).
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_multisig_execute_with_second_approval() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.approve_set_config(&g2);
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&g2);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_config_non_governor_rejected() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let stranger = Address::generate(&t.env);
+    t.client.set_config(
+        &stranger,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
 fn last_event_name(env: &Env) -> Symbol {
     // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
     // exposes its entries as an XDR slice rather than an indexable Vec of

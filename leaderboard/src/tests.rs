@@ -47,6 +47,29 @@ fn test_accumulate_points() {
 }
 
 #[test]
+fn test_pending_rewards_accumulate_until_claimed() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+
+    client.queue_reward(&market, &user, &30_u64, &0_i128, &true);
+    client.queue_reward(&market, &user, &10_u64, &0_i128, &false);
+
+    assert_eq!(client.get_points(&user), 0);
+    let pending = client.get_pending_reward(&user).unwrap();
+    assert_eq!(pending.points, 40);
+    assert_eq!(pending.won_delta, 1);
+    assert_eq!(pending.lost_delta, 1);
+    assert_eq!(pending.bet_delta, 2);
+
+    client.claim_pending_rewards(&user);
+    assert_eq!(client.get_points(&user), 40);
+    let stats = client.get_stats(&user);
+    assert_eq!(stats.won_bets, 1);
+    assert_eq!(stats.lost_bets, 1);
+    assert_eq!(client.get_pending_reward(&user), None);
+}
+
+#[test]
 fn test_bonus_pts_no_won_lost() {
     let (env, client, _admin, market, referral) = setup();
     let user = Address::generate(&env);

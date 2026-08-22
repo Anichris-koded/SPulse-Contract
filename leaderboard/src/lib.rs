@@ -614,13 +614,14 @@ impl LeaderboardContract {
     }
 
     // ── Rank (issue #67) ───────────────────────────────────────────────────
-    // A 1-based rank inside the top list; 0 means "not in the list". The
-    // reverse lookup is validated against the forward entry first so an
-    // orphaned/stale TopPlayerSlot can never produce a fake rank.
-
-    pub fn get_rank(env: Env, user: Address) -> u32 {
+    // A 1-based rank inside the tracked top list. None explicitly means the
+    // player is outside the top list; this contract does not maintain a global
+    // player index and therefore cannot report a whole-population rank. The
+    // reverse lookup is validated first so an orphaned/stale TopPlayerSlot can
+    // never produce a fake rank.
+    pub fn get_rank(env: Env, user: Address) -> Option<u32> {
         let Some((slot, entry)) = Self::top_slot_entry(&env, &user) else {
-            return 0;
+            return None;
         };
         let count: u32 = env
             .storage()
@@ -646,7 +647,7 @@ impl LeaderboardContract {
                 }
             }
         }
-        rank
+        Some(rank)
     }
 
     /// Points of the weakest entry currently in the top list, decayed to now.

@@ -1269,6 +1269,71 @@ fn test_cancel_fees_zeroed_correctly() {
     t.client.cancel_refund(&bob, &id);
 }
 
+// ── 42b. Cancel reclaims only the fees a market actually retained (issue #87) ─
+
+#[test]
+fn test_cancel_market_reclaims_only_retained_fees() {
+    let t = setup();
+
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    let charlie = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+    fund_user(&t, &charlie, 200_0000000);
+
+    // Referrer + Bob (with referrer). Alice and Charlie bet without one.
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
+    t.referral_client.register_referral(
+        &bob,
+        &String::from_str(&t.env, "Bob"),
+        &Some(referrer.clone()),
+    );
+
+    let m1 = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "M1"),
+        &String::from_str(&t.env, "https://m1.png"),
+        &Category::Crypto,
+        &3600_u64,
+    );
+    let m2 = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "M2"),
+        &String::from_str(&t.env, "https://m2.png"),
+        &Category::Crypto,
+        &3600_u64,
+    );
+
+    // Market 1: Alice (no referrer → 2 XLM retained) + Bob (referrer → 1.5
+    // XLM retained, 0.5 XLM already paid to the referrer at bet time).
+    t.client.place_bet(&alice, &m1, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &m1, &false, &100_0000000_i128);
+
+    // Market 2: Charlie (no referrer → 2 XLM retained).
+    t.client.place_bet(&charlie, &m2, &true, &100_0000000_i128);
+
+    // 2 + 1.5 + 2 = 5.5 XLM accumulated; the referrer already holds 0.5 XLM.
+    assert_eq!(t.client.get_accumulated_fees(), 5_5000000);
+    assert_eq!(t.xlm.balance(&referrer), 5000000);
+
+    // Cancelling market 1 must reclaim only 3.5 XLM (2 + 1.5), leaving
+    // market 2's 2 XLM untouched. The old net-pool formula reclaimed 4 XLM
+    // and silently ate 0.5 XLM of market 2's platform fees.
+    t.client.cancel_market(&t.admin, &m1);
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+
+    // Bettors still pull their full gross refunds; the referrer fee is gone.
+    assert_eq!(t.client.cancel_refund(&alice, &m1), 100_0000000);
+    assert_eq!(t.client.cancel_refund(&bob, &m1), 100_0000000);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 42. COMPREHENSIVE END-TO-END INTEGRATION TEST
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -282,9 +282,6 @@ impl LeaderboardContract {
     // ── Bet-settlement path ───────────────────────────────────────────────────
 
     /// Called by the market contract after a bet is settled.
-    /// Updates points + won/lost counts and optionally mints PULSE tokens.
-    /// Replaces the old two-call pattern (add_pts + separate mint).
-    pub fn reward(
     /// The cross-contract ABI version this deployment implements (issue #84).
     /// Callers that invoke add_pts/add_bonus_pts/reward/reward_bonus should
     /// check this before calling so an upgrade with a breaking signature
@@ -333,7 +330,6 @@ impl LeaderboardContract {
             .unwrap_or(false)
     }
 
-    pub fn reward(
     /// Original ABI name — kept for callers that deploy against the pre-#23
     /// interface (prediction_market and referral_registry tests use it).
     pub fn set_token(
@@ -445,57 +441,6 @@ impl LeaderboardContract {
         }
         caller.require_auth();
         Self::credit_points(&env, &user, pts, Some(is_won));
-        Ok(())
-    }
-
-    pub fn reward_bonus(
-
-        let mut s = Self::load_stored(&env, &user);
-        s.points += pts;
-        let mut stats = Self::stats_for_update(&env, &user);
-
-        stats.points += pts;
-        stats.total_bets += 1;
-        if is_won {
-            s.won_bets += 1;
-        } else {
-            s.lost_bets += 1;
-        }
-        Self::save_stored(&env, &user, &s);
-        Self::update_top_players(&env, user.clone(), s.points);
-
-        // Mint PULSE tokens if wired and amount > 0.
-        if tokens > 0 {
-            if let Some(token) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Address>(&DataKey::TokenContract)
-            {
-                let this = env.current_contract_address();
-                let _: Val = env.invoke_contract(
-                    &token,
-                    &Symbol::new(&env, "mint"),
-                    vec![
-                        &env,
-                        this.into_val(&env),
-                        user.into_val(&env),
-                        tokens.into_val(&env),
-                    ],
-                );
-            }
-        }
-
-        Self::commit_stats(&env, &user, &stats);
-
-        Self::update_top_players(&env, user.clone(), stats.points);
-        // Instance storage (TopPlayerCount, MinPoints, MinSlot, Admin, etc.)
-        // has its own TTL that is never bumped by persistent-key writes above —
-        // refresh it on every write so the leaderboard's cached min survives.
-        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
-        env.events().publish(
-            (Symbol::new(&env, "leaderboard_updated"), user),
-            (stats.points, stats.won_bets, stats.lost_bets),
-        );
         Ok(())
     }
 

@@ -23,10 +23,10 @@ pub enum TokenError {
     InvalidExpirationLedger = 8,
     // Issue #95: operation blocked because the contract is paused.
     Paused = 9,
-    ContractPaused = 9,
     AlreadyMinter = 10,
     NotMinter = 11,
     MinterListFull = 12,
+    SupplyCapExceeded = 13,
 }
 
 // TTL: ~1yr threshold, ~2yr extend
@@ -49,6 +49,7 @@ pub enum DataKey {
     MinterAt(u32),
     MinterCount,
     MinterIndex(Address),
+    SupplyCap, // i128 — maximum total_supply (0 = unlimited)
 }
 
 #[contracttype]
@@ -104,6 +105,36 @@ impl PULSETokenContract {
     /// The cross-contract ABI version this deployment implements (issue #84).
     pub fn interface_version(_env: Env) -> u32 {
         INTERFACE_VERSION
+    }
+
+    // ── Supply cap (issue #79) ────────────────────────────────────────────
+    // A cap of 0 means unlimited (backwards-compatible default).
+    // Admin only; emits a SupplyCapSet event so indexers can track policy changes.
+
+    /// Set or clear the maximum total_supply. Admin only.
+    pub fn set_supply_cap(env: Env, admin: Address, cap: i128) -> Result<(), TokenError> {
+        let stored = Self::require_admin(&env)?;
+        if admin != stored {
+            return Err(TokenError::NotAdmin);
+        }
+        admin.require_auth();
+        if cap < 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        env.storage().instance().set(&DataKey::SupplyCap, &cap);
+        env.events().publish(
+            (Symbol::new(&env, "supply_cap_set"), admin),
+            cap,
+        );
+        Ok(())
+    }
+
+    /// Current supply cap. 0 means unlimited.
+    pub fn get_supply_cap(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SupplyCap)
+            .unwrap_or(0)
     }
 
     /// Halt mint/transfer/burn in an emergency. Admin only. View functions
@@ -215,10 +246,6 @@ impl PULSETokenContract {
             .unwrap_or(false)
     }
 
-    pub fn mint(env: Env, minter: Address, to: Address, amount: i128) -> Result<(), TokenError> {
-        if Self::paused(env.clone()) {
-            return Err(TokenError::Paused);
-        }
     pub fn get_authorized_minters(env: Env) -> soroban_sdk::Vec<Address> {
         let count: u32 = env
             .storage()
@@ -266,16 +293,21 @@ impl PULSETokenContract {
             .set(&to_key, &(balance + amount));
         env.storage()
             .persistent()
-            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(to.clone()), &(balance + amount));
-        let supply: i128 = env
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);        let supply: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
-        env.storage()
+        // Issue #79: enforce supply cap — prevents unbounded PULSE inflation.
+        let cap: i128 = env
+            .storage()
             .instance()
-            .set(&DataKey::TotalSupply, &(supply + amount));
+            .get(&DataKey::SupplyCap)
+            .unwrap_or(0);
+        if cap > 0 && supply + amount > cap {
+            return Err(TokenError::SupplyCapExceeded);
+        }
+        env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
         env.events().publish(
             (Symbol::new(&env, "mint"), minter, to),
             amount,
@@ -509,7 +541,7 @@ impl PULSETokenContract {
 
     fn require_not_paused(env: &Env) -> Result<(), TokenError> {
         if Self::is_paused(env.clone()) {
-            return Err(TokenError::ContractPaused);
+            return Err(TokenError::Paused);
         }
         Ok(())
     }

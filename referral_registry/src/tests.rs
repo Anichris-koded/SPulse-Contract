@@ -120,16 +120,25 @@ fn test_register_no_referrer() {
     assert!(!t.client.has_referrer(&user));
 }
 
-// ── 3. Welcome bonus: 5 pts + 1 PULSE on registration ─────────────────────
+// ── 3. Welcome bonus: 5 pts + 1 PULSE only when a referrer is provided ────────
 
 #[test]
 fn test_welcome_bonus() {
     let t = setup();
+    let referrer = Address::generate(&t.env);
     let user = Address::generate(&t.env);
 
+    // Register the referrer first (no bonus expected — no referrer provided)
     let no_ref: Option<Address> = None;
     t.client
-        .register_referral(&user, &String::from_str(&t.env, "NewUser"), &no_ref);
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
+    // Register user WITH the referrer — this should trigger the welcome bonus
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "NewUser"),
+        &Some(referrer.clone()),
+    );
 
     // Leaderboard: 5 welcome points, no win/loss impact
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
@@ -141,6 +150,25 @@ fn test_welcome_bonus() {
     // Token: 1 PULSE (7 decimals)
     let tok_client = pulse_token::PULSETokenContractClient::new(&t.env, &t.token_id);
     assert_eq!(tok_client.balance(&user), 1_0000000);
+}
+
+// ── 3b. No welcome bonus when registering WITHOUT a referrer ──────────────────
+
+#[test]
+fn test_no_bonus_without_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Solo"), &no_ref);
+
+    // No bonus points, no PULSE minted
+    let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    assert_eq!(lb_client.get_points(&user), 0);
+
+    let tok_client = pulse_token::PULSETokenContractClient::new(&t.env, &t.token_id);
+    assert_eq!(tok_client.balance(&user), 0);
 }
 
 // ── 4. Reject self-referral ──────────────────────────────────────────────────

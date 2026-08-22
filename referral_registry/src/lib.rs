@@ -25,6 +25,12 @@ pub const INTERFACE_VERSION: u32 = 1;
 // misbehaving (issue #84).
 const EXPECTED_LEADERBOARD_INTERFACE_VERSION: u32 = 1;
 
+/// Maximum allowed depth of the referral chain. A new registration whose
+/// referrer already sits at depth MAX_REFERRAL_DEPTH (i.e. has MAX_REFERRAL_DEPTH
+/// ancestors) is rejected. This bounds both gas usage during the on-chain
+/// traversal and sybil-amplification attack surface.
+const MAX_REFERRAL_DEPTH: u32 = 5;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -188,6 +194,7 @@ impl ReferralRegistryContract {
                 return Err(ReferralError::ReferrerNotRegistered);
             }
         }
+
         // Lever A: write ONE packed Profile entry (display_name + referrer)
         // instead of the three legacy keys (Registered + DisplayName + Referrer).
         // Existence of Profile(user) is what is_registered() now checks.

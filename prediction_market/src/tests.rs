@@ -2094,9 +2094,14 @@ fn test_set_config_non_governor_rejected() {
         &cfg.xlm_sac,
     );
 fn last_event_name(env: &Env) -> Symbol {
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than an indexable Vec of
+    // (address, topics, data) tuples.
     let events = env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let topic0: Val = last.1.get_unchecked(0);
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "no event was emitted");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(env, &body.topics[0]).unwrap();
     Symbol::try_from_val(env, &topic0).unwrap()
 }
 

@@ -1,7 +1,7 @@
 use crate::{PULSETokenContract, PULSETokenContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger as _},
-    Address, Env, String, Symbol, TryFromVal,
+    Address, Env, String, Symbol, TryFromVal, Val,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -475,10 +475,14 @@ fn test_get_authorized_minters() {
     let user = Address::generate(&env);
     client.mint(&minter, &user, &10_0000000_i128);
 
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than the older indexable Vec
+    // of (address, topics, data) tuples.
     let events = env.events().all();
-    assert!(events.len() > 0);
-    let last = events.get(events.len() - 1).unwrap();
-    let topic0 = last.1.get_unchecked(0);
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "mint emitted no event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(&env, &body.topics[0]).unwrap();
     let name = Symbol::try_from_val(&env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&env, "mint"));
 }

@@ -1,9 +1,10 @@
 use super::*;
 use soroban_sdk::{
     contract, contractimpl,
+    testutils::{Address as _, Events},
     testutils::{storage::Persistent as _, Address as _, Events},
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String, Symbol, TryFromVal,
+    Env, String, Symbol, TryFromVal, Val,
 };
 
 // Import sibling contracts for inter-contract testing
@@ -771,8 +772,14 @@ fn test_register_referral_emits_event() {
     let no_ref: Option<Address> = None;
     t.client
         .register_referral(&user, &String::from_str(&t.env, "Alice"), &no_ref);
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than an indexable Vec of
+    // (address, topics, data) tuples.
     let events = t.env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let name = Symbol::try_from_val(&t.env, &last.1.get_unchecked(0)).unwrap();
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "register_referral emitted no event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(&t.env, &body.topics[0]).unwrap();
+    let name = Symbol::try_from_val(&t.env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&t.env, "referral_registered"));
 }

@@ -1,4 +1,4 @@
-﻿{
+{
   "generators": {
     "address": 7,
     "nonce": 0,
@@ -151,7 +151,7 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-              "function_name": "set_token",
+              "function_name": "set_token_contract",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -299,7 +299,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -318,7 +318,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -348,7 +348,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -367,7 +367,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -397,7 +397,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -416,7 +416,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -446,7 +446,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -465,7 +465,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -495,7 +495,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -514,7 +514,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -544,7 +544,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -563,7 +563,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -593,7 +593,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -612,7 +612,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -642,7 +642,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -661,7 +661,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -691,7 +691,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -710,7 +710,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -740,7 +740,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -759,7 +759,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -789,7 +789,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -808,7 +808,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -838,7 +838,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -857,7 +857,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -887,7 +887,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -906,7 +906,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -936,7 +936,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -955,7 +955,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -985,7 +985,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -1004,7 +1004,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -1034,7 +1034,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -1053,7 +1053,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -1083,7 +1083,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -1102,7 +1102,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -1132,7 +1132,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -1151,7 +1151,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -1181,7 +1181,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -1200,7 +1200,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -1230,7 +1230,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000000"
+                  "i128": "110000000"
                 }
               ]
             }
@@ -1249,7 +1249,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000000"
+                      "i128": "110000000"
                     }
                   ]
                 }
@@ -1721,6 +1721,30 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "MinPoints"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "MinSlot"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "ReferralContract"
                           }
                         ]
@@ -1760,7 +1784,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1890,7 +1914,7 @@
                       "symbol": "gross"
                     },
                     "val": {
-                      "i128": "200000000"
+                      "i128": "2200000000"
                     }
                   },
                   {
@@ -1906,7 +1930,7 @@
                       "symbol": "net"
                     },
                     "val": {
-                      "i128": "196000000"
+                      "i128": "2156000000"
                     }
                   }
                 ]
@@ -2118,7 +2142,7 @@
                       "symbol": "total_yes"
                     },
                     "val": {
-                      "i128": "196000000"
+                      "i128": "2156000000"
                     }
                   }
                 ]
@@ -2153,7 +2177,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "4000000"
+                        "i128": "44000000"
                       }
                     },
                     {
@@ -2730,7 +2754,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "200000000"
+                      "i128": "2200000000"
                     }
                   },
                   {
@@ -2782,7 +2806,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "99800000000"
+                      "i128": "97800000000"
                     }
                   },
                   {
@@ -2924,7 +2948,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       }
     ]
   },

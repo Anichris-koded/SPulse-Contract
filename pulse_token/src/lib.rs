@@ -286,19 +286,14 @@ impl PULSETokenContract {
         if !is_minter {
             return Err(TokenError::UnauthorizedMinter);
         }
-        let balance = Self::balance(env.clone(), to.clone());
-        let to_key = DataKey::Balance(to.clone());
-        env.storage()
-            .persistent()
-            .set(&to_key, &(balance + amount));
-        env.storage()
-            .persistent()
-            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);        let supply: i128 = env
+        // Issue #79: enforce supply cap BEFORE any state change.
+        // Check must happen first — if cap is exceeded, no balance or
+        // supply should be modified.
+        let supply: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
-        // Issue #79: enforce supply cap — prevents unbounded PULSE inflation.
         let cap: i128 = env
             .storage()
             .instance()
@@ -307,6 +302,15 @@ impl PULSETokenContract {
         if cap > 0 && supply + amount > cap {
             return Err(TokenError::SupplyCapExceeded);
         }
+        // Cap OK — now apply state changes.
+        let balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
+        env.storage()
+            .persistent()
+            .set(&to_key, &(balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
         env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
         env.events().publish(
             (Symbol::new(&env, "mint"), minter, to),

@@ -742,6 +742,90 @@ fn test_view_functions_work_while_paused() {
     assert!(t.client.is_registered(&user));
 }
 
+// ── Issue #78: legacy key migration ───────────────────────────────────────────
+
+#[test]
+fn test_migrate_user_writes_profile_removes_legacy() {
+    let t = setup();
+    let legacy_user = Address::generate(&t.env);
+    let legacy_ref = Address::generate(&t.env);
+
+    // Simulate a pre-upgrade registration by writing OLD keys directly
+    t.env.as_contract(&t.referral_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Registered(legacy_user.clone()), &true);
+        t.env.storage().persistent().set(
+            &DataKey::DisplayName(legacy_user.clone()),
+            &String::from_str(&t.env, "OldTimer"),
+        );
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Referrer(legacy_user.clone()), &legacy_ref);
+    });
+
+    // Migrate
+    t.client.migrate_user(&t.admin, &legacy_user);
+
+    // Profile now exists
+    assert!(t.client.is_registered(&legacy_user));
+    assert_eq!(
+        t.client.get_display_name(&legacy_user),
+        String::from_str(&t.env, "OldTimer")
+    );
+    assert_eq!(t.client.get_referrer(&legacy_user), Some(legacy_ref.clone()));
+
+    // Legacy keys removed
+    let legacy_removed = t.env.as_contract(&t.referral_id, || {
+        !t.env
+            .storage()
+            .persistent()
+            .has(&DataKey::Registered(legacy_user.clone()))
+            && !t.env
+                .storage()
+                .persistent()
+                .has(&DataKey::DisplayName(legacy_user.clone()))
+                && !t.env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::Referrer(legacy_user))
+    });
+    assert!(legacy_removed);
+}
+
+#[test]
+fn test_migrate_user_noop_if_already_migrated() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    // Already has a Profile key — migration should be a no-op
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "NewUser"),
+                referrer: None,
+            },
+        );
+    });
+
+    // Should succeed silently (no-op)
+    t.client.migrate_user(&t.admin, &user);
+    assert_eq!(
+        t.client.get_display_name(&user),
+        String::from_str(&t.env, "NewUser")
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_migrate_user_rejects_non_admin() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let not_admin = Address::generate(&t.env);
+    t.client.migrate_user(&not_admin, &user);
 #[test]
 fn test_register_and_refresh_extend_referrer_ttl() {
     let t = setup();

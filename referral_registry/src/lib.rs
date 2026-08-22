@@ -331,6 +331,71 @@ impl ReferralRegistryContract {
         }
     }
 
+    /// Issue #78: Admin-callable legacy migration. Reads old Registered/DisplayName/Referrer keys,
+    /// writes the packed Profile entry, and removes the legacy keys. Idempotent — no-op if
+    /// Profile already exists.
+    pub fn migrate_user(env: Env, admin: Address, user: Address) -> Result<(), ReferralError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap();
+        if admin != stored_admin {
+            return Err(ReferralError::NotAdmin);
+        }
+        admin.require_auth();
+        // Already migrated — Profile exists, nothing to do
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Profile(user.clone()))
+        {
+            return Ok(());
+        }
+        // No legacy keys — nothing to migrate
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Registered(user.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let display_name: String = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisplayName(user.clone()))
+            .unwrap_or_else(|| String::from_str(&env, "user"));
+        let referrer: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Referrer(user.clone()));
+        // Write the packed profile
+        env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name,
+                referrer: referrer.clone(),
+            },
+        );
+        // If this user has a referrer, increment that referrer's count
+        if let Some(ref ref_addr) = referrer {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ReferralCount(ref_addr.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
+        }
+        // Remove legacy keys
+        env.storage().persistent().remove(&DataKey::Registered(user.clone()));
+        env.storage().persistent().remove(&DataKey::DisplayName(user.clone()));
+        env.storage().persistent().remove(&DataKey::Referrer(user));
+        Ok(())
+    }
+
     fn load_profile(env: &Env, user: &Address) -> Option<UserProfile> {
         if let Some(p) = env
             .storage()

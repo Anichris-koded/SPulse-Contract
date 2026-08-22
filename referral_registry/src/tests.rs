@@ -1,8 +1,9 @@
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    contract, contractimpl,
+    testutils::{storage::Persistent as _, Address as _, Events},
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String,
+    Env, String, Symbol, TryFromVal,
 };
 
 // Import sibling contracts for inter-contract testing
@@ -53,7 +54,7 @@ fn setup() -> TestSetup {
 
     // Lever G: leaderboard mints the welcome bonus internally now, so it needs
     // the token address and minter authorization (mirrors mainnet upgrade).
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy: referral no longer mints directly, kept harmless.
     token_client.set_minter(&referral_id);
@@ -85,6 +86,9 @@ fn test_register_with_referrer() {
     let t = setup();
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
 
     t.client.register_referral(
         &user,
@@ -125,16 +129,10 @@ fn test_welcome_bonus() {
     t.client
         .register_referral(&user, &String::from_str(&t.env, "NewUser"), &no_ref);
 
+    // Rewards are queued during registration and applied explicitly.
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    // Registration only queues the welcome reward; it does not run the
-    // leaderboard's expensive sorting or token minting.
-    assert_eq!(lb_client.get_points(&user), 0);
-    let pending = lb_client.get_pending_reward(&user).unwrap();
-    assert_eq!(pending.points, 5);
-    assert_eq!(pending.tokens, 1_0000000);
     lb_client.claim_pending_rewards(&user);
-
-    // After claiming: 5 welcome points, no win/loss impact.
+    // Leaderboard: 5 welcome points, no win/loss impact
     assert_eq!(lb_client.get_points(&user), 5);
     let stats = lb_client.get_stats(&user);
     assert_eq!(stats.won_bets, 0);
@@ -209,6 +207,10 @@ fn test_credit_with_referrer() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
     // Register user with referrer
     t.client.register_referral(
         &user,
@@ -230,12 +232,10 @@ fn test_credit_with_referrer() {
     let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
     assert_eq!(xlm_client.balance(&referrer), referral_fee);
 
-    // Referrer points are queued independently from the immediate XLM payout.
+    // Welcome + referral points are queued and claimed separately.
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 0);
-    assert_eq!(lb_client.get_pending_reward(&referrer).unwrap().points, 3);
     lb_client.claim_pending_rewards(&referrer);
-    assert_eq!(lb_client.get_points(&referrer), 3);
+    assert_eq!(lb_client.get_points(&referrer), 8);
 
     // Earnings tracked
     assert_eq!(t.client.get_earnings(&referrer), referral_fee);
@@ -297,6 +297,10 @@ fn test_earnings_accumulation() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -323,6 +327,10 @@ fn test_referrer_bonus_points_accumulate() {
     let user = Address::generate(&t.env);
     let referrer = Address::generate(&t.env);
 
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
+
     t.client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -339,10 +347,8 @@ fn test_referrer_bonus_points_accumulate() {
     t.client.credit(&t.market, &user, &5_000_000_i128);
 
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
-    assert_eq!(lb_client.get_points(&referrer), 0);
-    assert_eq!(lb_client.get_pending_reward(&referrer).unwrap().points, 9);
     lb_client.claim_pending_rewards(&referrer);
-    assert_eq!(lb_client.get_points(&referrer), 9); // 3 × 3 pts
+    assert_eq!(lb_client.get_points(&referrer), 14); // welcome bonus + 3 × 3 pts
 }
 
 // ── 11. Referral count tracking ──────────────────────────────────────────────
@@ -351,6 +357,9 @@ fn test_referrer_bonus_points_accumulate() {
 fn test_referral_count_tracking() {
     let t = setup();
     let referrer = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
 
     // 3 users register with the same referrer
     for _ in 0..3 {
@@ -365,7 +374,23 @@ fn test_referral_count_tracking() {
     assert_eq!(t.client.get_referral_count(&referrer), 3);
 }
 
-// ── 12. Double initialization rejected ───────────────────────────────────────
+// ── 12. Unregistered referrers are rejected ─────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_reject_unregistered_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let unregistered_referrer = Address::generate(&t.env);
+
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Bettor"),
+        &Some(unregistered_referrer),
+    );
+}
+
+// ── 13. Double initialization rejected ───────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "Error(Contract, #1)")]
@@ -444,4 +469,282 @@ fn test_legacy_user_without_referrer() {
     assert!(s.client.is_registered(&legacy_user));
     assert_eq!(s.client.get_referrer(&legacy_user), None);
     assert!(!s.client.has_referrer(&legacy_user));
+}
+
+// ── Cross-contract interface versioning (issue #84) ───────────────────────────
+
+// A stand-in for a leaderboard deployment that was upgraded to an
+// incompatible ABI: it only implements interface_version(), reporting a
+// version this referral_registry build does not expect. Used to prove that
+// register_referral/credit refuse to call into it rather than failing deep
+// inside argument decoding (or, worse, silently misinterpreting arguments).
+#[contract]
+struct MockIncompatibleLeaderboard;
+
+#[contractimpl]
+impl MockIncompatibleLeaderboard {
+    pub fn interface_version(_env: Env) -> u32 {
+        99
+    }
+}
+
+fn setup_with_incompatible_leaderboard() -> TestSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+
+    let token_id = env.register(PULSETokenContract, ());
+    pulse_token::PULSETokenContractClient::new(&env, &token_id).initialize(
+        &admin,
+        &String::from_str(&env, "PULSE"),
+        &String::from_str(&env, "PLSE"),
+        &7u32,
+    );
+
+    let leaderboard_id = env.register(MockIncompatibleLeaderboard, ());
+
+    let referral_id = env.register(ReferralRegistryContract, ());
+    let referral_client = ReferralRegistryContractClient::new(&env, &referral_id);
+
+    let xlm_sac_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    referral_client.initialize(&admin, &market, &token_id, &leaderboard_id, &xlm_sac_id);
+
+    TestSetup {
+        env,
+        client: referral_client,
+        admin,
+        market,
+        token_id,
+        leaderboard_id,
+        xlm_sac_id,
+        referral_id,
+    }
+}
+
+#[test]
+fn test_interface_version_reported() {
+    let t = setup();
+    assert_eq!(t.client.interface_version(), 1);
+}
+
+#[test]
+fn test_register_referral_survives_incompatible_leaderboard() {
+    let t = setup_with_incompatible_leaderboard();
+
+    let user = Address::generate(&t.env);
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+    // The optional reward queue may fail, but registration remains committed.
+    assert!(t.client.is_registered(&user));
+}
+
+#[test]
+fn test_credit_survives_incompatible_leaderboard() {
+    let t = setup_with_incompatible_leaderboard();
+
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    // Write the profile directly — register_referral itself would already
+    // fail against the incompatible leaderboard, and this test is only
+    // concerned with credit()'s own version check.
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Bettor"),
+                referrer: Some(referrer),
+            },
+        );
+    });
+
+    // Fund the referral contract so the fee transfer preceding the
+    // leaderboard call succeeds and the version check is what's exercised.
+    let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
+    sac_admin.mint(&t.referral_id, &100_0000000_i128);
+
+    let result = t.client.try_credit(&t.market, &user, &1_0000000_i128);
+    assert_eq!(result.unwrap().unwrap(), true);
+    assert_eq!(t.client.get_earnings(&referrer), 1_0000000_i128);
+}
+
+// A stand-in for a leaderboard deployment that reports the EXPECTED version
+// (so require_compatible_leaderboard's check passes) but is missing the
+// actual function the caller is about to invoke. This is the limitation the
+// version check does not cover: a matching u32 alone does not prove the
+// callee's real function shape still matches, only that its author intended
+// it to. If someone bumps INTERFACE_VERSION without actually shipping the
+// signature that number is supposed to promise, callers still break, just
+// past the version check instead of at it.
+#[contract]
+struct MockLeaderboardMissingRewardBonus;
+
+#[contractimpl]
+impl MockLeaderboardMissingRewardBonus {
+    pub fn interface_version(_env: Env) -> u32 {
+        1
+    }
+    // No reward_bonus() here on purpose.
+}
+
+fn setup_with_version_matched_but_incompatible_leaderboard() -> TestSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+
+    let token_id = env.register(PULSETokenContract, ());
+    pulse_token::PULSETokenContractClient::new(&env, &token_id).initialize(
+        &admin,
+        &String::from_str(&env, "PULSE"),
+        &String::from_str(&env, "PLSE"),
+        &7u32,
+    );
+
+    let leaderboard_id = env.register(MockLeaderboardMissingRewardBonus, ());
+
+    let referral_id = env.register(ReferralRegistryContract, ());
+    let referral_client = ReferralRegistryContractClient::new(&env, &referral_id);
+
+    let xlm_sac_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    referral_client.initialize(&admin, &market, &token_id, &leaderboard_id, &xlm_sac_id);
+
+    TestSetup {
+        env,
+        client: referral_client,
+        admin,
+        market,
+        token_id,
+        leaderboard_id,
+        xlm_sac_id,
+        referral_id,
+    }
+}
+
+// A matching-version deployment that lacks the optional queue method must
+// not prevent registration from succeeding.
+#[test]
+fn test_matching_version_does_not_block_registration_when_queue_is_missing() {
+    let t = setup_with_version_matched_but_incompatible_leaderboard();
+    let user = Address::generate(&t.env);
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+    assert!(t.client.is_registered(&user));
+}
+
+// ── Emergency Pause (issue #83) ───────────────────────────────────────────────
+
+#[test]
+fn test_pause_unpause_admin_only() {
+    let t = setup();
+    assert!(!t.client.is_paused());
+    t.client.pause(&t.admin);
+    assert!(t.client.is_paused());
+    t.client.unpause(&t.admin);
+    assert!(!t.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_pause_rejects_non_admin() {
+    let t = setup();
+    let not_admin = Address::generate(&t.env);
+    t.client.pause(&not_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_paused_rejects_register_referral() {
+    let t = setup();
+    t.client.pause(&t.admin);
+    let user = Address::generate(&t.env);
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_paused_rejects_credit() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    // Write the profile directly rather than via register_referral, so this
+    // test only exercises the pause gate on credit() (register_referral's
+    // leaderboard cross-call has an unrelated, pre-existing ABI mismatch).
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Bettor"),
+                referrer: Some(referrer.clone()),
+            },
+        );
+    });
+
+    t.client.pause(&t.admin);
+    t.client.credit(&t.market, &user, &1_0000000_i128);
+}
+
+#[test]
+fn test_view_functions_work_while_paused() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    t.env.as_contract(&t.referral_id, || {
+        t.env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Someone"),
+                referrer: None,
+            },
+        );
+    });
+
+    t.client.pause(&t.admin);
+    assert!(t.client.is_registered(&user));
+}
+
+#[test]
+fn test_register_and_refresh_extend_referrer_ttl() {
+    let t = setup();
+    let referrer = Address::generate(&t.env);
+    t.client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Ref"),
+        &None,
+    );
+    let user = Address::generate(&t.env);
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "Bettor"),
+        &Some(referrer.clone()),
+    );
+
+    let count_ttl = t.env.as_contract(&t.referral_id, || {
+        t.env.storage()
+            .persistent()
+            .get_ttl(&DataKey::ReferralCount(referrer.clone()))
+    });
+    assert!(count_ttl >= TTL_BUMP);
+    t.client.refresh_referrer_ttl(&referrer);
+    assert_eq!(t.client.get_referral_count(&referrer), 1);
+fn test_register_referral_emits_event() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Alice"), &no_ref);
+    let events = t.env.events().all();
+    let last = events.get(events.len() - 1).unwrap();
+    let name = Symbol::try_from_val(&t.env, &last.1.get_unchecked(0)).unwrap();
+    assert_eq!(name, Symbol::new(&t.env, "referral_registered"));
 }

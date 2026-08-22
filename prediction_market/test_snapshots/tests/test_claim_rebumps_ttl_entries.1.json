@@ -151,7 +151,7 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-              "function_name": "set_token",
+              "function_name": "set_token_contract",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -882,6 +882,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "total_bets"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "won_bets"
                     },
                     "val": {
@@ -1015,7 +1023,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "30"
+                        "u64": "0"
                       }
                     },
                     {
@@ -1073,7 +1081,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6000200
+        "live_until": 12307301
       },
       {
         "entry": {
@@ -1441,6 +1449,36 @@
           "ext": "v0"
         },
         "live_until": 12307301
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Payout"
+                  },
+                  {
+                    "u64": "1"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "i128": "980000000"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307301
       },
       {
         "entry": {
@@ -1877,7 +1915,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 12307301
       }
     ]
   },

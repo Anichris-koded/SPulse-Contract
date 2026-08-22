@@ -924,6 +924,52 @@ fn test_cancel_refund_double_claim_rejected() {
     t.client.cancel_refund(&user, &id); // should fail: NoBetFound (gross zeroed)
 }
 
+// ── Issue #58: cancel_refund zeroes net and decrements market totals ─────────
+
+#[test]
+fn test_cancel_refund_clears_net_and_market_totals() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+
+    // Alice bets YES 100 XLM → net = 100 * 9800/10000 = 98 XLM
+    // Bob   bets NO  50 XLM  → net = 50  * 9800/10000 = 49 XLM
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &50_0000000_i128);
+
+    let market_before = t.client.get_market(&id);
+    assert_eq!(market_before.total_yes, 98_0000000);
+    assert_eq!(market_before.total_no, 49_0000000);
+
+    // Confirm get_bet reports staked net before cancel
+    let alice_bet_before = t.client.get_bet(&id, &alice);
+    assert_eq!(alice_bet_before.amount, 98_0000000);
+
+    // Cancel the market then refund both bettors
+    t.client.cancel_market(&t.admin, &id);
+    t.client.cancel_refund(&alice, &id);
+    t.client.cancel_refund(&bob, &id);
+
+    // Issue #58 fix: get_bet must return amount == 0 after refund
+    let alice_bet_after = t.client.get_bet(&id, &alice);
+    assert_eq!(alice_bet_after.amount, 0, "net should be zeroed after cancel_refund");
+
+    let bob_bet_after = t.client.get_bet(&id, &bob);
+    assert_eq!(bob_bet_after.amount, 0, "net should be zeroed after cancel_refund");
+
+    // Issue #58 fix: market totals must be decremented to 0 after all refunds
+    let market_after = t.client.get_market(&id);
+    assert_eq!(market_after.total_yes, 0, "total_yes should be 0 after alice's refund");
+    assert_eq!(market_after.total_no, 0, "total_no should be 0 after bob's refund");
+
+    // Gross is still zeroed (idempotency guard unchanged)
+    assert_eq!(t.client.get_bet_gross(&id, &alice), 0);
+    assert_eq!(t.client.get_bet_gross(&id, &bob), 0);
+}
+
 // ── 19. cancel_refund on non-cancelled market rejected ────────────────────────
 
 #[test]
@@ -2308,11 +2354,26 @@ fn test_interface_version_reported() {
 #[should_panic(expected = "Error(Contract, #36)")]
 fn test_place_bet_rejects_incompatible_referral() {
     let t = setup();
-    let id = create_test_market(&t);
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
 
+    // Apply the incompatible referral first (through the timelock) so the
+    // market created below is bet against while still live.
+    let fake_referral = t.env.register(MockIncompatibleDependency, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &fake_referral,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_CHANGE_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
+
+    let id = create_test_market(&t);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     advance_ledgers(&t.env, 6_000_000);
 
     let market_contract = t.client.address.clone();
@@ -2390,6 +2451,8 @@ fn test_claim_survives_incompatible_leaderboard() {
         &fake_leaderboard,
         &cfg.xlm_sac,
     );
+    advance_time(&t.env, CONFIG_CHANGE_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
 
     t.client.claim(&user, &id);
     assert!(t.client.get_bet(&id, &user).claimed);
@@ -2433,6 +2496,8 @@ fn test_matching_version_does_not_block_claim_when_queue_is_missing() {
         &fake_leaderboard,
         &cfg.xlm_sac,
     );
+    advance_time(&t.env, CONFIG_CHANGE_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
 
     // The optional queue call fails, but claim state and the XLM payout remain
     // successful because the failure is intentionally ignored.
@@ -2624,6 +2689,72 @@ fn test_cancel_withdrawal_request_still_works_while_paused() {
     assert!(t.client.get_pending_withdrawal(&recipient).is_none());
 }
 
+// ── Timelocked config changes (issue #93) ───────────────────────────────────
+//
+// set_config no longer re-points the market to arbitrary addresses instantly.
+// It stages the change, which only lands after CONFIG_CHANGE_DELAY_SECS via
+// execute_set_config, and can be cancelled before it matures. This gives
+// off-chain monitors time to detect a malicious redirect and the admin time to
+// reverse it.
+
+#[test]
+fn test_set_config_is_timelocked() {
+    let t = setup();
+    let new_token = Address::generate(&t.env);
+    let new_referral = Address::generate(&t.env);
+    let new_leaderboard = Address::generate(&t.env);
+    let new_xlm = Address::generate(&t.env);
+
+    let before = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &new_token,
+        &new_referral,
+        &new_leaderboard,
+        &new_xlm,
+    );
+
+    // Staged but NOT applied yet.
+    assert_eq!(t.client.get_config(), before);
+    let pending = t.client.get_pending_config().unwrap();
+    assert_eq!(pending.token, new_token);
+    assert_eq!(pending.pending_at, t.env.ledger().timestamp());
+
+    // After the delay it lands.
+    advance_time(&t.env, CONFIG_CHANGE_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
+
+    let after = t.client.get_config();
+    assert_eq!(after.token, new_token);
+    assert_eq!(after.referral, new_referral);
+    assert_eq!(after.leaderboard, new_leaderboard);
+    assert_eq!(after.xlm_sac, new_xlm);
+    assert!(t.client.get_pending_config().is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_execute_set_config_before_delay_rejected() {
+    let t = setup();
+    let new_token = Address::generate(&t.env);
+    let new_referral = Address::generate(&t.env);
+    let new_leaderboard = Address::generate(&t.env);
+    let new_xlm = Address::generate(&t.env);
+    t.client.set_config(
+        &t.admin,
+        &new_token,
+        &new_referral,
+        &new_leaderboard,
+        &new_xlm,
+    );
+    // Too soon — the timelock has not matured.
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn test_execute_set_config_without_pending_rejected() {
+    let t = setup();
 // ═══════════════════════════════════════════════════════════════════════════
 // SECURITY REGRESSION — issue #51 (set_config pinning / governance)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2763,6 +2894,44 @@ fn test_set_config_multisig_requires_threshold() {
 }
 
 #[test]
+fn test_cancel_set_config_removes_pending() {
+    let t = setup();
+    let before = t.client.get_config();
+    let new_token = Address::generate(&t.env);
+    let new_referral = Address::generate(&t.env);
+    let new_leaderboard = Address::generate(&t.env);
+    let new_xlm = Address::generate(&t.env);
+    t.client.set_config(
+        &t.admin,
+        &new_token,
+        &new_referral,
+        &new_leaderboard,
+        &new_xlm,
+    );
+    assert!(t.client.get_pending_config().is_some());
+
+    t.client.cancel_set_config(&t.admin);
+
+    assert!(t.client.get_pending_config().is_none());
+    assert_eq!(t.client.get_config(), before);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_set_config_rejects_non_admin() {
+    let t = setup();
+    let rando = Address::generate(&t.env);
+    let new_token = Address::generate(&t.env);
+    let new_referral = Address::generate(&t.env);
+    let new_leaderboard = Address::generate(&t.env);
+    let new_xlm = Address::generate(&t.env);
+    t.client.set_config(
+        &rando,
+        &new_token,
+        &new_referral,
+        &new_leaderboard,
+        &new_xlm,
+    );
 fn test_set_config_multisig_execute_with_second_approval() {
     let t = setup();
     let g2 = Address::generate(&t.env);

@@ -1,6 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, token, vec, Address,
+    BytesN, Env, IntoVal, String, Symbol, Val, Vec,
     contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env, Executable,
     IntoVal, String, Symbol, Val, Vec,
 };
@@ -49,6 +51,12 @@ const WITHDRAW_DELAY_SECS: u64 = 86_400; // 24h timelock between request and pay
 const MAX_WITHDRAWAL_BPS: i128 = 2_000; // per-request cap: 20% of accumulated fees
 const CONFIG_DELAY_SECS: u64 = 86_400; // issue #51: dispute window before Config is live
 const MAX_GOVERNORS: u32 = 10;
+
+// Issue #93: config changes are staged and only take effect after this delay.
+// A compromised admin key can no longer redirect all fund flows instantly:
+// off-chain monitors get a window to detect the change (via the emitted
+// ConfigChangeStaged event) and the admin can cancel it before it lands.
+const CONFIG_CHANGE_DELAY_SECS: u64 = 86_400; // 24h timelock
 
 // TTL: ~1yr threshold, ~2yr extend (mainnet: ~1 ledger/5s)
 const TTL_BUMP: u32 = 3_153_600;
@@ -120,6 +128,13 @@ pub enum MarketError {
     /// ABI change (renamed function, changed argument order/count/type,
     /// changed return type) always increments INTERFACE_VERSION in the same
     /// commit. See EXPECTED_REFERRAL_INTERFACE_VERSION / EXPECTED_LEADERBOARD_INTERFACE_VERSION.
+    IncompatibleInterface = 28,
+    /// execute_set_config / cancel_set_config called without a staged config
+    /// change (issue #93).
+    NoPendingConfig = 29,
+    /// A staged config change has not yet matured past
+    /// CONFIG_CHANGE_DELAY_SECS (issue #93).
+    ConfigChangeTooSoon = 30,
     IncompatibleInterface = 36,
 }
 
@@ -130,6 +145,7 @@ pub enum DataKey {
     Admin,
     // Config addresses — all in instance storage (shared, cheap)
     Cfg, // single packed Config struct — 1 read instead of 5
+    PendingConfig, // staged, timelocked config change (issue #93)
     MarketCount,
     AccumulatedFees,
     Market(u64),
@@ -174,6 +190,27 @@ pub struct Config {
     pub xlm_sac: Address,
 }
 
+// ── Staged config change with a maturation timestamp (issue #93) ────────────
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingConfig {
+    pub token: Address,
+    pub referral: Address,
+    pub leaderboard: Address,
+    pub xlm_sac: Address,
+    pub pending_at: u64,
+}
+
+// Issue #93: emitted when set_config stages a change, so off-chain indexers
+// can alert on suspicious address redirects before the timelock matures.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChangeStaged {
+    pub pending_at: u64,
+    pub token: Address,
+    pub referral: Address,
+    pub leaderboard: Address,
+    pub xlm_sac: Address,
 // ── BetEntry: two-sided position + Gross + BetCount in one slot ────────────
 /// WASM hashes (or the SAC sentinel) pinned for each Config role.
 #[contracttype]
@@ -344,6 +381,11 @@ impl PredictionMarketContract {
         Ok(())
     }
 
+    /// Stage a config change (token / referral / leaderboard / xlm_sac). Admin
+    /// only. The change does NOT take effect immediately: it must mature past
+    /// CONFIG_CHANGE_DELAY_SECS via execute_set_config, giving off-chain
+    /// monitors time to detect it (via the ConfigChangeStaged event) and the
+    /// admin time to cancel it with cancel_set_config (issue #93).
     /// Propose a Config change. Does **not** take effect immediately.
     ///
     /// Issue #51: live WASM hashes are read on-chain (not caller-supplied),
@@ -381,9 +423,52 @@ impl PredictionMarketContract {
                 xlm_sac,
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
+
+        let pending_at = env.ledger().timestamp();
+        let pending = PendingConfig {
+            token: token_contract,
+            referral: referral_contract,
+            leaderboard: leaderboard_contract,
+            xlm_sac,
+            pending_at,
+        };
+        env.storage().instance().set(&DataKey::PendingConfig, &pending);
+
+        ConfigChangeStaged {
+            pending_at,
+            token: pending.token.clone(),
+            referral: pending.referral.clone(),
+            leaderboard: pending.leaderboard.clone(),
+            xlm_sac: pending.xlm_sac.clone(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Apply a previously staged config change once its timelock has matured.
+    /// Admin only (issue #93).
+    pub fn execute_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+
+        let pending: PendingConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingConfig)
+            .ok_or(MarketError::NoPendingConfig)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.pending_at || now - pending.pending_at < CONFIG_CHANGE_DELAY_SECS {
+            return Err(MarketError::ConfigChangeTooSoon);
+        }
+
         env.storage().instance().set(
             &DataKey::Cfg,
             &Config {
+                token: pending.token,
+                referral: pending.referral,
+                leaderboard: pending.leaderboard,
+                xlm_sac: pending.xlm_sac,
                 token: token_contract.clone(),
                 referral: referral_contract.clone(),
                 leaderboard: leaderboard_contract.clone(),
@@ -490,9 +575,24 @@ impl PredictionMarketContract {
             (Symbol::new(&env, "cfg_can"), caller),
             1_u32,
         );
+        env.storage().instance().remove(&DataKey::PendingConfig);
         Ok(())
     }
 
+    /// Cancel a staged config change before it matures. Admin only (issue #93).
+    pub fn cancel_set_config(env: Env, admin: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if !env.storage().instance().has(&DataKey::PendingConfig) {
+            return Err(MarketError::NoPendingConfig);
+        }
+        env.storage().instance().remove(&DataKey::PendingConfig);
+        Ok(())
+    }
+
+    /// Read the currently staged (not yet effective) config change, if any.
+    pub fn get_pending_config(env: Env) -> Option<PendingConfig> {
+        env.storage().instance().get(&DataKey::PendingConfig)
     pub fn add_governor(env: Env, admin: Address, governor: Address) -> Result<(), MarketError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
@@ -1257,7 +1357,7 @@ impl PredictionMarketContract {
     pub fn cancel_refund(env: Env, user: Address, market_id: u64) -> Result<i128, MarketError> {
         user.require_auth();
 
-        let market = Self::load_market(&env, market_id)?;
+        let mut market = Self::load_market(&env, market_id)?;
         if !market.cancelled {
             return Err(MarketError::MarketNotCancelled);
         }
@@ -1275,9 +1375,24 @@ impl PredictionMarketContract {
         }
 
         let gross = entry.gross;
+        let net = entry.net;
+        // Issue #58: zero both gross (idempotency guard) and net so that
+        // get_bet no longer reports a staked amount after the refund.
         entry.gross = 0;
         entry.net = 0;
         env.storage().persistent().set(&bet_key, &entry);
+
+        // Issue #58: decrement market totals so total_yes/total_no reflect
+        // that this bet has been refunded. BetEntry already carries is_yes
+        // and net, so no storage-model change is required.
+        let mkt_key = DataKey::Market(market_id);
+        if entry.is_yes {
+            market.total_yes = market.total_yes.saturating_sub(net);
+        } else {
+            market.total_no = market.total_no.saturating_sub(net);
+        }
+        env.storage().persistent().set(&mkt_key, &market);
+
         // Read-time TTL refresh (issue #9): a refund must not be able to observe
         // an expired bet/market record — keep both alive so a user who returns
         // late to a cancelled market can still pull their refund.
@@ -1286,7 +1401,7 @@ impl PredictionMarketContract {
             .extend_ttl(&bet_key, TTL_BUMP, TTL_HIGH);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Market(market_id), TTL_BUMP, TTL_HIGH);
+            .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
         token::Client::new(&env, &cfg.xlm_sac).transfer(

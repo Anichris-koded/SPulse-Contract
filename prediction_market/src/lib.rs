@@ -1731,12 +1731,20 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        if amount > fees {
+        // Only earned fees may be scheduled; OpenFees backs refunds for
+        // unsettled markets and must remain unavailable.
+        let open_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenFees)
+            .unwrap_or(0);
+        let available = fees.saturating_sub(open_fees);
+        if amount > available {
             return Err(MarketError::WithdrawalTooLarge);
         }
         // Cap: a single request may take at most MAX_WITHDRAWAL_BPS of the
-        // accumulator, so even a compromised recipient cannot drain it fully.
-        let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+        // earned accumulator, so even a compromised recipient cannot drain it fully.
+        let cap = available * MAX_WITHDRAWAL_BPS / BPS_DENOM;
         if amount > cap {
             return Err(MarketError::WithdrawalTooLarge);
         }
@@ -1787,7 +1795,13 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0);
-        if acc_fees < req.amount {
+        let open_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenFees)
+            .unwrap_or(0);
+        let available = acc_fees.saturating_sub(open_fees);
+        if req.amount > available {
             return Err(MarketError::WithdrawalTooLarge);
         }
         acc_fees -= req.amount;

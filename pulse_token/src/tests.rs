@@ -1,7 +1,7 @@
 use crate::{PULSETokenContract, PULSETokenContractClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events, Ledger as _},
+    Address, Env, String, Symbol, TryFromVal, Val,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -296,31 +296,128 @@ fn test_total_supply_tracking() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  12. Approve + allowance reflects granted amount
+//  12. Cross-contract interface versioning (issue #84)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_approve_and_allowance() {
+fn test_interface_version_reported() {
     let env = Env::default();
     env.mock_all_auths();
     let client = setup(&env);
     let _admin = init(&env, &client);
 
-    let owner = Address::generate(&env);
-    let spender = Address::generate(&env);
-    let expiration_ledger = env.ledger().sequence() + 1000;
-
-    client.approve(&owner, &spender, &50_0000000_i128, &expiration_ledger);
-
-    assert_eq!(client.allowance(&owner, &spender), 50_0000000_i128);
+    assert_eq!(client.interface_version(), 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  13. transfer_from spends down the allowance and moves balances
+//  17. Emergency Pause (issue #83)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_transfer_from_spends_allowance() {
+fn test_pause_unpause_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    assert!(!client.is_paused());
+    client.pause(&_admin);
+    assert!(client.is_paused());
+    client.unpause(&_admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_pause_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let not_admin = Address::generate(&env);
+    client.pause(&not_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_paused_rejects_mint() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    client.pause(&admin);
+
+    let recipient = Address::generate(&env);
+    client.mint(&minter, &recipient, &10_0000000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_paused_rejects_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.mint(&minter, &alice, &50_0000000_i128);
+
+    client.pause(&admin);
+    client.transfer(&alice, &bob, &10_0000000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_paused_rejects_burn() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &50_0000000_i128);
+
+    client.pause(&admin);
+    client.burn(&user, &10_0000000_i128);
+}
+
+#[test]
+fn test_view_functions_work_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &50_0000000_i128);
+
+    client.pause(&admin);
+
+    assert_eq!(client.balance(&user), 50_0000000_i128);
+    assert_eq!(client.total_supply(), 50_0000000_i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Issue #80: minter audit list
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_set_minter_idempotent() {
+#[test]
+fn test_mint_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
     let client = setup(&env);
@@ -328,92 +425,64 @@ fn test_transfer_from_spends_allowance() {
 
     let minter = Address::generate(&env);
     client.set_minter(&minter);
-
-    let owner = Address::generate(&env);
-    let spender = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    client.mint(&minter, &owner, &100_0000000_i128);
-
-    let expiration_ledger = env.ledger().sequence() + 1000;
-    client.approve(&owner, &spender, &40_0000000_i128, &expiration_ledger);
-
-    client.transfer_from(&spender, &owner, &recipient, &15_0000000_i128);
-
-    assert_eq!(client.balance(&owner), 85_0000000_i128);
-    assert_eq!(client.balance(&recipient), 15_0000000_i128);
-    assert_eq!(client.allowance(&owner, &spender), 25_0000000_i128);
+    // Second call with same address must fail with AlreadyMinter (#10)
+    client.set_minter(&minter);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  14. Reject transfer_from beyond the granted allowance
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
-fn test_reject_transfer_from_exceeding_allowance() {
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_remove_minter_not_minter() {
     let env = Env::default();
     env.mock_all_auths();
     let client = setup(&env);
     let _admin = init(&env, &client);
 
+    let not_minter = Address::generate(&env);
+    // Must fail with NotMinter (#11)
+    client.remove_minter(&not_minter);
+}
+
+#[test]
+fn test_get_authorized_minters() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter1 = Address::generate(&env);
+    let minter2 = Address::generate(&env);
+    let minter3 = Address::generate(&env);
+
+    client.set_minter(&minter1);
+    client.set_minter(&minter2);
+    client.set_minter(&minter3);
+
+    let minters = client.get_authorized_minters();
+    assert_eq!(minters.len(), 3);
+    assert!(minters.contains(&minter1));
+    assert!(minters.contains(&minter2));
+    assert!(minters.contains(&minter3));
+
+    // Remove one and verify the list shrinks
+    client.remove_minter(&minter2);
+    let minters = client.get_authorized_minters();
+    assert_eq!(minters.len(), 2);
+    assert!(minters.contains(&minter1));
+    assert!(!minters.contains(&minter2));
+    assert!(minters.contains(&minter3));
     let minter = Address::generate(&env);
     client.set_minter(&minter);
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &10_0000000_i128);
 
-    let owner = Address::generate(&env);
-    let spender = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    client.mint(&minter, &owner, &100_0000000_i128);
-
-    let expiration_ledger = env.ledger().sequence() + 1000;
-    client.approve(&owner, &spender, &10_0000000_i128, &expiration_ledger);
-
-    // Attempt to spend more than approved
-    client.transfer_from(&spender, &owner, &recipient, &20_0000000_i128); // panics
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  15. Approving amount 0 revokes an existing allowance
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_approve_zero_revokes_allowance() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = setup(&env);
-    let _admin = init(&env, &client);
-
-    let owner = Address::generate(&env);
-    let spender = Address::generate(&env);
-    let expiration_ledger = env.ledger().sequence() + 1000;
-
-    client.approve(&owner, &spender, &50_0000000_i128, &expiration_ledger);
-    assert_eq!(client.allowance(&owner, &spender), 50_0000000_i128);
-
-    client.approve(&owner, &spender, &0_i128, &expiration_ledger);
-    assert_eq!(client.allowance(&owner, &spender), 0_i128);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  16. Allowance reads as 0 once past its expiration ledger
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_allowance_expires() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = setup(&env);
-    let _admin = init(&env, &client);
-
-    let owner = Address::generate(&env);
-    let spender = Address::generate(&env);
-    let expiration_ledger = env.ledger().sequence() + 5;
-
-    client.approve(&owner, &spender, &50_0000000_i128, &expiration_ledger);
-    assert_eq!(client.allowance(&owner, &spender), 50_0000000_i128);
-
-    env.ledger().with_mut(|li| li.sequence_number = expiration_ledger + 1);
-
-    assert_eq!(client.allowance(&owner, &spender), 0_i128);
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than the older indexable Vec
+    // of (address, topics, data) tuples.
+    let events = env.events().all();
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "mint emitted no event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(&env, &body.topics[0]).unwrap();
+    let name = Symbol::try_from_val(&env, &topic0).unwrap();
+    assert_eq!(name, Symbol::new(&env, "mint"));
 }

@@ -1,7 +1,7 @@
 use crate::{PULSETokenContract, PULSETokenContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger as _},
-    Address, Env, String, Symbol, TryFromVal,
+    Address, Env, String, Symbol, TryIntoVal,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -416,8 +416,6 @@ fn test_view_functions_work_while_paused() {
 #[test]
 #[should_panic(expected = "Error(Contract, #10)")]
 fn test_set_minter_idempotent() {
-#[test]
-fn test_mint_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
     let client = setup(&env);
@@ -470,15 +468,30 @@ fn test_get_authorized_minters() {
     assert!(minters.contains(&minter1));
     assert!(!minters.contains(&minter2));
     assert!(minters.contains(&minter3));
+}
+
+#[test]
+fn test_mint_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
     let minter = Address::generate(&env);
     client.set_minter(&minter);
     let user = Address::generate(&env);
     client.mint(&minter, &user, &10_0000000_i128);
 
     let events = env.events().all();
-    assert!(events.len() > 0);
-    let last = events.get(events.len() - 1).unwrap();
-    let topic0 = last.1.get_unchecked(0);
-    let name = Symbol::try_from_val(&env, &topic0).unwrap();
+    let last = events.events().last().unwrap();
+    let topics = match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.topics,
+    };
+    let name: Symbol = topics
+        .iter()
+        .next()
+        .unwrap()
+        .try_into_val(&env)
+        .unwrap();
     assert_eq!(name, Symbol::new(&env, "mint"));
 }

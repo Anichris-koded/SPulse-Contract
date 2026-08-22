@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryIntoVal};
 
 fn setup() -> (
     Env,
@@ -605,7 +605,16 @@ fn test_add_pts_emits_leaderboard_updated() {
     let user = Address::generate(&env);
     client.add_pts(&market, &user, &100_u64, &true);
     let events = env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let name = Symbol::try_from_val(&env, &last.1.get_unchecked(0)).unwrap();
+    let last = events.events().last().unwrap();
+    let topics = match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.topics,
+    };
+    let name: Symbol = topics
+        .iter()
+        .next()
+        .unwrap()
+        .try_into_val(&env)
+        .unwrap();
     assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }
+

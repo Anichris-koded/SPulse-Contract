@@ -241,7 +241,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(to.clone()), &(balance + amount));
         let supply: i128 = env
             .storage()
             .instance()
@@ -274,7 +273,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let to_balance = Self::balance(env.clone(), to.clone());
         let to_key = DataKey::Balance(to.clone());
         env.storage()
@@ -283,7 +281,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
             amount,
@@ -394,11 +391,10 @@ impl PULSETokenContract {
             .set(&to_key, &(to_balance + amount));
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Balance(from), TTL_BUMP, TTL_HIGH);
+            .extend_ttl(&DataKey::Balance(from.clone()), TTL_BUMP, TTL_HIGH);
         env.storage()
             .persistent()
             .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
             amount,
@@ -423,7 +419,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let supply: i128 = env
             .storage()
             .instance()

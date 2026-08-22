@@ -11,9 +11,6 @@ const REFERRAL_BET_POINTS: u64 = 3;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
-const TTL_BUMP: u32 = 3_153_600;
-const TTL_HIGH: u32 = 6_307_200;
-
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
 pub const INTERFACE_VERSION: u32 = 1;
@@ -200,12 +197,7 @@ impl ReferralRegistryContract {
         );
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Profile(user), TTL_BUMP, TTL_HIGH);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Profile(user.clone()),
-            TTL_BUMP,
-            TTL_HIGH,
-        );
+            .extend_ttl(&DataKey::Profile(user.clone()), TTL_BUMP, TTL_HIGH);
         // The referrer's counter is a DIFFERENT user's entry — update in place.
         if let Some(ref ref_addr) = referrer {
             let count: u32 = env
@@ -219,10 +211,6 @@ impl ReferralRegistryContract {
                 .set(&count_key, &(count + 1));
             env.storage()
                 .persistent()
-                .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::ReferralCount(ref_addr), TTL_BUMP, TTL_HIGH);
                 .extend_ttl(&count_key, TTL_BUMP, TTL_HIGH);
         }
 
@@ -295,21 +283,13 @@ impl ReferralRegistryContract {
                     .persistent()
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
-                let earn_key = DataKey::ReferralEarnings(ref_addr);
+                let earn_key = DataKey::ReferralEarnings(ref_addr.clone());
                 env.storage()
                     .persistent()
                     .set(&earn_key, &(earnings + referral_fee));
                 env.storage()
                     .persistent()
                     .extend_ttl(&earn_key, TTL_BUMP, TTL_HIGH);
-                env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr.clone()),
-                    &(earnings + referral_fee),
-                );
-                env.storage().persistent().extend_ttl(
-                    &DataKey::ReferralEarnings(ref_addr),
-                    TTL_BUMP,
-                    TTL_HIGH,
                 env.events().publish(
                     (Symbol::new(&env, "referral_credited"), user, ref_addr),
                     referral_fee,

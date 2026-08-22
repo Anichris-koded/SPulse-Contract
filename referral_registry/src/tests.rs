@@ -5,7 +5,7 @@ use soroban_sdk::{
     contract, contractimpl,
     testutils::Address as _,
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String, Symbol, TryFromVal,
+    Env, String, Symbol, TryIntoVal,
 };
 
 // Import sibling contracts for inter-contract testing
@@ -743,6 +743,9 @@ fn test_register_and_refresh_extend_referrer_ttl() {
     assert!(count_ttl >= TTL_BUMP);
     t.client.refresh_referrer_ttl(&referrer);
     assert_eq!(t.client.get_referral_count(&referrer), 1);
+}
+
+#[test]
 fn test_register_referral_emits_event() {
     let t = setup();
     let user = Address::generate(&t.env);
@@ -750,7 +753,15 @@ fn test_register_referral_emits_event() {
     t.client
         .register_referral(&user, &String::from_str(&t.env, "Alice"), &no_ref);
     let events = t.env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let name = Symbol::try_from_val(&t.env, &last.1.get_unchecked(0)).unwrap();
+    let last = events.events().last().unwrap();
+    let topics = match &last.body {
+        soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.topics,
+    };
+    let name: Symbol = topics
+        .iter()
+        .next()
+        .unwrap()
+        .try_into_val(&t.env)
+        .unwrap();
     assert_eq!(name, Symbol::new(&t.env, "referral_registered"));
 }

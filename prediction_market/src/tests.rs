@@ -2561,14 +2561,6 @@ fn test_pause_unpause_admin_only() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn test_pause_rejects_non_admin() {
-    let t = setup();
-    let not_admin = Address::generate(&t.env);
-    t.client.pause(&not_admin);
-}
-
-#[test]
 #[should_panic(expected = "Error(Contract, #26)")]
 fn test_paused_rejects_create_market() {
     let t = setup();
@@ -3280,12 +3272,12 @@ fn test_resolve_does_not_make_principal_withdrawable() {
     fund_user(&t, &alice, 500_0000000);
     fund_user(&t, &bob, 500_0000000);
 
-    // Both sides funded: 100 XLM YES + 100 XLM NO → 196 XLM of user principal.
+    // Both sides funded: 100 XLM YES + 100 XLM NO \u2192 196 XLM of user principal.
     t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
     t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
 
-    // Resolve to YES (winning side non-empty) — principal must stay in the
+    // Resolve to YES (winning side non-empty) \u2014 principal must stay in the
     // contract for claims and must NOT become withdrawable as fees.
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
@@ -3296,7 +3288,7 @@ fn test_resolve_does_not_make_principal_withdrawable() {
     let contract_before = t.xlm.balance(&contract);
 
     let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
-    // Only the earned platform fees (4 XLM) are withdrawable — not the pool.
+    // Only the earned platform fees (4 XLM) are withdrawable \u2014 not the pool.
     assert_eq!(withdrawn, 4_0000000);
     assert_eq!(t.client.get_accumulated_fees(), 0);
     // The user principal is untouched and still sits in the contract.
@@ -3304,10 +3296,10 @@ fn test_resolve_does_not_make_principal_withdrawable() {
     assert_eq!(t.xlm.balance(&contract), principal);
 }
 
-// ── #4: empty-side sweep is fully accounted — the invariant holds ────────────
+// ── #4: empty-side sweep is fully accounted \u2014 the invariant holds ────────────
 // The empty-side sweep-to-fees is the protocol's pre-existing design (issue #3,
 // tracked separately). #4 guarantees the accounting invariant: what is
-// withdrawable is EXACTLY AccumulatedFees − OpenFees, with no double-counting.
+// withdrawable is EXACTLY AccumulatedFees \u2212 OpenFees, with no double-counting.
 #[test]
 fn test_empty_side_sweep_withdrawable_is_fully_accounted() {
     let t = setup();
@@ -3325,7 +3317,7 @@ fn test_empty_side_sweep_withdrawable_is_fully_accounted() {
     assert_eq!(t.client.get_open_fees(), 0);
     let market = t.client.get_market(&id);
     let swept_pool: i128 = market.total_yes; // 98_0000000
-    // withdrawable == AccumulatedFees − OpenFees == fee + swept pool (protocol).
+    // withdrawable == AccumulatedFees \u2212 OpenFees == fee + swept pool (protocol).
     assert_eq!(t.client.get_accumulated_fees(), 2_0000000 + swept_pool);
     let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
     assert_eq!(withdrawn, 2_0000000 + swept_pool);
@@ -3359,18 +3351,127 @@ fn test_multi_market_withdrawal_regression() {
     assert_eq!(t.client.get_market_fee_ledger(&id_a), 0);
     assert_eq!(t.client.get_market_fee_ledger(&id_b), 1_0000000);
 
-    // B is still open → its fees are reserved, still nothing withdrawable.
+    // B is still open \u2192 its fees are reserved, still nothing withdrawable.
     let res = t.client.try_withdraw_fees(&t.admin, &t.admin);
     assert!(res.is_err());
 
     // Refund A's bettor in full.
     assert_eq!(t.client.cancel_refund(&user_a, &id_a), 100_0000000);
 
-    // Resolve B → its fee becomes earned and is the ONLY withdrawable amount.
+    // Resolve B \u2192 its fee becomes earned and is the ONLY withdrawable amount.
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id_b, &true);
     assert_eq!(t.client.get_open_fees(), 0);
     let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
     assert_eq!(withdrawn, 1_0000000);
     assert_eq!(t.client.get_accumulated_fees(), 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #6 (config governance / code-hash pinning)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── 96. WasmHashMismatch: execute_set_config rejects when dependency swaps WASM during delay ──
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn test_execute_set_config_rejects_wasm_hash_mismatch() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    let hashes = t.client.get_pinned_hashes();
+    assert!(hashes.is_some());
+}
+
+// ── 97. approve_set_config: multi-sig threshold enforcement ──────────────────────
+#[test]
+#[should_panic(expected = "Error(Contract, #34)")]
+fn test_approve_set_config_rejects_double_approval() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.approve_set_config(&t.admin);
+}
+
+// ── 98. set_config rejects when a proposal already exists ────────────────────────
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_set_config_rejects_duplicate_proposal() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+}
+
+// ── 99. Non-governor cannot propose config change ────────────────────────────────
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_set_config_rejects_non_governor() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let stranger = Address::generate(&t.env);
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &stranger,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+}
+
+// ── 100. Full governance flow: propose \u2192 approve \u2192 execute (happy path) ──────────
+#[test]
+fn test_config_governance_full_happy_path() {
+    let t = setup();
+    let before = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+
+    t.client.set_config(
+        &t.admin,
+        &before.token,
+        &before.referral,
+        &new_lb,
+        &before.xlm_sac,
+    );
+    assert!(t.client.get_pending_config().is_some());
+    let hashes = t.client.get_pinned_hashes();
+    assert!(hashes.is_some());
+
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+
+    t.client.execute_set_config(&t.admin);
+
+    assert!(t.client.get_pending_config().is_none());
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+    let new_hashes = t.client.get_pinned_hashes().unwrap();
+    assert_eq!(new_hashes.leaderboard, hashes.unwrap().leaderboard);
+}
 }

@@ -1,11 +1,10 @@
 use super::*;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _},
-    testutils::{Address as _, Events},
     contract, contractimpl,
-    testutils::Address as _,
+    testutils::{Address as _, Events},
+    testutils::{storage::Persistent as _, Address as _, Events},
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String, Symbol, TryFromVal,
+    Env, String, Symbol, TryFromVal, Val,
 };
 
 // Import sibling contracts for inter-contract testing
@@ -120,19 +119,30 @@ fn test_register_no_referrer() {
     assert!(!t.client.has_referrer(&user));
 }
 
-// ── 3. Welcome bonus: 5 pts + 1 PULSE on registration ─────────────────────
+// ── 3. Welcome bonus: 5 pts + 1 PULSE only when a referrer is provided ────────
 
 #[test]
 fn test_welcome_bonus() {
     let t = setup();
+    let referrer = Address::generate(&t.env);
     let user = Address::generate(&t.env);
 
+    // Register the referrer first (no bonus expected — no referrer provided)
     let no_ref: Option<Address> = None;
     t.client
-        .register_referral(&user, &String::from_str(&t.env, "NewUser"), &no_ref);
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
 
-    // Leaderboard: 5 welcome points, no win/loss impact
+    // Register user WITH the referrer — this should trigger the welcome bonus
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "NewUser"),
+        &Some(referrer.clone()),
+    );
+
+    // Rewards are queued during registration and applied explicitly.
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    lb_client.claim_pending_rewards(&user);
+    // Leaderboard: 5 welcome points, no win/loss impact
     assert_eq!(lb_client.get_points(&user), 5);
     let stats = lb_client.get_stats(&user);
     assert_eq!(stats.won_bets, 0);
@@ -141,6 +151,25 @@ fn test_welcome_bonus() {
     // Token: 1 PULSE (7 decimals)
     let tok_client = pulse_token::PULSETokenContractClient::new(&t.env, &t.token_id);
     assert_eq!(tok_client.balance(&user), 1_0000000);
+}
+
+// ── 3b. No welcome bonus when registering WITHOUT a referrer ──────────────────
+
+#[test]
+fn test_no_bonus_without_referrer() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Solo"), &no_ref);
+
+    // No bonus points, no PULSE minted
+    let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    assert_eq!(lb_client.get_points(&user), 0);
+
+    let tok_client = pulse_token::PULSETokenContractClient::new(&t.env, &t.token_id);
+    assert_eq!(tok_client.balance(&user), 0);
 }
 
 // ── 4. Reject self-referral ──────────────────────────────────────────────────
@@ -232,8 +261,9 @@ fn test_credit_with_referrer() {
     let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
     assert_eq!(xlm_client.balance(&referrer), referral_fee);
 
-    // Referrer got 3 leaderboard bonus points
+    // Welcome + referral points are queued and claimed separately.
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    lb_client.claim_pending_rewards(&referrer);
     assert_eq!(lb_client.get_points(&referrer), 8);
 
     // Earnings tracked
@@ -346,6 +376,7 @@ fn test_referrer_bonus_points_accumulate() {
     t.client.credit(&t.market, &user, &5_000_000_i128);
 
     let lb_client = leaderboard::LeaderboardContractClient::new(&t.env, &t.leaderboard_id);
+    lb_client.claim_pending_rewards(&referrer);
     assert_eq!(lb_client.get_points(&referrer), 14); // welcome bonus + 3 × 3 pts
 }
 
@@ -532,20 +563,18 @@ fn test_interface_version_reported() {
 }
 
 #[test]
-fn test_register_referral_rejects_incompatible_leaderboard() {
+fn test_register_referral_survives_incompatible_leaderboard() {
     let t = setup_with_incompatible_leaderboard();
 
     let user = Address::generate(&t.env);
-    let result =
-        t.client
-            .try_register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
-    assert_eq!(result.unwrap_err().unwrap(), ReferralError::IncompatibleInterface);
-    // The registration itself must not have partially applied.
-    assert!(!t.client.is_registered(&user));
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+    // The optional reward queue may fail, but registration remains committed.
+    assert!(t.client.is_registered(&user));
 }
 
 #[test]
-fn test_credit_rejects_incompatible_leaderboard() {
+fn test_credit_survives_incompatible_leaderboard() {
     let t = setup_with_incompatible_leaderboard();
 
     let user = Address::generate(&t.env);
@@ -569,7 +598,8 @@ fn test_credit_rejects_incompatible_leaderboard() {
     sac_admin.mint(&t.referral_id, &100_0000000_i128);
 
     let result = t.client.try_credit(&t.market, &user, &1_0000000_i128);
-    assert_eq!(result.unwrap_err().unwrap(), ReferralError::IncompatibleInterface);
+    assert_eq!(result.unwrap().unwrap(), true);
+    assert_eq!(t.client.get_earnings(&referrer), 1_0000000_i128);
 }
 
 // A stand-in for a leaderboard deployment that reports the EXPECTED version
@@ -630,22 +660,15 @@ fn setup_with_version_matched_but_incompatible_leaderboard() -> TestSetup {
     }
 }
 
-// Documents the known gap in issue #84's fix: a version match is not proof
-// of ABI compatibility. require_compatible_leaderboard happily passes here
-// (both sides report version 1), but the subsequent reward_bonus() call
-// still traps because the mock never implements it. The version check is a
-// best-effort signal, not a guarantee, unless every breaking ABI change is
-// disciplined about bumping INTERFACE_VERSION at the same time.
+// A matching-version deployment that lacks the optional queue method must
+// not prevent registration from succeeding.
 #[test]
-#[should_panic]
-fn test_matching_version_does_not_guarantee_call_succeeds() {
+fn test_matching_version_does_not_block_registration_when_queue_is_missing() {
     let t = setup_with_version_matched_but_incompatible_leaderboard();
     let user = Address::generate(&t.env);
-    // Passes require_compatible_leaderboard (version 1 == version 1), then
-    // panics inside the real reward_bonus() invoke_contract call because the
-    // function doesn't exist on the callee.
     t.client
         .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
+    assert!(t.client.is_registered(&user));
 }
 
 // ── Emergency Pause (issue #83) ───────────────────────────────────────────────
@@ -749,8 +772,14 @@ fn test_register_referral_emits_event() {
     let no_ref: Option<Address> = None;
     t.client
         .register_referral(&user, &String::from_str(&t.env, "Alice"), &no_ref);
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than an indexable Vec of
+    // (address, topics, data) tuples.
     let events = t.env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let name = Symbol::try_from_val(&t.env, &last.1.get_unchecked(0)).unwrap();
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "register_referral emitted no event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(&t.env, &body.topics[0]).unwrap();
+    let name = Symbol::try_from_val(&t.env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&t.env, "referral_registered"));
 }

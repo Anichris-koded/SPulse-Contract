@@ -115,7 +115,7 @@ pub enum MarketError {
     /// ABI change (renamed function, changed argument order/count/type,
     /// changed return type) always increments INTERFACE_VERSION in the same
     /// commit. See EXPECTED_REFERRAL_INTERFACE_VERSION / EXPECTED_LEADERBOARD_INTERFACE_VERSION.
-    IncompatibleInterface = 28,
+    IncompatibleInterface = 36,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -1171,10 +1171,12 @@ impl PredictionMarketContract {
             (LOSE_POINTS, LOSE_TOKENS)
         };
 
-        Self::require_compatible_leaderboard(&env, &cfg.leaderboard)?;
-        let _: Val = env.invoke_contract(
+        // Queue reward accounting as an optional side effect. A missing,
+        // paused, incompatible, or out-of-budget leaderboard must not roll
+        // back the already-completed claim and XLM payout.
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &cfg.leaderboard,
-            &Symbol::new(&env, "reward"),
+            &Symbol::new(&env, "queue_reward"),
             vec![
                 &env,
                 this.clone().into_val(&env),

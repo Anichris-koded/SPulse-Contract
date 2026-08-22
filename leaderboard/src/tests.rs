@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal, Val};
 
 fn setup() -> (
     Env,
@@ -44,6 +44,29 @@ fn test_accumulate_points() {
     client.add_pts(&market, &user, &30_u64, &false);
     client.add_pts(&market, &user, &20_u64, &true);
     assert_eq!(client.get_points(&user), 100);
+}
+
+#[test]
+fn test_pending_rewards_accumulate_until_claimed() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+
+    client.queue_reward(&market, &user, &30_u64, &0_i128, &true);
+    client.queue_reward(&market, &user, &10_u64, &0_i128, &false);
+
+    assert_eq!(client.get_points(&user), 0);
+    let pending = client.get_pending_reward(&user).unwrap();
+    assert_eq!(pending.points, 40);
+    assert_eq!(pending.won_delta, 1);
+    assert_eq!(pending.lost_delta, 1);
+    assert_eq!(pending.bet_delta, 2);
+
+    client.claim_pending_rewards(&user);
+    assert_eq!(client.get_points(&user), 40);
+    let stats = client.get_stats(&user);
+    assert_eq!(stats.won_bets, 1);
+    assert_eq!(stats.lost_bets, 1);
+    assert_eq!(client.get_pending_reward(&user), None);
 }
 
 #[test]
@@ -634,8 +657,14 @@ fn test_add_pts_emits_leaderboard_updated() {
     let (env, client, _admin, market, _referral) = setup();
     let user = Address::generate(&env);
     client.add_pts(&market, &user, &100_u64, &true);
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than an indexable Vec of
+    // (address, topics, data) tuples.
     let events = env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let name = Symbol::try_from_val(&env, &last.1.get_unchecked(0)).unwrap();
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "add_pts emitted no event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(&env, &body.topics[0]).unwrap();
+    let name = Symbol::try_from_val(&env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }

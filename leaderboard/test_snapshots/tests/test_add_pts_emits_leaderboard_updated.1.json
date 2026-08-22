@@ -140,6 +140,33 @@
               "key": {
                 "vec": [
                   {
+                    "symbol": "StatsEpoch"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 0
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307200
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
                     "symbol": "TopPlayerAt"
                   },
                   {
@@ -160,18 +187,18 @@
                   },
                   {
                     "key": {
-                      "symbol": "points"
+                      "symbol": "epoch"
                     },
                     "val": {
-                      "u64": "100"
+                      "u32": 0
                     }
                   },
                   {
                     "key": {
-                      "symbol": "seq"
+                      "symbol": "points"
                     },
                     "val": {
-                      "u64": "0"
+                      "u64": "100"
                     }
                   }
                 ]
@@ -257,7 +284,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "100"
+                        "u64": "0"
                       }
                     },
                     {
@@ -282,18 +309,6 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
-                            "symbol": "SeqCounter"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "u64": "1"
                       }
                     },
                     {

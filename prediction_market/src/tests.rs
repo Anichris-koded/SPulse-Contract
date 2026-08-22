@@ -820,6 +820,30 @@ fn test_execute_without_request() {
     t.client.execute_withdraw_fees(&rando);
 }
 
+// ── 27i. Recipient revoked during the timelock cannot execute (issue #12) ──────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_execute_rejected_after_fee_recipient_removed() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+
+    // Role revoked while the 24h timelock is still running.
+    t.client.remove_fee_recipient(&t.admin, &recipient);
+    advance_time(&t.env, WITHDRAW_DELAY_SECS);
+    t.client.execute_withdraw_fees(&recipient);
+}
+
 // ── 27h. Duplicate withdrawal requests are rejected (issue #12) ───────────────
 
 #[test]

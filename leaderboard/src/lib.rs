@@ -230,7 +230,7 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user.clone(), stats.points);
+        Self::maintain_ordered_top_index(&env, user.clone(), stats.points);
         // Instance storage (TopPlayerCount, MinPoints, MinSlot, Admin, etc.)
         // has its own TTL that is never bumped by persistent-key writes above —
         // refresh it on every write so the leaderboard's cached min survives.
@@ -291,7 +291,7 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user.clone(), stats.points);
+        Self::maintain_ordered_top_index(&env, user.clone(), stats.points);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
@@ -341,7 +341,7 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user.clone(), stats.points);
+        Self::maintain_ordered_top_index(&env, user.clone(), stats.points);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
@@ -404,7 +404,7 @@ impl LeaderboardContract {
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
         env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
 
-        Self::update_top_players(&env, user.clone(), stats.points);
+        Self::maintain_ordered_top_index(&env, user.clone(), stats.points);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         env.events().publish(
             (Symbol::new(&env, "leaderboard_updated"), user),
@@ -568,11 +568,21 @@ impl LeaderboardContract {
         }
     }
 
+    /// Write one entry into the forward and reverse indexes as one logical
+    /// operation. Every write path goes through this helper, so the slots
+    /// consumed by get_top_players are always kept in sync with lookups.
+    fn write_ordered_entry(env: &Env, slot: u32, entry: &PlayerEntry) {
+        let key = DataKey::TopPlayerAt(slot);
+        env.storage().persistent().set(&key, entry);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(entry.address.clone()), &slot);
+    }
+
     /// Bubbles a (possibly new) entry up from `slot` until the list is
     /// descending again. Forward and reverse indexes are always written
-    /// together so the pair cannot drift apart; TTL freshness is refreshed
-    /// at the owner-touch points (insert / update / eviction) instead of
-    /// per swap, to keep the write footprint bounded.
+    /// together; TTL freshness is refreshed at the owner-touch points
+    /// (insert / update / eviction) instead of per swap.
     fn bubble_up(env: &Env, entry: &PlayerEntry, mut slot: u32) {
         while slot > 0 {
             let prev: Option<PlayerEntry> =
@@ -584,18 +594,8 @@ impl LeaderboardContract {
                     // and a bubble can rewrite dozens of slots in one call.
                     // TTL freshness is maintained at the owner-touch points
                     // (insert / in-place update / eviction) instead.
-                    let key_hi = DataKey::TopPlayerAt(slot - 1);
-                    let key_lo = DataKey::TopPlayerAt(slot);
-                    env.storage().persistent().set(&key_hi, entry);
-                    env.storage().persistent().set(&key_lo, &prev);
-                    env.storage().persistent().set(
-                        &DataKey::TopPlayerSlot(entry.address.clone()),
-                        &(slot - 1),
-                    );
-                    env.storage().persistent().set(
-                        &DataKey::TopPlayerSlot(prev.address.clone()),
-                        &slot,
-                    );
+                    Self::write_ordered_entry(env, slot - 1, entry);
+                    Self::write_ordered_entry(env, slot, &prev);
                     slot -= 1;
                 }
                 // A missing entry above means the list has a TTL-expired hole;
@@ -614,8 +614,7 @@ impl LeaderboardContract {
             points,
         };
         let key = DataKey::TopPlayerAt(slot);
-        env.storage().persistent().set(&key, &entry);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(user.clone()), &slot);
+        Self::write_ordered_entry(env, slot, &entry);
         env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
         env.storage()
             .persistent()
@@ -678,9 +677,8 @@ impl LeaderboardContract {
         for slot in 0..n {
             let entry = entries.get(slot).unwrap();
             let key = DataKey::TopPlayerAt(slot);
-            env.storage().persistent().set(&key, &entry);
+            Self::write_ordered_entry(env, slot, &entry);
             env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
-            env.storage().persistent().set(&DataKey::TopPlayerSlot(entry.address.clone()), &slot);
             env.storage().persistent().extend_ttl(
                 &DataKey::TopPlayerSlot(entry.address.clone()),
                 TTL_BUMP,
@@ -701,13 +699,13 @@ impl LeaderboardContract {
         n
     }
 
-    fn update_top_players(env: &Env, user: Address, new_points: u64) {
+    fn maintain_ordered_top_index(env: &Env, user: Address, new_points: u64) {
         // Fast path: the user is already in the list — in-place update backed
         // by a validated reverse lookup (issue #67).
         if let Some((slot, mut entry)) = Self::top_slot_entry(env, &user) {
             entry.points = new_points;
             let key = DataKey::TopPlayerAt(slot);
-            env.storage().persistent().set(&key, &entry);
+            Self::write_ordered_entry(env, slot, &entry);
             env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
 
             Self::bubble_up(env, &entry, slot);
@@ -772,8 +770,7 @@ impl LeaderboardContract {
                     points: new_points,
                 };
                 let key = DataKey::TopPlayerAt(min_slot);
-                env.storage().persistent().set(&key, &new_entry);
-                env.storage().persistent().set(&DataKey::TopPlayerSlot(user.clone()), &min_slot);
+                Self::write_ordered_entry(env, min_slot, &new_entry);
                 env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
                 env.storage().persistent().extend_ttl(
                     &DataKey::TopPlayerSlot(user.clone()),

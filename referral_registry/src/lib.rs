@@ -11,9 +11,6 @@ const REFERRAL_BET_POINTS: u64 = 3;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
-const TTL_BUMP: u32 = 3_153_600;
-const TTL_HIGH: u32 = 6_307_200;
-
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
 pub const INTERFACE_VERSION: u32 = 1;
@@ -205,9 +202,6 @@ impl ReferralRegistryContract {
                 referrer: referrer.clone(),
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Profile(user), TTL_BUMP, TTL_HIGH);
         env.storage().persistent().extend_ttl(
             &DataKey::Profile(user.clone()),
             TTL_BUMP,
@@ -226,10 +220,6 @@ impl ReferralRegistryContract {
                 .set(&count_key, &(count + 1));
             env.storage()
                 .persistent()
-                .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::ReferralCount(ref_addr), TTL_BUMP, TTL_HIGH);
                 .extend_ttl(&count_key, TTL_BUMP, TTL_HIGH);
         }
 
@@ -239,10 +229,12 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
-        Self::require_compatible_leaderboard(&env, &leaderboard)?;
-        let _: Val = env.invoke_contract(
+        // Queue the welcome reward as an optional side effect. Registration
+        // remains successful if the leaderboard is paused, unavailable, or
+        // exceeds the remaining invocation budget.
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
+            &Symbol::new(&env, "queue_bonus_reward"),
             vec![
                 &env,
                 this.into_val(&env),
@@ -286,15 +278,17 @@ impl ReferralRegistryContract {
                     .instance()
                     .get(&DataKey::LeaderboardContract)
                     .unwrap();
-                Self::require_compatible_leaderboard(&env, &leaderboard)?;
-                let _: Val = env.invoke_contract(
+                // Queue points as an optional side effect. The XLM transfer
+                // and earnings update remain critical referral accounting.
+                let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
                     &leaderboard,
-                    &Symbol::new(&env, "add_bonus_pts"),
+                    &Symbol::new(&env, "queue_bonus_reward"),
                     vec![
                         &env,
                         env.current_contract_address().into_val(&env),
                         ref_addr.clone().into_val(&env),
                         REFERRAL_BET_POINTS.into_val(&env),
+                        0_i128.into_val(&env),
                     ],
                 );
                 let earnings: i128 = env
@@ -302,21 +296,13 @@ impl ReferralRegistryContract {
                     .persistent()
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
-                let earn_key = DataKey::ReferralEarnings(ref_addr);
+                let earn_key = DataKey::ReferralEarnings(ref_addr.clone());
                 env.storage()
                     .persistent()
                     .set(&earn_key, &(earnings + referral_fee));
                 env.storage()
                     .persistent()
                     .extend_ttl(&earn_key, TTL_BUMP, TTL_HIGH);
-                env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr.clone()),
-                    &(earnings + referral_fee),
-                );
-                env.storage().persistent().extend_ttl(
-                    &DataKey::ReferralEarnings(ref_addr),
-                    TTL_BUMP,
-                    TTL_HIGH,
                 env.events().publish(
                     (Symbol::new(&env, "referral_credited"), user, ref_addr),
                     referral_fee,

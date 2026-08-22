@@ -66,6 +66,9 @@ pub enum DataKey {
     MinPoints, // u64 — points of the weakest entry currently in the top list
     MinSlot,   // u32 — slot index of that weakest entry
     Paused,
+    // Pull-based reward queue (issue #86). Expensive sorting and token minting
+    // happen later in claim_pending_rewards, outside critical fund paths.
+    PendingReward(Address),
 }
 
 // OPT: PlayerEntry now embeds points directly (avoids a Stats read during sort)
@@ -87,7 +90,17 @@ pub struct PlayerStats {
     pub lost_bets: u32,
 }
 
-// Internal packed stats —
+// Pull-based pending reward. Fields accumulate so multiple rewards can be
+// claimed together without losing win/loss accounting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingReward {
+    pub points: u64,
+    pub tokens: i128,
+    pub won_delta: u32,
+    pub lost_delta: u32,
+    pub bet_delta: u32,
+}
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -187,6 +200,79 @@ impl LeaderboardContract {
         token: Address,
     ) -> Result<(), LeaderboardError> {
         Self::set_token_contract(env, admin, token)
+    }
+
+    // ── Pull-based reward flow (issue #86) ───────────────────────────────────
+
+    pub fn queue_reward(
+        env: Env,
+        caller: Address,
+        user: Address,
+        points: u64,
+        tokens: i128,
+        is_winner: bool,
+    ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
+        Self::require_market_contract(&env, &caller)?;
+        caller.require_auth();
+        Self::accumulate_pending(&env, &user, points, tokens, is_winner, false);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    pub fn queue_bonus_reward(
+        env: Env,
+        caller: Address,
+        user: Address,
+        points: u64,
+        tokens: i128,
+    ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
+        Self::require_referral_contract(&env, &caller)?;
+        caller.require_auth();
+        Self::accumulate_pending(&env, &user, points, tokens, false, true);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    /// Apply all pending points and mint tokens in a separate transaction.
+    /// Anyone may submit this; the stored rewards always belong to `user`.
+    pub fn claim_pending_rewards(env: Env, user: Address) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
+        let key = DataKey::PendingReward(user.clone());
+        let pending: PendingReward = match env.storage().persistent().get(&key) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        env.storage().persistent().remove(&key);
+
+        let mut stats: PlayerStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or(PlayerStats {
+                points: 0,
+                total_bets: 0,
+                won_bets: 0,
+                lost_bets: 0,
+            });
+        stats.points += pending.points;
+        stats.total_bets += pending.bet_delta;
+        stats.won_bets += pending.won_delta;
+        stats.lost_bets += pending.lost_delta;
+        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
+        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+        Self::update_top_players(&env, user.clone(), stats.points);
+
+        if pending.tokens > 0 {
+            Self::mint_reward(&env, &user, pending.tokens)?;
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    pub fn get_pending_reward(env: Env, user: Address) -> Option<PendingReward> {
+        env.storage().persistent().get(&DataKey::PendingReward(user))
     }
 
     pub fn add_pts(
@@ -294,7 +380,6 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user.clone(), tokens);
             Self::mint_reward(&env, &user, tokens)?;
         }
         env.events().publish(
@@ -334,7 +419,7 @@ impl LeaderboardContract {
                 total_bets: 0,
                 won_bets: 0,
                 lost_bets: 0,
-            });https://github.com/SPulse-Org/SPulse-Contract/pull/130/conflict?name=leaderboard%252Fsrc%252Flib.rs&ancestor_oid=7a7b4038a30cf18254c768dec1b0e925e99a2524&base_oid=0f8e07db85d70716277718fbad02702bff8b9c5b&head_oid=c7b44b6d2c85aa76e0a7a3edd62090eaf86845af
+            });
         stats.points += points;
         stats.total_bets += 1; // bonus awards count as activity
         env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
@@ -344,7 +429,6 @@ impl LeaderboardContract {
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
 
         if tokens > 0 {
-            Self::mint_pulse(&env, user.clone(), tokens);
             Self::mint_reward(&env, &user, tokens)?;
         }
         env.events().publish(
@@ -533,6 +617,40 @@ impl LeaderboardContract {
             );
         }
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+    }
+
+    fn accumulate_pending(
+        env: &Env,
+        user: &Address,
+        points: u64,
+        tokens: i128,
+        is_winner: bool,
+        is_bonus: bool,
+    ) {
+        let key = DataKey::PendingReward(user.clone());
+        let mut pending: PendingReward = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(PendingReward {
+                points: 0,
+                tokens: 0,
+                won_delta: 0,
+                lost_delta: 0,
+                bet_delta: 0,
+            });
+        pending.points += points;
+        pending.tokens += tokens;
+        pending.bet_delta += 1;
+        if !is_bonus {
+            if is_winner {
+                pending.won_delta += 1;
+            } else {
+                pending.lost_delta += 1;
+            }
+        }
+        env.storage().persistent().set(&key, &pending);
+        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
     }
 
     // ── Internal: maintain a persistent sorted top list ──────────────────────
@@ -826,13 +944,7 @@ impl LeaderboardContract {
         Ok(())
     }
 
-    fn mint_pulse(env: &Env, user: Address, amount: i128) {
-    // Issue #84: check pulse_token's reported ABI version before invoking
-    // mint(), so an incompatible token upgrade fails with a clear error
-    // instead of an opaque invoke_contract failure or, worse, a call that
-    // still type-checks against a changed signature and silently misbehaves.
-    // A matching version number alone does not prove the callee's shape is
-    // still compatible; see IncompatibleInterface's doc comment.
+    // Issue #84: check pulse_token's reported ABI version before invoking mint.
     fn require_compatible_token(env: &Env, token: &Address) -> Result<(), LeaderboardError> {
         let version: u32 =
             env.invoke_contract(token, &Symbol::new(env, "interface_version"), vec![env]);

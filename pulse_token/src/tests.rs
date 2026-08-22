@@ -716,3 +716,123 @@ fn test_balance_survives_beyond_original_ttl_and_supply_stays_consistent() {
     assert!(balance_ttl(&env, &client.address, &bob) >= TTL_BUMP);
     assert!(instance_ttl(&env, &client.address) >= TTL_BUMP);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #79 — supply cap prevents unbounded PULSE inflation
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_supply_cap_default_unlimited() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+    let minter = Address::generate(&env);
+    let alice = Address::generate(&env);
+    client.set_minter(&minter);
+
+    // Default cap is 0 (unlimited) — minting should work.
+    assert_eq!(client.get_supply_cap(), 0);
+    client.mint(&minter, &alice, &1_000_0000000_i128);
+    assert_eq!(client.total_supply(), 1_000_0000000_i128);
+}
+
+#[test]
+fn test_set_supply_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+    let minter = Address::generate(&env);
+    let alice = Address::generate(&env);
+    client.set_minter(&minter);
+
+    // Set cap to 100 PULSE.
+    client.set_supply_cap(&admin, &100_0000000_i128);
+    assert_eq!(client.get_supply_cap(), 100_0000000_i128);
+
+    // Mint 50 PULSE — should succeed.
+    client.mint(&minter, &alice, &50_0000000_i128);
+    assert_eq!(client.total_supply(), 50_0000000_i128);
+
+    // Mint 60 more PULSE — total would be 110, exceeding cap.
+    assert!(client.try_mint(&minter, &alice, &60_0000000_i128).is_err());
+    assert_eq!(client.total_supply(), 50_0000000_i128); // unchanged
+}
+
+#[test]
+fn test_supply_cap_exact_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+    let minter = Address::generate(&env);
+    let alice = Address::generate(&env);
+    client.set_minter(&minter);
+
+    // Set cap to 100 PULSE.
+    client.set_supply_cap(&admin, &100_0000000_i128);
+
+    // Mint exactly 100 PULSE — should succeed.
+    client.mint(&minter, &alice, &100_0000000_i128);
+    assert_eq!(client.total_supply(), 100_0000000_i128);
+
+    // Mint 1 stroop more — should fail.
+    assert!(client.try_mint(&minter, &alice, &1).is_err());
+    assert_eq!(client.total_supply(), 100_0000000_i128); // unchanged
+}
+
+#[test]
+fn test_supply_cap_clear() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+    let minter = Address::generate(&env);
+    let alice = Address::generate(&env);
+    client.set_minter(&minter);
+
+    // Set cap, mint up to it.
+    client.set_supply_cap(&admin, &10_0000000_i128);
+    client.mint(&minter, &alice, &10_0000000_i128);
+    assert!(client.try_mint(&minter, &alice, &1).is_err());
+
+    // Clear cap (set to 0) — minting resumes.
+    client.set_supply_cap(&admin, &0);
+    assert_eq!(client.get_supply_cap(), 0);
+    client.mint(&minter, &alice, &1_0000000_i128);
+    assert_eq!(client.total_supply(), 11_0000000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_set_supply_cap_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+    let rando = Address::generate(&env);
+
+    // Non-admin must fail with NotAdmin.
+    client.set_supply_cap(&rando, &1_000_0000000_i128);
+}
+
+#[test]
+fn test_supply_cap_balance_unchanged_on_reject() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = init(&env, &client);
+    let minter = Address::generate(&env);
+    let alice = Address::generate(&env);
+    client.set_minter(&minter);
+
+    // Set cap and mint up to it.
+    client.set_supply_cap(&admin, &10_0000000_i128);
+    client.mint(&minter, &alice, &10_0000000_i128);
+
+    // Attempt to exceed cap — balance must remain unchanged.
+    let balance_before = client.balance(&alice);
+    assert!(client.try_mint(&minter, &alice, &1_0000000_i128).is_err());
+    assert_eq!(client.balance(&alice), balance_before); // no state corruption
+}

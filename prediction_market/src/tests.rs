@@ -386,17 +386,165 @@ fn test_increase_position_same_side() {
     assert_eq!(market.bet_count, 1);
 }
 
-// ── 12. Reject opposite-side bet ─────────────────────────────────────────────
+// ── 12. Hedge: user can bet both sides of a market ───────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")]
-fn test_reject_opposite_side_bet() {
+fn test_hedge_both_sides() {
     let t = setup();
     let id = create_test_market(&t);
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 500_0000000);
+
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &false, &50_0000000_i128);
+
+    // Both sides are tracked independently on the same single entry
+    let market = t.client.get_market(&id);
+    assert_eq!(market.total_yes, 98_0000000);
+    assert_eq!(market.total_no, 49_0000000);
+    assert_eq!(market.bet_count, 1);
+
+    let pos = t.client.get_position(&id, &user);
+    assert_eq!(pos.net_yes, 98_0000000);
+    assert_eq!(pos.net_no, 49_0000000);
+    assert_eq!(pos.gross, 150_0000000);
+    assert_eq!(pos.count, 2);
+    assert!(!pos.claimed);
+
+    // ABI view reports the dominant side
+    let bet = t.client.get_bet(&id, &user);
+    assert_eq!(bet.amount, 98_0000000);
+    assert!(bet.is_yes);
+    assert!(!bet.claimed);
+}
+
+// ── 12b. Rebalance: bets on either side accumulate independently ─────────────
+
+#[test]
+fn test_rebalance_accumulates_both_sides() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 1000_0000000);
+
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &id, &false, &50_0000000_i128);
+    t.client.place_bet(&user, &id, &true, &25_0000000_i128);
+    t.client.place_bet(&user, &id, &false, &75_0000000_i128);
+
+    let pos = t.client.get_position(&id, &user);
+    assert_eq!(pos.net_yes, 98_0000000 + 24_5000000); // 122.5 XLM net
+    assert_eq!(pos.net_no, 49_0000000 + 73_5000000); // 122.5 XLM net
+    assert_eq!(pos.gross, 250_0000000);
+    assert_eq!(pos.count, 4);
+
+    let market = t.client.get_market(&id);
+    assert_eq!(market.total_yes, 98_0000000 + 24_5000000);
+    assert_eq!(market.total_no, 49_0000000 + 73_5000000);
+}
+
+// ── 12b2. Spam guard counts both sides of a position ─────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_reject_too_many_bets_across_sides() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 100_000_000_000);
+    for i in 0..=20u32 {
+        t.client.place_bet(&user, &id, &(i % 2 == 0), &1_0000000_i128);
+    }
+}
+
+// ── 12c. Full hedge: equal stakes on both sides are outcome-neutral ──────────
+
+#[test]
+fn test_full_hedge_is_outcome_neutral() {
+    for outcome in [true, false] {
+        let t = setup();
+        let id = create_test_market(&t);
+        let user = Address::generate(&t.env);
+        fund_user(&t, &user, 500_0000000);
+
+        t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+        t.client.place_bet(&user, &id, &false, &100_0000000_i128);
+        advance_time(&t.env, 3601);
+        t.client.resolve_market(&t.admin, &id, &outcome);
+
+        let before = t.xlm.balance(&user);
+        t.client.claim(&user, &id);
+        // payout = 98 * 196 / 98 = 196 — the whole pool back, losing only the 2% fee
+        assert_eq!(t.xlm.balance(&user) - before, 196_0000000);
+    }
+}
+
+// ── 12d. Two-sided payout math stays conserved for other winners ─────────────
+
+#[test]
+fn test_hedged_payout_conserves_pool() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 1000_0000000);
+    fund_user(&t, &bob, 1000_0000000);
+
+    // Alice hedges: YES 100 (net 98) + NO 50 (net 49). Bob bets NO 100 (net 98).
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&alice, &id, &false, &50_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
+
+    let market = t.client.get_market(&id);
+    assert_eq!(market.total_yes, 98_0000000);
+    assert_eq!(market.total_no, 147_0000000);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    // Alice wins on her YES side only — payout uses net_yes, never the losing NO net.
+    let alice_before = t.xlm.balance(&alice);
+    t.client.claim(&alice, &id);
+    let alice_payout = t.xlm.balance(&alice) - alice_before;
+    assert_eq!(alice_payout, 245_0000000); // 98 * 245 / 98
+
+    // Bob loses: his NO net is absorbed by the pool and paid to winners.
+    let bob_before = t.xlm.balance(&bob);
+    t.client.claim(&bob, &id);
+    assert_eq!(t.xlm.balance(&bob), bob_before);
+
+    // Platform keeps exactly the 2% fees — pool is fully distributed to winners.
+    assert_eq!(t.client.get_accumulated_fees(), 5_0000000); // 2% of 250 gross
+}
+
+// ── 12e. Cancel refund covers both sides (gross total) ───────────────────────
+
+#[test]
+fn test_cancel_refund_two_sided_position() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 500_0000000);
+
+    let before = t.xlm.balance(&user);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &id, &false, &50_0000000_i128);
+
+    t.client.cancel_market(&t.admin, &id);
+    let refunded = t.client.cancel_refund(&user, &id);
+    assert_eq!(refunded, 150_0000000); // full gross across both sides
+    assert_eq!(t.xlm.balance(&user), before);
+}
+
+// ── 12f. get_position for a user with no bet ─────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_get_position_no_bet_found() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    t.client.get_position(&id, &user);
 }
 
 // ── 13. Resolve market ───────────────────────────────────────────────────────

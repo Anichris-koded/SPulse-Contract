@@ -82,6 +82,9 @@ pub enum MarketError {
     MarketCancelled = 8,
     MarketNotResolved = 9,
     BetTooSmall = 10,
+    // Retained for ABI stability — error codes must not shift on upgrade.
+    // No longer produced: users may now hold positions on both sides.
+    #[allow(dead_code)]
     OppositeSideBet = 11,
     AlreadyClaimed = 12,
     NoBetFound = 13,
@@ -128,6 +131,7 @@ pub enum DataKey {
     MarketCount,
     AccumulatedFees,
     Market(u64),
+    Bet(u64, Address), // two-sided net_yes/net_no + gross + count packed; see BetEntry
     // Per-market ledger of the fees this market actually contributed to
     // AccumulatedFees: platform fee for every bet, plus referral fee only
     // when it was NOT paid out to a referrer. cancel_market reclaims this
@@ -167,6 +171,7 @@ pub struct Config {
     pub xlm_sac: Address,
 }
 
+// ── BetEntry: two-sided position + Gross + BetCount in one slot ────────────
 /// WASM hashes (or the SAC sentinel) pinned for each Config role.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,9 +196,9 @@ pub struct PendingConfigChange {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BetEntry {
-    pub net: i128,   // post-fee amount bet (used for payout)
-    pub gross: i128, // pre-fee amount sent (used for cancel_refund)
-    pub is_yes: bool,
+    pub net_yes: i128, // post-fee net committed to YES (used for payout)
+    pub net_no: i128,  // post-fee net committed to NO (used for payout)
+    pub gross: i128,   // pre-fee total sent across both sides (used for cancel_refund)
     pub claimed: bool,
     pub count: u32, // how many times this user has bet on this market
 }
@@ -237,13 +242,25 @@ pub struct Market {
     pub bet_count: u32,
 }
 
-// Kept for ABI compatibility — frontend reads Bet fields
+// Kept for ABI compatibility — frontend reads Bet fields.
+// For a two-sided position, amount/is_yes report the dominant side.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bet {
     pub amount: i128,
     pub is_yes: bool,
     pub claimed: bool,
+}
+
+// Full two-sided position view — exposes both sides of a user's bet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Position {
+    pub net_yes: i128,
+    pub net_no: i128,
+    pub gross: i128,
+    pub claimed: bool,
+    pub count: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -772,7 +789,7 @@ impl PredictionMarketContract {
         let bet_key = DataKey::Bet(market_id, user.clone());
         let existing: Option<BetEntry> = env.storage().persistent().get(&bet_key);
 
-        // Spam guard + side check combined from single read
+        // Spam guard from single read (both sides share the bet counter)
         if let Some(ref e) = existing {
             if e.count >= MAX_BETS_PER_USER {
                 env.storage().persistent().remove(&lock_key);
@@ -809,6 +826,7 @@ impl PredictionMarketContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &acc_fees);
 
+        // ── Write BetEntry (two-sided net + gross + count in one write) ────
         // ── Per-market fee ledger (issue #87) ──────────────────────────────
         // Record exactly what this bet added to the accumulator for this
         // market. Referral fees transferred to a referrer at bet time are
@@ -830,15 +848,19 @@ impl PredictionMarketContract {
         // ── Write BetEntry (net + gross + count in one write) ─────────────
         let new_entry = match existing {
             Some(mut e) => {
-                e.net += net;
+                if is_yes {
+                    e.net_yes += net;
+                } else {
+                    e.net_no += net;
+                }
                 e.gross += amount;
                 e.count += 1;
                 e
             }
             None => BetEntry {
-                net,
+                net_yes: if is_yes { net } else { 0 },
+                net_no: if is_yes { 0 } else { net },
                 gross: amount,
-                is_yes,
                 claimed: false,
                 count: 1,
             },
@@ -1158,7 +1180,14 @@ impl PredictionMarketContract {
             return Err(MarketError::AlreadyClaimed);
         }
 
-        let is_winner = entry.is_yes == market.outcome;
+        // Winning payout is driven by the net committed to the winning side
+        // only; the losing side's net stays in the pool for all winners.
+        let winning_net = if market.outcome {
+            entry.net_yes
+        } else {
+            entry.net_no
+        };
+        let is_winner = winning_net > 0;
         let total_pool = market.total_yes + market.total_no;
         let winning_side = if market.outcome {
             market.total_yes
@@ -1417,9 +1446,25 @@ impl PredictionMarketContract {
             .get(&DataKey::Bet(market_id, user))
             .ok_or(MarketError::NoBetFound)?;
         Ok(Bet {
-            amount: e.net,
-            is_yes: e.is_yes,
+            amount: e.net_yes.max(e.net_no),
+            is_yes: e.net_yes >= e.net_no,
             claimed: e.claimed,
+        })
+    }
+
+    // Full two-sided position view (0 on an untouched side)
+    pub fn get_position(env: Env, market_id: u64, user: Address) -> Result<Position, MarketError> {
+        let e: BetEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bet(market_id, user))
+            .ok_or(MarketError::NoBetFound)?;
+        Ok(Position {
+            net_yes: e.net_yes,
+            net_no: e.net_no,
+            gross: e.gross,
+            claimed: e.claimed,
+            count: e.count,
         })
     }
 

@@ -336,13 +336,14 @@ fn test_credit_no_referrer() {
     sac_admin.mint(&t.referral_id, &10_0000000_i128);
 
     let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
-    let market_bal_before = xlm_client.balance(&t.market);
+    let referral_bal_before = xlm_client.balance(&t.referral_id);
 
     let result = t.client.credit(&t.market, &user, &5_000_000);
     assert!(!result);
 
-    // Fee returned to caller (market contract)
-    assert_eq!(xlm_client.balance(&t.market), market_bal_before + 5_000_000);
+    // Issue #76: fee stays with referral contract as surplus (no round-trip)
+    assert_eq!(xlm_client.balance(&t.referral_id), referral_bal_before);
+    assert_eq!(t.client.get_surplus_fees(), 5_000_000);
 }
 
 // ── 8b. Credit returns false for completely unregistered user ─────────────────
@@ -357,13 +358,14 @@ fn test_credit_unregistered_user() {
     sac_admin.mint(&t.referral_id, &10_0000000_i128);
 
     let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
-    let market_bal_before = xlm_client.balance(&t.market);
+    let referral_bal_before = xlm_client.balance(&t.referral_id);
 
     let result = t.client.credit(&t.market, &user, &5_000_000);
     assert!(!result);
 
-    // Fee returned to caller (market contract)
-    assert_eq!(xlm_client.balance(&t.market), market_bal_before + 5_000_000);
+    // Issue #76: fee stays with referral contract as surplus (no round-trip)
+    assert_eq!(xlm_client.balance(&t.referral_id), referral_bal_before);
+    assert_eq!(t.client.get_surplus_fees(), 5_000_000);
 }
 
 // ── 9. Earnings accumulation across multiple credits ─────────────────────────
@@ -838,6 +840,7 @@ fn test_view_functions_work_while_paused() {
     assert!(t.client.is_registered(&user));
 }
 
+<<<<<<< HEAD
 // ── Issue #78: legacy key migration ───────────────────────────────────────────
 
 #[test]
@@ -913,10 +916,56 @@ fn test_migrate_user_noop_if_already_migrated() {
         t.client.get_display_name(&user),
         String::from_str(&t.env, "NewUser")
     );
+=======
+// ── Issue #76: surplus fees ───────────────────────────────────────────────────
+
+#[test]
+fn test_surplus_fees_accumulate() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Solo"), &no_ref);
+
+    let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
+    sac_admin.mint(&t.referral_id, &100_0000000_i128);
+
+    t.client.credit(&t.market, &user, &5_000_000);
+    assert_eq!(t.client.get_surplus_fees(), 5_000_000);
+
+    t.client.credit(&t.market, &user, &3_000_000);
+    assert_eq!(t.client.get_surplus_fees(), 8_000_000);
+}
+
+#[test]
+fn test_withdraw_surplus_fees() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let no_ref: Option<Address> = None;
+    t.client
+        .register_referral(&user, &String::from_str(&t.env, "Solo"), &no_ref);
+
+    let sac_admin = StellarAssetClient::new(&t.env, &t.xlm_sac_id);
+    sac_admin.mint(&t.referral_id, &100_0000000_i128);
+
+    t.client.credit(&t.market, &user, &5_000_000);
+
+    let recipient = Address::generate(&t.env);
+    let xlm_client = TokenClient::new(&t.env, &t.xlm_sac_id);
+    let recipient_before = xlm_client.balance(&recipient);
+
+    let withdrawn = t.client.withdraw_surplus_fees(&t.admin, &recipient);
+    assert_eq!(withdrawn, 5_000_000);
+    assert_eq!(xlm_client.balance(&recipient), recipient_before + 5_000_000);
+    assert_eq!(t.client.get_surplus_fees(), 0);
+>>>>>>> 7cfb065 (fix(referral_registry): hold no-referrer fees as admin-withdrawable surplus)
 }
 
 #[test]
 #[should_panic(expected = "Error(Contract, #6)")]
+<<<<<<< HEAD
 fn test_migrate_user_rejects_non_admin() {
     let t = setup();
     let user = Address::generate(&t.env);
@@ -962,4 +1011,11 @@ fn test_register_referral_emits_event() {
     let topic0 = Val::try_from_val(&t.env, &body.topics[0]).unwrap();
     let name = Symbol::try_from_val(&t.env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&t.env, "referral_registered"));
+=======
+fn test_withdraw_surplus_fees_rejects_non_admin() {
+    let t = setup();
+    let not_admin = Address::generate(&t.env);
+    let recipient = Address::generate(&t.env);
+    t.client.withdraw_surplus_fees(&not_admin, &recipient);
+>>>>>>> 7cfb065 (fix(referral_registry): hold no-referrer fees as admin-withdrawable surplus)
 }

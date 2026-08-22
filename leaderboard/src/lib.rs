@@ -6,6 +6,15 @@ use soroban_sdk::{
     Vec,
 };
 
+pub const MAX_TOP_PLAYERS: u32 = 50;
+/// Rank returned by `get_rank` for a player who is not in the top list.
+///
+/// It must be numerically greater than every valid in-list rank
+/// (`1..=MAX_TOP_PLAYERS`) so that an unranked player never sorts above an
+/// actual position. Historically this value was `0`, which was strictly less
+/// than every valid rank and made "unranked" indistinguishable from "rank 0"
+/// (issue #91). Callers should treat `rank > MAX_TOP_PLAYERS` as "not ranked".
+pub const UNRANKED_RANK: u32 = MAX_TOP_PLAYERS + 1;
 const MAX_TOP_PLAYERS: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 20;
 const TTL_BUMP: u32 = 3_153_600;
@@ -865,6 +874,17 @@ impl LeaderboardContract {
             .unwrap_or(0)
     }
 
+    // ── Rank (issues #67, #91) ─────────────────────────────────────────────
+    // A 1-based rank inside the top list. Players outside the list get
+    // UNRANKED_RANK (MAX_TOP_PLAYERS + 1), never 0, so an unranked player can
+    // never sort above (numerically lower than) a real position and the
+    // "unranked" state is unambiguous. The reverse lookup is validated
+    // against the forward entry first so an orphaned/stale TopPlayerSlot can
+    // never produce a fake rank.
+
+    pub fn get_rank(env: Env, user: Address) -> u32 {
+        let Some((slot, entry)) = Self::top_slot_entry(&env, &user) else {
+            return UNRANKED_RANK;
     /// Rank is 1-based position in the sorted top list, or 0 if the user is
     /// not currently in it. A reverse lookup is only trusted when the forward
     /// entry still exists and points back at `user`; otherwise the stale

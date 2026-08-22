@@ -198,6 +198,10 @@ fn test_rank_calculation() {
     client.add_pts(&market, &bob, &100_u64, &true);
     client.add_pts(&market, &charlie, &75_u64, &true);
 
+    assert_eq!(client.get_rank(&bob), 1);
+    assert_eq!(client.get_rank(&charlie), 2);
+    assert_eq!(client.get_rank(&alice), 3);
+    assert_eq!(client.get_rank(&dave), UNRANKED_RANK);
     assert_eq!(client.get_rank(&bob), Some(1));
     assert_eq!(client.get_rank(&charlie), Some(2));
     assert_eq!(client.get_rank(&alice), Some(3));
@@ -289,6 +293,7 @@ fn test_low_scorer_rejected_when_full() {
 
     // Weak user has stats/points recorded, but is NOT in the top list.
     assert_eq!(client.get_points(&weak), 5);
+    assert_eq!(client.get_rank(&weak), UNRANKED_RANK);
     assert_eq!(client.get_rank(&weak), None);
     assert_eq!(client.get_player_count(), 50);
     assert_eq!(client.get_rank(&weak), 0);
@@ -318,6 +323,7 @@ fn test_bottom_player_rising_updates_min() {
     // rather than staying stale at 100.
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &105_u64, &true);
+    assert_eq!(client.get_rank(&newcomer), UNRANKED_RANK);
     assert_eq!(client.get_rank(&newcomer), None);
     assert_eq!(client.get_rank(&newcomer), 0);
     assert_eq!(client.get_top_player_count(), 50);
@@ -352,7 +358,7 @@ fn test_equal_min_newcomer_displaces_min_when_full() {
     // Still capped at 50; the incumbent min (100) is evicted, the newcomer
     // enters, and the list now holds the newcomer instead of the old min.
     assert_eq!(client.get_player_count(), 50);
-    assert_eq!(client.get_rank(&min_player), 0);
+    assert_eq!(client.get_rank(&min_player), UNRANKED_RANK);
     assert_eq!(client.get_rank(&newcomer), 50);
 }
 
@@ -389,7 +395,7 @@ fn test_equal_min_fifo_evicts_oldest_tie() {
 
     assert_eq!(client.get_player_count(), 50);
     // FIFO: the oldest tied-at-min player is displaced; the newer tie stays.
-    assert_eq!(client.get_rank(&first_tie), 0);
+    assert_eq!(client.get_rank(&first_tie), UNRANKED_RANK);
     assert_eq!(client.get_rank(&last_tie), 46);
     assert_eq!(client.get_rank(&newcomer), 46);
 }
@@ -418,7 +424,7 @@ fn test_fill_min_boost_keeps_cache_correct() {
     // player must remain in the list.
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &120_u64, &true);
-    assert_eq!(client.get_rank(&newcomer), 0);
+    assert_eq!(client.get_rank(&newcomer), UNRANKED_RANK);
     assert_eq!(client.get_rank(&weakest), 50);
 }
 
@@ -449,7 +455,7 @@ fn test_fifo_evicts_consecutive_oldest_ties_across_slot_reuse() {
     // lowest min slot.
     let c = Address::generate(&env);
     client.add_pts(&market, &c, &100_u64, &true);
-    assert_eq!(client.get_rank(&a), 0);
+    assert_eq!(client.get_rank(&a), UNRANKED_RANK);
     assert_eq!(client.get_rank(&b), 49);
     assert_eq!(client.get_rank(&c), 49);
 
@@ -457,15 +463,15 @@ fn test_fifo_evicts_consecutive_oldest_ties_across_slot_reuse() {
     // D must evict B, NOT C. This is the FIFO-vs-lowest-slot discriminator.
     let d = Address::generate(&env);
     client.add_pts(&market, &d, &100_u64, &true);
-    assert_eq!(client.get_rank(&a), 0);
-    assert_eq!(client.get_rank(&b), 0);
+    assert_eq!(client.get_rank(&a), UNRANKED_RANK);
+    assert_eq!(client.get_rank(&b), UNRANKED_RANK);
     assert_eq!(client.get_rank(&c), 49);
     assert_eq!(client.get_rank(&d), 49);
 
     // E ties the min → C is now the oldest survivor (D reused B's slot).
     let e = Address::generate(&env);
     client.add_pts(&market, &e, &100_u64, &true);
-    assert_eq!(client.get_rank(&c), 0);
+    assert_eq!(client.get_rank(&c), UNRANKED_RANK);
     assert_eq!(client.get_rank(&d), 49);
     assert_eq!(client.get_rank(&e), 49);
 }
@@ -562,6 +568,37 @@ fn test_reconcile_compacts_ttl_holes_and_restores_slots() {
 }
 
 #[test]
+fn test_unranked_sentinel_for_user_not_in_list() {
+    let (env, client, _admin, _market, _referral) = setup();
+    let stranger = Address::generate(&env);
+    assert_eq!(client.get_rank(&stranger), UNRANKED_RANK);
+}
+
+#[test]
+fn test_unranked_rank_is_above_every_list_rank() {
+    // The numeric rank invariant from issue #91: an unranked player must never
+    // sort above (numerically lower than) a real position. The weakest player
+    // in a full list holds rank MAX_TOP_PLAYERS, so the sentinel must be
+    // strictly greater — never 0, which was less than every valid rank.
+    let (env, client, _admin, market, _referral) = setup();
+    for i in 0..MAX_TOP_PLAYERS {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &(1000 + i as u64), &true);
+    }
+    assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);
+
+    let weakest = client
+        .get_top_players(&(MAX_TOP_PLAYERS - 1), &1)
+        .get(0)
+        .unwrap()
+        .address
+        .clone();
+    assert_eq!(client.get_rank(&weakest), MAX_TOP_PLAYERS);
+
+    let outside = Address::generate(&env);
+    let outside_rank = client.get_rank(&outside);
+    assert_eq!(outside_rank, UNRANKED_RANK);
+    assert!(outside_rank > client.get_rank(&weakest));
 fn test_upsert_repairs_stale_slot_instead_of_panicking() {
     // In-place path used to unwrap TopPlayerAt; a TTL hole must re-insert.
     let (env, client, _admin, market, _referral) = setup();
@@ -694,6 +731,7 @@ fn test_eviction_repairs_expired_min_entry() {
     assert_eq!(client.get_rank(&newcomer), Some(1));
     // The expired player (100) is gone; even though their orphaned
     // TopPlayerSlot survives, get_rank must not report a stale rank.
+    assert_eq!(client.get_rank(&weakest), UNRANKED_RANK);
     assert_eq!(client.get_rank(&weakest), None);
     // 101 is the new minimum — the repaired min cache agrees.
     assert_eq!(client.get_min_points(), 101);
@@ -702,7 +740,8 @@ fn test_eviction_repairs_expired_min_entry() {
 #[test]
 fn test_eviction_clears_reverse_mapping() {
     // Fill the board, then let a newcomer displace the weakest entry. The
-    // evicted player's TopPlayerSlot must be removed so get_rank reads 0.
+    // evicted player's TopPlayerSlot must be removed so get_rank reads the
+    // unranked sentinel.
     let (env, client, _admin, market, _referral) = setup();
     let mut weakest = None;
     for i in 0u64..50 {
@@ -719,6 +758,8 @@ fn test_eviction_clears_reverse_mapping() {
     client.add_pts(&market, &newcomer, &1000_u64, &true);
     assert_eq!(client.get_rank(&newcomer), Some(1));
 
+    // Displaced player: unranked and no lingering reverse mapping.
+    assert_eq!(client.get_rank(&weakest), UNRANKED_RANK);
     // Displaced player: no rank and no lingering reverse mapping.
     assert_eq!(client.get_rank(&weakest), None);
     let still_mapped = env.as_contract(&client.address, || {

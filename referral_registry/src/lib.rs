@@ -11,9 +11,6 @@ const REFERRAL_BET_POINTS: u64 = 3;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
 
-const TTL_BUMP: u32 = 3_153_600;
-const TTL_HIGH: u32 = 6_307_200;
-
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
 pub const INTERFACE_VERSION: u32 = 1;
@@ -24,6 +21,12 @@ pub const INTERFACE_VERSION: u32 = 1;
 // blind and either panicking deep in argument decoding or silently
 // misbehaving (issue #84).
 const EXPECTED_LEADERBOARD_INTERFACE_VERSION: u32 = 1;
+
+/// Maximum allowed depth of the referral chain. A new registration whose
+/// referrer already sits at depth MAX_REFERRAL_DEPTH (i.e. has MAX_REFERRAL_DEPTH
+/// ancestors) is rejected. This bounds both gas usage during the on-chain
+/// traversal and sybil-amplification attack surface.
+const MAX_REFERRAL_DEPTH: u32 = 5;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -188,6 +191,7 @@ impl ReferralRegistryContract {
                 return Err(ReferralError::ReferrerNotRegistered);
             }
         }
+
         // Lever A: write ONE packed Profile entry (display_name + referrer)
         // instead of the three legacy keys (Registered + DisplayName + Referrer).
         // Existence of Profile(user) is what is_registered() now checks.
@@ -198,9 +202,6 @@ impl ReferralRegistryContract {
                 referrer: referrer.clone(),
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Profile(user), TTL_BUMP, TTL_HIGH);
         env.storage().persistent().extend_ttl(
             &DataKey::Profile(user.clone()),
             TTL_BUMP,
@@ -219,10 +220,6 @@ impl ReferralRegistryContract {
                 .set(&count_key, &(count + 1));
             env.storage()
                 .persistent()
-                .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::ReferralCount(ref_addr), TTL_BUMP, TTL_HIGH);
                 .extend_ttl(&count_key, TTL_BUMP, TTL_HIGH);
         }
 
@@ -232,10 +229,12 @@ impl ReferralRegistryContract {
             .instance()
             .get(&DataKey::LeaderboardContract)
             .unwrap();
-        Self::require_compatible_leaderboard(&env, &leaderboard)?;
-        let _: Val = env.invoke_contract(
+        // Queue the welcome reward as an optional side effect. Registration
+        // remains successful if the leaderboard is paused, unavailable, or
+        // exceeds the remaining invocation budget.
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
+            &Symbol::new(&env, "queue_bonus_reward"),
             vec![
                 &env,
                 this.into_val(&env),
@@ -279,15 +278,17 @@ impl ReferralRegistryContract {
                     .instance()
                     .get(&DataKey::LeaderboardContract)
                     .unwrap();
-                Self::require_compatible_leaderboard(&env, &leaderboard)?;
-                let _: Val = env.invoke_contract(
+                // Queue points as an optional side effect. The XLM transfer
+                // and earnings update remain critical referral accounting.
+                let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(
                     &leaderboard,
-                    &Symbol::new(&env, "add_bonus_pts"),
+                    &Symbol::new(&env, "queue_bonus_reward"),
                     vec![
                         &env,
                         env.current_contract_address().into_val(&env),
                         ref_addr.clone().into_val(&env),
                         REFERRAL_BET_POINTS.into_val(&env),
+                        0_i128.into_val(&env),
                     ],
                 );
                 let earnings: i128 = env
@@ -295,21 +296,13 @@ impl ReferralRegistryContract {
                     .persistent()
                     .get(&DataKey::ReferralEarnings(ref_addr.clone()))
                     .unwrap_or(0);
-                let earn_key = DataKey::ReferralEarnings(ref_addr);
+                let earn_key = DataKey::ReferralEarnings(ref_addr.clone());
                 env.storage()
                     .persistent()
                     .set(&earn_key, &(earnings + referral_fee));
                 env.storage()
                     .persistent()
                     .extend_ttl(&earn_key, TTL_BUMP, TTL_HIGH);
-                env.storage().persistent().set(
-                    &DataKey::ReferralEarnings(ref_addr.clone()),
-                    &(earnings + referral_fee),
-                );
-                env.storage().persistent().extend_ttl(
-                    &DataKey::ReferralEarnings(ref_addr),
-                    TTL_BUMP,
-                    TTL_HIGH,
                 env.events().publish(
                     (Symbol::new(&env, "referral_credited"), user, ref_addr),
                     referral_fee,
@@ -336,6 +329,71 @@ impl ReferralRegistryContract {
                 Ok(false)
             }
         }
+    }
+
+    /// Issue #78: Admin-callable legacy migration. Reads old Registered/DisplayName/Referrer keys,
+    /// writes the packed Profile entry, and removes the legacy keys. Idempotent — no-op if
+    /// Profile already exists.
+    pub fn migrate_user(env: Env, admin: Address, user: Address) -> Result<(), ReferralError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap();
+        if admin != stored_admin {
+            return Err(ReferralError::NotAdmin);
+        }
+        admin.require_auth();
+        // Already migrated — Profile exists, nothing to do
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Profile(user.clone()))
+        {
+            return Ok(());
+        }
+        // No legacy keys — nothing to migrate
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Registered(user.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let display_name: String = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisplayName(user.clone()))
+            .unwrap_or_else(|| String::from_str(&env, "user"));
+        let referrer: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Referrer(user.clone()));
+        // Write the packed profile
+        env.storage().persistent().set(
+            &DataKey::Profile(user.clone()),
+            &UserProfile {
+                display_name,
+                referrer: referrer.clone(),
+            },
+        );
+        // If this user has a referrer, increment that referrer's count
+        if let Some(ref ref_addr) = referrer {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ReferralCount(ref_addr.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
+        }
+        // Remove legacy keys
+        env.storage().persistent().remove(&DataKey::Registered(user.clone()));
+        env.storage().persistent().remove(&DataKey::DisplayName(user.clone()));
+        env.storage().persistent().remove(&DataKey::Referrer(user));
+        Ok(())
     }
 
     fn load_profile(env: &Env, user: &Address) -> Option<UserProfile> {

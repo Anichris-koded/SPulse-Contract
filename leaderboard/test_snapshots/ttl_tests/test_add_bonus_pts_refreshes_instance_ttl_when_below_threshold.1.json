@@ -140,6 +140,33 @@
               "key": {
                 "vec": [
                   {
+                    "symbol": "StatsEpoch"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 26
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 9460801
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
                     "symbol": "TopPlayerAt"
                   },
                   {
@@ -160,10 +187,26 @@
                   },
                   {
                     "key": {
+                      "symbol": "epoch"
+                    },
+                    "val": {
+                      "u32": 26
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "points"
                     },
                     "val": {
                       "u64": "10"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "seq"
+                    },
+                    "val": {
+                      "u64": "0"
                     }
                   }
                 ]

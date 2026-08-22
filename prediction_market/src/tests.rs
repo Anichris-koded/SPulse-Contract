@@ -1,8 +1,9 @@
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
+    contract, contractimpl,
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Env, String,
+    BytesN, Env, String, Symbol, TryFromVal, Val,
 };
 
 use leaderboard::LeaderboardContract;
@@ -78,7 +79,7 @@ fn setup() -> TestSetup {
     // Lever G: the leaderboard now mints PULSE internally (one cross-call from
     // market/referral instead of two). It must know the token AND be authorized
     // as a minter. This mirrors the exact mainnet upgrade sequence.
-    leaderboard_client.set_token(&admin, &token_id);
+    leaderboard_client.set_token_contract(&admin, &token_id);
     token_client.set_minter(&leaderboard_id);
     // Legacy minter auths kept harmless (market/referral no longer mint directly).
     token_client.set_minter(&market_id);
@@ -124,6 +125,20 @@ fn advance_time(env: &Env, secs: u64) {
     });
 }
 
+fn rewind_time(env: &Env, secs: u64) {
+    let current = env.ledger().timestamp();
+    env.ledger().set(LedgerInfo {
+        timestamp: current - secs,
+        protocol_version: 26,
+        sequence_number: env.ledger().sequence() + 1,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 100,
+        min_persistent_entry_ttl: 100,
+        max_entry_ttl: 10_000_000,
+    });
+}
+
 // ── 1. Initialize ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -148,6 +163,49 @@ fn test_create_market() {
     assert!(!market.resolved);
     assert!(!market.cancelled);
     assert_eq!(market.bet_count, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_reject_zero_market_duration() {
+    let t = setup();
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Zero duration"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &0_u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_reject_market_duration_below_minimum() {
+    let t = setup();
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Too short"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &(MIN_MARKET_DURATION_SECS - 1),
+    );
+}
+
+#[test]
+fn test_market_duration_minimum_is_allowed() {
+    let t = setup();
+    let id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Minimum duration"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Other,
+        &MIN_MARKET_DURATION_SECS,
+    );
+
+    assert_eq!(
+        t.client.get_market(&id).end_time,
+        t.env.ledger().timestamp() + MIN_MARKET_DURATION_SECS
+    );
 }
 
 // ── 3. Place YES bet ──────────────────────────────────────────────────────────
@@ -201,7 +259,9 @@ fn test_fee_full_2_percent_no_referrer() {
     fund_user(&t, &user, 200_0000000);
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
-    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    // Issue #78: only platform_fee is tracked in AccumulatedFees;
+    // referral fee stays in referral contract as surplus.
+    assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
 }
 
 // ── 6. Fee split with referrer ────────────────────────────────────────────────
@@ -214,6 +274,12 @@ fn test_fee_split_with_referrer() {
     let referrer = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
 
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -224,7 +290,8 @@ fn test_fee_split_with_referrer() {
 
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
 }
 
 // ── 7. Reject bet on expired market ──────────────────────────────────────────
@@ -281,6 +348,19 @@ fn test_reject_bet_below_minimum() {
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &5_000_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_reject_gross_minimum_when_net_is_too_small() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+
+    // The gross minimum is not enough to produce the one-XLM net minimum
+    // after the two-percent fee.
+    t.client.place_bet(&user, &id, &true, &MIN_BET);
 }
 
 // ── 11. Increase existing position ───────────────────────────────────────────
@@ -564,10 +644,14 @@ fn test_cancel_market_claim_style_refund() {
     let alice_refund = t.client.cancel_refund(&alice, &id);
     assert_eq!(alice_refund, 100_0000000); // full gross (100 XLM)
     assert_eq!(t.xlm.balance(&alice), alice_before);
+    assert_eq!(t.client.get_bet(&id, &alice).amount, 0);
+    assert_eq!(t.client.get_bet_gross(&id, &alice), 0);
 
     let bob_refund = t.client.cancel_refund(&bob, &id);
     assert_eq!(bob_refund, 50_0000000); // full gross (50 XLM)
     assert_eq!(t.xlm.balance(&bob), bob_before);
+    assert_eq!(t.client.get_bet(&id, &bob).amount, 0);
+    assert_eq!(t.client.get_bet_gross(&id, &bob), 0);
 }
 
 // ── 18. Cancel refund is idempotent — double refund rejected ──────────────────
@@ -632,6 +716,7 @@ fn test_claim_winner() {
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
     t.client.claim(&alice, &id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
 
     let payout = t.xlm.balance(&alice) - alice_pre_claim;
     assert_eq!(payout, 196_0000000);
@@ -659,6 +744,7 @@ fn test_claim_loser() {
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
     t.client.claim(&bob, &id);
+    t.leaderboard_client.claim_pending_rewards(&bob);
 
     assert_eq!(t.xlm.balance(&bob), bob_pre_claim);
     let stats = t.leaderboard_client.get_stats(&bob);
@@ -729,7 +815,7 @@ fn test_withdraw_fees() {
     assert_eq!(t.xlm.balance(&t.admin), admin_xlm_before + fees_before);
 }
 
-// ── 27. Fee recipient can withdraw ───────────────────────────────────────────
+// ── 27. Fee recipient withdrawal is capped + timelocked (issue #12) ──────────
 
 #[test]
 fn test_fee_recipient_withdraw() {
@@ -742,18 +828,194 @@ fn test_fee_recipient_withdraw() {
     let recipient = Address::generate(&t.env);
     let treasury = Address::generate(&t.env);
     t.client.add_fee_recipient(&t.admin, &recipient);
+    t.client.add_fee_recipient(&t.admin, &treasury);
 
     let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
     let treasury_before = t.xlm.balance(&treasury);
-    t.client.withdraw_fees(&recipient, &treasury);
-    assert_eq!(t.xlm.balance(&treasury), treasury_before + fees);
-    assert_eq!(t.client.get_accumulated_fees(), 0);
+
+    // Fee recipient requests a capped withdrawal to the registered treasury.
+    t.client.request_withdraw_fees(&recipient, &treasury, &cap);
+
+    // Payout is NOT immediate: timelocked for WITHDRAW_DELAY_SECS.
+    let pending = t.client.get_pending_withdrawal(&recipient).unwrap();
+    assert_eq!(pending.recipient, treasury);
+    assert_eq!(pending.amount, cap);
+    assert_eq!(t.xlm.balance(&treasury), treasury_before);
+
+    // After the delay the payout executes.
+    advance_time(&t.env, WITHDRAW_DELAY_SECS);
+    let withdrawn = t.client.execute_withdraw_fees(&recipient);
+    assert_eq!(withdrawn, cap);
+    assert_eq!(t.xlm.balance(&treasury), treasury_before + cap);
+    assert_eq!(t.client.get_accumulated_fees(), fees - cap);
+}
+
+// ── 27b. Fee recipient can no longer withdraw immediately (issue #12) ─────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reject_fee_recipient_immediate_withdraw() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    t.client.withdraw_fees(&recipient, &recipient);
+}
+
+// ── 27c. Withdraw to an arbitrary address is rejected (issue #12) ─────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reject_withdraw_fees_to_arbitrary_recipient() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let rando = Address::generate(&t.env);
+    t.client.withdraw_fees(&t.admin, &rando);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_reject_fee_recipient_request_arbitrary_recipient() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    let rando = Address::generate(&t.env);
+    t.client.request_withdraw_fees(&recipient, &rando, &1_i128);
+}
+
+// ── 27d. Cannot drain the whole accumulator in one request (issue #12) ────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_reject_drain_entire_accumulator_in_one_request() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    t.client.request_withdraw_fees(&recipient, &recipient, &fees);
+}
+
+// ── 27e. Payout is locked until the timelock elapses (issue #12) ──────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_withdrawal_execute_before_delay() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    t.client.execute_withdraw_fees(&recipient);
+}
+
+// ── 27f. Admin can cancel a pending withdrawal request (issue #12) ────────────
+
+#[test]
+fn test_admin_cancel_pending_withdrawal() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    assert!(t.client.get_pending_withdrawal(&recipient).is_some());
+
+    t.client.cancel_withdrawal_request(&t.admin, &recipient);
+    assert!(t.client.get_pending_withdrawal(&recipient).is_none());
+    assert_eq!(t.client.get_accumulated_fees(), fees);
+}
+
+// ── 27g. Executing without a pending request is rejected (issue #12) ──────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn test_execute_without_request() {
+    let t = setup();
+    let rando = Address::generate(&t.env);
+    t.client.execute_withdraw_fees(&rando);
+}
+
+// ── 27i. Recipient revoked during the timelock cannot execute (issue #12) ──────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_execute_rejected_after_fee_recipient_removed() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+
+    // Role revoked while the 24h timelock is still running.
+    t.client.remove_fee_recipient(&t.admin, &recipient);
+    advance_time(&t.env, WITHDRAW_DELAY_SECS);
+    t.client.execute_withdraw_fees(&recipient);
+}
+
+// ── 27h. Duplicate withdrawal requests are rejected (issue #12) ───────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_reject_duplicate_withdrawal_request() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
 }
 
 // ── 28. Non-authorized cannot withdraw fees ───────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #18)")]
+#[should_panic(expected = "Error(Contract, #3)")]
 fn test_reject_withdraw_fees_non_admin() {
     let t = setup();
     let id = create_test_market(&t);
@@ -786,6 +1048,53 @@ fn test_bettor_index_enumeration() {
     assert_eq!(bettors.get(0).unwrap(), alice);
     assert_eq!(bettors.get(1).unwrap(), bob);
     assert_eq!(bettors.get(2).unwrap(), charlie);
+
+    let first_page = t.client.get_market_bettors_page(&id, &0, &2);
+    assert_eq!(first_page.len(), 2);
+    assert_eq!(first_page.get(0).unwrap(), alice);
+    assert_eq!(first_page.get(1).unwrap(), bob);
+
+    let second_page = t.client.get_market_bettors_page(&id, &2, &2);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0).unwrap(), charlie);
+}
+
+#[test]
+fn test_bettor_index_legacy_read_is_bounded() {
+    let t = setup();
+    // Simulating a 101-entry legacy index legitimately reads 100 slots in one
+    // call, which exceeds the default mainnet-like resource limits — this test
+    // proves read boundedness, not gas, so lift the limits like other suites.
+    t.env.cost_estimate().disable_resource_limits();
+    let id = create_test_market(&t);
+    let first = Address::generate(&t.env);
+    let beyond_first_page = Address::generate(&t.env);
+
+    // Simulate a large legacy index without spending time creating 101 bets.
+    t.env.as_contract(&t.client.address, || {
+        t.env.storage().persistent().set(
+            &DataKey::BettorCount(id),
+            &(MAX_BETTORS_PER_PAGE + 1),
+        );
+        t.env.storage().persistent().set(
+            &DataKey::BettorAt(id, 0),
+            &first,
+        );
+        t.env.storage().persistent().set(
+            &DataKey::BettorAt(id, MAX_BETTORS_PER_PAGE),
+            &beyond_first_page,
+        );
+    });
+
+    let legacy_page = t.client.get_market_bettors(&id);
+    assert_eq!(legacy_page.len(), 1);
+    assert_eq!(legacy_page.get(0).unwrap(), first);
+
+    let later_page = t
+        .client
+        .get_market_bettors_page(&id, &MAX_BETTORS_PER_PAGE, &1);
+    assert_eq!(later_page.len(), 1);
+    assert_eq!(later_page.get(0).unwrap(), beyond_first_page);
 }
 
 // ── 30. Referrer earns 3 bonus points per referred bet ───────────────────────
@@ -798,6 +1107,12 @@ fn test_referrer_bonus_points_per_bet() {
     let referrer = Address::generate(&t.env);
     fund_user(&t, &user, 500_0000000);
 
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Fan"),
@@ -807,7 +1122,8 @@ fn test_referrer_bonus_points_per_bet() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &50_0000000_i128);
 
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 }
 
 // ── 31. Spam guard: TooManyBets ──────────────────────────────────────────────
@@ -820,8 +1136,10 @@ fn test_reject_too_many_bets() {
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 100_000_000_000);
 
+    // 1.1 XLM gross clears the net minimum (net = 1.078 XLM >= MIN_BET) so the
+    // 21st bet actually trips the TooManyBets guard instead of BetTooSmall.
     for _ in 0..=20u32 {
-        t.client.place_bet(&user, &id, &true, &1_0000000_i128);
+        t.client.place_bet(&user, &id, &true, &11_0000000_i128);
     }
 }
 
@@ -890,6 +1208,31 @@ fn test_market_creation_rate_limit_resets_after_window() {
         &7200_u64,
     );
     assert_eq!(id, 11);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_market_creation_rate_limit_rejects_timestamp_regression() {
+    let t = setup();
+    for i in 0..10u32 {
+        let _ = t.client.create_market(
+            &t.admin,
+            &String::from_str(&t.env, "Market"),
+            &String::from_str(&t.env, "https://x.png"),
+            &Category::Crypto,
+            &(3600_u64 + i as u64),
+        );
+    }
+
+    // Rewinding the ledger must not reset the active rate-limit window.
+    rewind_time(&t.env, 1);
+    t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Over limit after rewind"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Sports,
+        &7200_u64,
+    );
 }
 
 // ── 33. Double initialization rejected ───────────────────────────────────────
@@ -1016,7 +1359,7 @@ fn test_empty_side_resolution_pool_to_fees() {
     // Only YES bets — no one bets NO
     t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
     let fees_before = t.client.get_accumulated_fees();
-    assert_eq!(fees_before, 2_0000000); // 2% platform fee
+    assert_eq!(fees_before, 1_5000000); // 1.5% platform fee (referral fee goes to surplus)
 
     // Advance past end_time and resolve NO (empty winning side)
     advance_time(&t.env, 3601);
@@ -1030,8 +1373,9 @@ fn test_empty_side_resolution_pool_to_fees() {
         "entire YES pool should sweep to fees when NO side is empty"
     );
 
-    // Admin can withdraw the swept pool
+    // Admin can withdraw the swept pool to a registered treasury
     let treasury = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &treasury);
     let before = t.xlm.balance(&treasury);
     let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
     assert_eq!(withdrawn, fees_after);
@@ -1040,6 +1384,7 @@ fn test_empty_side_resolution_pool_to_fees() {
 
     // Alice (was YES, losing side) can still claim — gets PULSE tokens + points
     t.client.claim(&alice, &id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
     let bet = t.client.get_bet(&id, &alice);
     assert!(bet.claimed);
     // Gets lose-tier rewards because winning_side == 0
@@ -1058,10 +1403,10 @@ fn test_cancel_fees_zeroed_correctly() {
     fund_user(&t, &alice, 200_0000000);
     fund_user(&t, &bob, 200_0000000);
 
-    // Two bets accumulate fees
-    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 2 XLM fee
-    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 2 XLM fee
-    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+    // Two bets accumulate fees (only platform_fee tracked; referral fee goes to surplus)
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 1.5 XLM platform fee
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 1.5 XLM platform fee
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000);
 
     // Cancel zeroes out those fees
     t.client.cancel_market(&t.admin, &id);
@@ -1070,6 +1415,71 @@ fn test_cancel_fees_zeroed_correctly() {
     // Bettors get their gross back
     t.client.cancel_refund(&alice, &id);
     t.client.cancel_refund(&bob, &id);
+}
+
+// ── 42b. Cancel reclaims only the fees a market actually retained (issue #87) ─
+
+#[test]
+fn test_cancel_market_reclaims_only_retained_fees() {
+    let t = setup();
+
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    let charlie = Address::generate(&t.env);
+    let referrer = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+    fund_user(&t, &charlie, 200_0000000);
+
+    // Referrer + Bob (with referrer). Alice and Charlie bet without one.
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
+    t.referral_client.register_referral(
+        &bob,
+        &String::from_str(&t.env, "Bob"),
+        &Some(referrer.clone()),
+    );
+
+    let m1 = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "M1"),
+        &String::from_str(&t.env, "https://m1.png"),
+        &Category::Crypto,
+        &3600_u64,
+    );
+    let m2 = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "M2"),
+        &String::from_str(&t.env, "https://m2.png"),
+        &Category::Crypto,
+        &3600_u64,
+    );
+
+    // Market 1: Alice (no referrer → 2 XLM retained) + Bob (referrer → 1.5
+    // XLM retained, 0.5 XLM already paid to the referrer at bet time).
+    t.client.place_bet(&alice, &m1, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &m1, &false, &100_0000000_i128);
+
+    // Market 2: Charlie (no referrer → 2 XLM retained).
+    t.client.place_bet(&charlie, &m2, &true, &100_0000000_i128);
+
+    // 2 + 1.5 + 2 = 5.5 XLM accumulated; the referrer already holds 0.5 XLM.
+    assert_eq!(t.client.get_accumulated_fees(), 5_5000000);
+    assert_eq!(t.xlm.balance(&referrer), 5000000);
+
+    // Cancelling market 1 must reclaim only 3.5 XLM (2 + 1.5), leaving
+    // market 2's 2 XLM untouched. The old net-pool formula reclaimed 4 XLM
+    // and silently ate 0.5 XLM of market 2's platform fees.
+    t.client.cancel_market(&t.admin, &m1);
+    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+
+    // Bettors still pull their full gross refunds; the referrer fee is gone.
+    assert_eq!(t.client.cancel_refund(&alice, &m1), 100_0000000);
+    assert_eq!(t.client.cancel_refund(&bob, &m1), 100_0000000);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1086,11 +1496,18 @@ fn test_e2e_full_inter_contract_flow() {
     fund_user(&t, &alice, 1000_0000000);
     fund_user(&t, &bob, 1000_0000000);
 
+    let no_ref: Option<Address> = None;
+    t.referral_client.register_referral(
+        &referrer,
+        &String::from_str(&t.env, "Referrer"),
+        &no_ref,
+    );
     t.referral_client.register_referral(
         &alice,
         &String::from_str(&t.env, "Alice"),
         &Some(referrer.clone()),
     );
+    t.leaderboard_client.claim_pending_rewards(&alice);
     assert_eq!(t.leaderboard_client.get_points(&alice), 5);
     assert_eq!(t.token_client.balance(&alice), 1_0000000);
 
@@ -1108,7 +1525,8 @@ fn test_e2e_full_inter_contract_flow() {
         .place_bet(&alice, &market_id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 3);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
     // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
     assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
     assert_eq!(t.client.get_market(&market_id).total_yes, 98_0000000);
@@ -1117,7 +1535,9 @@ fn test_e2e_full_inter_contract_flow() {
     // Bob bets NO 200 XLM — no referrer
     t.client
         .place_bet(&bob, &market_id, &false, &200_0000000_i128);
-    assert_eq!(t.client.get_accumulated_fees(), 5_5000000);
+    // Issue #78: only platform_fee tracked per bet; referral fee goes to surplus.
+    // Alice: 1.5M, Bob: 3M platform fee → total 4.5M
+    assert_eq!(t.client.get_accumulated_fees(), 4_5000000);
     // Bob never registered, so no bonus: total_bets = won(0) + lost(0) + bonus(0).
     assert_eq!(t.leaderboard_client.get_stats(&bob).total_bets, 0);
     assert_eq!(t.client.get_market(&market_id).total_no, 196_0000000);
@@ -1130,7 +1550,8 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 150_0000000);
     assert_eq!(t.client.get_market(&market_id).total_yes, 147_0000000);
     assert_eq!(t.client.get_market(&market_id).bet_count, 2);
-    assert_eq!(t.leaderboard_client.get_points(&referrer), 6);
+    t.leaderboard_client.claim_pending_rewards(&referrer);
+    assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 
     // Add a resolver and resolve via them
     let resolver = Address::generate(&t.env);
@@ -1142,6 +1563,7 @@ fn test_e2e_full_inter_contract_flow() {
     // Alice claims as winner
     let alice_xlm_before = t.xlm.balance(&alice);
     t.client.claim(&alice, &market_id);
+    t.leaderboard_client.claim_pending_rewards(&alice);
     let alice_payout = t.xlm.balance(&alice) - alice_xlm_before;
     assert_eq!(alice_payout, 343_0000000);
     assert_eq!(t.leaderboard_client.get_points(&alice), 35);
@@ -1150,12 +1572,14 @@ fn test_e2e_full_inter_contract_flow() {
     // Bob claims as loser
     let bob_xlm_before = t.xlm.balance(&bob);
     t.client.claim(&bob, &market_id);
+    t.leaderboard_client.claim_pending_rewards(&bob);
     assert_eq!(t.xlm.balance(&bob), bob_xlm_before);
     assert_eq!(t.leaderboard_client.get_points(&bob), 10);
     assert_eq!(t.token_client.balance(&bob), 2_0000000);
 
-    // Fee withdrawal to a treasury address
+    // Fee withdrawal to a registered treasury address
     let treasury = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &treasury);
     let fees_total = t.client.get_accumulated_fees();
     assert!(fees_total > 0);
     let treasury_before = t.xlm.balance(&treasury);
@@ -1277,4 +1701,675 @@ fn test_single_winner_gets_whole_net_pool() {
     // Whole pool (both nets) goes to the single winner.
     assert_eq!(t.xlm.balance(&winner) - before, total);
     assert_eq!(t.client.get_payout(&id, &winner), total);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION SUITE — issue #9 (persistent storage TTL)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn advance_ledgers(env: &Env, n: u32) {
+    let current_seq = env.ledger().sequence();
+    env.ledger().set(LedgerInfo {
+        timestamp: env.ledger().timestamp() + 1,
+        protocol_version: 26,
+        sequence_number: current_seq + n,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 100,
+        min_persistent_entry_ttl: 100,
+        max_entry_ttl: 10_000_000,
+    });
+}
+
+// ── #9: claims/refunds keep recoverable storage alive (TTL re-bump) ──────────
+#[test]
+fn test_claim_rebumps_ttl_entries() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    // Fast-forward deep into the TTL window (but not past it).
+    advance_ledgers(&t.env, 6_000_000);
+
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let before_bet = ttl(&bet_key);
+    let before_market = ttl(&market_key);
+
+    t.client.claim(&user, &id);
+
+    let after_bet = ttl(&bet_key);
+    let after_market = ttl(&market_key);
+    assert!(after_bet > before_bet);
+    assert!(after_market > before_market);
+}
+
+#[test]
+fn test_cancel_refund_rebumps_ttl_entries() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.cancel_market(&t.admin, &id);
+
+    advance_ledgers(&t.env, 6_000_000);
+
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let bet_before = ttl(&bet_key);
+    let market_before = ttl(&market_key);
+
+    t.client.cancel_refund(&user, &id);
+
+    assert!(ttl(&bet_key) > bet_before);
+    assert!(ttl(&market_key) > market_before);
+}
+
+// ── #54: permissionless refresh + per-market expiry tracking + migration ─────
+
+#[test]
+fn test_get_market_ttl_tracks_live_entry() {
+    let t = setup();
+    assert_eq!(t.client.get_market_ttl(&99_u64), 0);
+    let id = create_test_market(&t);
+    assert!(t.client.get_market_ttl(&id) >= TTL_BUMP);
+}
+
+#[test]
+fn test_refresh_market_ttl_rebumps_bet_and_market() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let bet_before = ttl(&bet_key);
+    let market_before = ttl(&market_key);
+
+    assert_eq!(t.client.refresh_market_ttl(&id), 1);
+    assert!(ttl(&bet_key) > bet_before);
+    assert!(ttl(&market_key) > market_before);
+    assert!(t.client.get_market_ttl(&id) > market_before);
+}
+
+// ── Cross-contract interface versioning (issue #84) ───────────────────────────
+
+// Stands in for a referral_registry/leaderboard deployment upgraded to an
+// incompatible ABI: it only implements interface_version(), reporting a
+// version this prediction_market build does not expect.
+#[contract]
+struct MockIncompatibleDependency;
+
+#[contractimpl]
+impl MockIncompatibleDependency {
+    pub fn interface_version(_env: Env) -> u32 {
+        99
+    }
+}
+
+#[test]
+fn test_interface_version_reported() {
+    let t = setup();
+    assert_eq!(t.client.interface_version(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #36)")]
+fn test_place_bet_rejects_incompatible_referral() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+
+    let market_contract = t.client.address.clone();
+    let bet_key = DataKey::Bet(id, user.clone());
+    let market_key = DataKey::Market(id);
+    let ttl = |key: &DataKey| -> u32 {
+        t.env
+            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+    };
+    let bet_before = ttl(&bet_key);
+    let market_before = ttl(&market_key);
+
+    // Anyone can pay to keep the keys alive — no auth required.
+    assert_eq!(t.client.refresh_market_ttl(&id), 1);
+    assert!(ttl(&bet_key) > bet_before);
+    assert!(ttl(&market_key) > market_before);
+    assert!(t.client.get_market_ttl(&id) > market_before);
+}
+
+#[test]
+fn test_refresh_markets_migrates_existing_entries() {
+    let t = setup();
+    let a = create_test_market(&t);
+    let b = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 400_0000000);
+    t.client.place_bet(&user, &a, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &b, &true, &100_0000000_i128);
+
+    advance_ledgers(&t.env, 6_000_000);
+    let before_a = t.client.get_market_ttl(&a);
+    let bumped = t.client.refresh_markets(&1_u64, &20_u32);
+    assert_eq!(bumped, 2);
+    assert!(t.client.get_market_ttl(&a) > before_a);
+    assert!(t.client.get_market_ttl(&b) >= TTL_BUMP);
+}
+
+#[test]
+fn test_resolve_market_rebumps_payout_entry() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let winner = Address::generate(&t.env);
+    let loser = Address::generate(&t.env);
+    fund_user(&t, &winner, 200_0000000);
+    fund_user(&t, &loser, 200_0000000);
+    t.client.place_bet(&winner, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&loser, &id, &false, &100_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+    let market_contract = t.client.address.clone();
+    let payout_key = DataKey::Payout(id, winner);
+    let payout_ttl = t.env.as_contract(&market_contract, || {
+        t.env.storage().persistent().get_ttl(&payout_key)
+    });
+    assert!(payout_ttl >= TTL_BUMP);
+}
+
+#[test]
+fn test_claim_survives_incompatible_leaderboard() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let fake_leaderboard = t.env.register(MockIncompatibleDependency, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &fake_leaderboard,
+        &cfg.xlm_sac,
+    );
+
+    t.client.claim(&user, &id);
+    assert!(t.client.get_bet(&id, &user).claimed);
+}
+
+// Stands in for a leaderboard deployment that reports the version this
+// prediction_market build expects, but is missing the actual reward()
+// function it's about to call. Proves the known limitation of the version
+// check: a matching u32 alone does not prove ABI compatibility, only that
+// the callee's author intended it to be compatible. If a breaking change to
+// reward()'s signature ever ships without bumping INTERFACE_VERSION, this is
+// exactly the failure mode that results, just past the version check instead
+// of at it.
+#[contract]
+struct MockLeaderboardMissingReward;
+
+#[contractimpl]
+impl MockLeaderboardMissingReward {
+    pub fn interface_version(_env: Env) -> u32 {
+        1
+    }
+    // No reward() here on purpose.
+}
+
+#[test]
+fn test_matching_version_does_not_block_claim_when_queue_is_missing() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let fake_leaderboard = t.env.register(MockLeaderboardMissingReward, ());
+    let cfg = t.client.get_config();
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &fake_leaderboard,
+        &cfg.xlm_sac,
+    );
+
+    // The optional queue call fails, but claim state and the XLM payout remain
+    // successful because the failure is intentionally ignored.
+    t.client.claim(&user, &id);
+    assert!(t.client.get_bet(&id, &user).claimed);
+}
+
+// ── Emergency Pause (issue #83) ───────────────────────────────────────────────
+
+#[test]
+fn test_pause_unpause_admin_only() {
+    let t = setup();
+    assert!(!t.client.is_paused());
+
+    t.client.pause(&t.admin);
+    assert!(t.client.is_paused());
+
+    t.client.unpause(&t.admin);
+    assert!(!t.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_pause_rejects_non_admin() {
+    let t = setup();
+    let not_admin = Address::generate(&t.env);
+    t.client.pause(&not_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_create_market() {
+    let t = setup();
+    t.client.pause(&t.admin);
+    create_test_market(&t);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_place_bet() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+
+    t.client.pause(&t.admin);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_resolve_market() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+
+    t.client.pause(&t.admin);
+    t.client.resolve_market(&t.admin, &id, &true);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_claim() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    t.client.pause(&t.admin);
+    t.client.claim(&user, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_withdraw_fees() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    t.client.pause(&t.admin);
+    t.client.withdraw_fees(&t.admin, &t.admin);
+}
+
+// Refunds remain the users' emergency exit even while paused.
+#[test]
+fn test_cancel_refund_still_works_while_paused() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.cancel_market(&t.admin, &id);
+
+    t.client.pause(&t.admin);
+    let refunded = t.client.cancel_refund(&user, &id);
+    assert_eq!(refunded, 100_0000000);
+}
+
+// View functions must keep working while paused.
+#[test]
+fn test_view_functions_work_while_paused() {
+    let t = setup();
+    let id = create_test_market(&t);
+    t.client.pause(&t.admin);
+
+    assert_eq!(t.client.get_market_count(), 1);
+    let market = t.client.get_market(&id);
+    assert_eq!(market.id, id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_cancel_market() {
+    let t = setup();
+    let id = create_test_market(&t);
+
+    t.client.pause(&t.admin);
+    t.client.cancel_market(&t.admin, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_request_withdraw_fees() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+
+    t.client.pause(&t.admin);
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_paused_rejects_execute_withdraw_fees() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+
+    // Request while unpaused, then let the timelock mature — the pause check
+    // in execute_withdraw_fees must still block payout even on a matured request.
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    advance_time(&t.env, WITHDRAW_DELAY_SECS);
+
+    t.client.pause(&t.admin);
+    t.client.execute_withdraw_fees(&recipient);
+}
+
+// The admin's ability to kill a compromised/stuck withdrawal request must
+// remain available mid-pause, same as the users' cancel_refund exit path.
+#[test]
+fn test_cancel_withdrawal_request_still_works_while_paused() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+
+    t.client.pause(&t.admin);
+    t.client.cancel_withdrawal_request(&t.admin, &recipient);
+
+    assert!(t.client.get_pending_withdrawal(&recipient).is_none());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION — issue #51 (set_config pinning / governance)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn second_leaderboard(t: &TestSetup) -> Address {
+    let id = t.env.register(LeaderboardContract, ());
+    let client = leaderboard::LeaderboardContractClient::new(&t.env, &id);
+    client.initialize(&t.admin, &t.client.address, &t.referral_client.address);
+    id
+}
+
+#[test]
+fn test_set_config_does_not_apply_immediately() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+
+    // Live config is unchanged until execute_set_config after the delay.
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+    let pending = t.client.get_pending_config().expect("pending change");
+    assert_eq!(pending.cfg.leaderboard, new_lb);
+    assert_eq!(pending.approvers.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_arbitrary_address() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let attacker = Address::generate(&t.env);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &attacker,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_set_config_rejects_wasm_as_xlm_sac() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    // A WASM/native contract must not be installable as the XLM SAC.
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.token,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn test_set_config_execute_before_delay() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_execute_after_delay_and_pin() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&t.admin);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+    assert!(t.client.get_pending_config().is_none());
+    let pins = t.client.get_pinned_hashes().expect("pins");
+    assert_eq!(pins.xlm_sac, BytesN::from_array(&t.env, &[0u8; 32]));
+}
+
+#[test]
+fn test_cancel_set_config_during_dispute_window() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.cancel_set_config(&t.admin);
+    assert!(t.client.get_pending_config().is_none());
+    assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn test_set_config_multisig_requires_threshold() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    // Only the proposer approved (1 of 2).
+    t.client.execute_set_config(&t.admin);
+}
+
+#[test]
+fn test_set_config_multisig_execute_with_second_approval() {
+    let t = setup();
+    let g2 = Address::generate(&t.env);
+    t.client.add_governor(&t.admin, &g2);
+    t.client.set_governor_threshold(&t.admin, &2_u32);
+
+    let cfg = t.client.get_config();
+    let new_lb = second_leaderboard(&t);
+    t.client.set_config(
+        &t.admin,
+        &cfg.token,
+        &cfg.referral,
+        &new_lb,
+        &cfg.xlm_sac,
+    );
+    t.client.approve_set_config(&g2);
+    advance_time(&t.env, CONFIG_DELAY_SECS);
+    t.client.execute_set_config(&g2);
+
+    assert_eq!(t.client.get_config().leaderboard, new_lb);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_config_non_governor_rejected() {
+    let t = setup();
+    let cfg = t.client.get_config();
+    let stranger = Address::generate(&t.env);
+    t.client.set_config(
+        &stranger,
+        &cfg.token,
+        &cfg.referral,
+        &cfg.leaderboard,
+        &cfg.xlm_sac,
+    );
+fn last_event_name(env: &Env) -> Symbol {
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than an indexable Vec of
+    // (address, topics, data) tuples.
+    let events = env.events().all();
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "no event was emitted");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(env, &body.topics[0]).unwrap();
+    Symbol::try_from_val(env, &topic0).unwrap()
+}
+
+#[test]
+fn test_create_market_emits_event() {
+    let t = setup();
+    let _id = create_test_market(&t);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_created"));
+}
+
+#[test]
+fn test_place_bet_emits_event() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "bet_placed"));
+}
+
+#[test]
+fn test_resolve_market_emits_event() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    fund_user(&t, &bob, 200_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &id, &true);
+    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_resolved"));
 }

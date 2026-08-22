@@ -671,43 +671,16 @@ impl LeaderboardContract {
 
     // ── Legacy write functions (kept for backward-compat) ─────────────────────
 
-    /// Legacy: called by the market contract to add points and update win/loss.
-    /// Prefer reward() for new integrations (adds token minting in one call).
+    /// Deprecated: use `reward()` instead. This function always returns
+    /// `UnauthorizedCaller` and will be removed in a future version.
     pub fn add_pts(
-        env: Env,
-        caller: Address,
-        user: Address,
-        pts: u64,
-        is_won: bool,
+        _env: Env,
+        _caller: Address,
+        _user: Address,
+        _pts: u64,
+        _is_won: bool,
     ) -> Result<(), LeaderboardError> {
-        let market: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != market {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
-        caller.require_auth();
-
-        let mut s = Self::load_stored(&env, &user);
-        s.points += pts;
-        if is_won {
-            s.won_bets += 1;
-        } else {
-            s.lost_bets += 1;
-        }
-        Self::save_stored(&env, &user, &s);
-        Self::update_top_players(&env, user, s.points);
-        Self::commit_stats(&env, &user, &stats);
-
-        Self::update_top_players(&env, user.clone(), stats.points);
-        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
-        env.events().publish(
-            (Symbol::new(&env, "leaderboard_updated"), user),
-            stats.points,
-        );
-        Ok(())
+        Err(LeaderboardError::UnauthorizedCaller)
     }
 
     /// Legacy: called by the referral contract to award bonus points.

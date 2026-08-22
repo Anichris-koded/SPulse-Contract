@@ -554,6 +554,16 @@ fn test_credit_rejects_incompatible_leaderboard() {
     // fail against the incompatible leaderboard, and this test is only
     // concerned with credit()'s own version check.
     t.env.as_contract(&t.referral_id, || {
+        // Both sides of the edge must look registered: this test exercises
+        // credit()'s own leaderboard version check, not the #99 referrer
+        // validation.
+        t.env.storage().persistent().set(
+            &DataKey::Profile(referrer.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Ref"),
+                referrer: None,
+            },
+        );
         t.env.storage().persistent().set(
             &DataKey::Profile(user.clone()),
             &UserProfile {

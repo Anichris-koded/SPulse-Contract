@@ -250,6 +250,20 @@ impl ReferralRegistryContract {
         Self::require_market_contract(&env, &caller)?;
         // Lever A: resolve referrer via packed Profile (new) or legacy key (old).
         let referrer: Option<Address> = Self::load_profile(&env, &user).and_then(|p| p.referrer);
+        // Issue #99 defense-in-depth: a stale/invalid edge pointing at an
+        // address that is not itself registered must never get paid.
+        let referrer = match referrer {
+            Some(r) if Self::is_registered(env.clone(), r.clone()) => Some(r),
+            other => {
+                if other.is_some() {
+                    env.events().publish(
+                        (Symbol::new(&env, "referral_invalid"), user.clone()),
+                        (),
+                    );
+                }
+                None
+            }
+        };
         match referrer {
             Some(ref_addr) => {
                 let xlm_sac: Address = env

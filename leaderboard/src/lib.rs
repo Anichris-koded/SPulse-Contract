@@ -1,18 +1,37 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Val,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal,
+    Symbol, Val, Vec,
 };
 
-const MAX_TOP_PLAYERS: u32 = 50;
+pub const MAX_TOP_PLAYERS: u32 = 50;
+const MAX_PAGE_SIZE: u32 = MAX_TOP_PLAYERS;
+/// Bound on bubble swaps per write so a fill-to-capacity burst of ascending
+/// inserts cannot blow the per-transaction write-footprint limit. Read paths
+/// re-sort on decayed values, so ordering converges without full bubbles.
+const MAX_BUBBLE_STEPS: u32 = 4;
+/// Issue #69: one decay period is ~1 week of ledgers (at ~5s per ledger).
+const DECAY_PERIOD_LEDGERS: u32 = 120_960;
+/// Each period a score keeps DECAY_RETAIN_NUM/DECAY_RETAIN_DEN of its value.
+const DECAY_RETAIN_NUM: u64 = 9;
+const DECAY_RETAIN_DEN: u64 = 10;
+/// A score fully stale (decayed to zero) after this many periods (~2 years):
+/// derived from TTL_HIGH so a score cannot outlive its storage entry.
+const DECAY_ZERO_AFTER_PERIODS: u32 = TTL_HIGH / DECAY_PERIOD_LEDGERS;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
+
+/// Rank returned by `get_rank` for a player who is not in the top list.
+/// (`MAX_TOP_PLAYERS + 1`) so that an unranked player never sorts above a
+/// real position and the "unranked" state is unambiguous (issue #91). Callers
+/// should treat `rank > MAX_TOP_PLAYERS` as "not ranked".
+pub const UNRANKED_RANK: u32 = MAX_TOP_PLAYERS + 1;
 
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes. Callers pin the version they were
 // built against and check it before invoking, so an incompatible upgrade
-// fails with a clear error instead of a silently broken cross-contract call.
+// fails loudly instead of misbehaving.
 pub const INTERFACE_VERSION: u32 = 1;
 
 // Issue #84: the version of pulse_token's ABI that reward()/reward_bonus()
@@ -31,23 +50,15 @@ pub enum LeaderboardError {
     NotAdmin = 5,
     ContractPaused = 6,
     /// pulse_token reported an interface_version this contract wasn't built
-    /// against (issue #84). Note: a matching version number alone does not
-    /// prove the callee's actual function shape still matches; it only
-    /// proves the callee's author intended it to. The guarantee only holds
-    /// if every breaking ABI change (renamed function, changed argument
-    /// order/count/type, changed return type) always increments
-    /// INTERFACE_VERSION in the same commit. See EXPECTED_TOKEN_INTERFACE_VERSION.
+    /// against (issue #84).
     IncompatibleInterface = 7,
     /// reward()/reward_bonus() called with tokens > 0 but no TokenContract
     /// has been set via set_token_contract.
     TokenNotConfigured = 8,
 }
 
-// OPT: was 4 separate keys per user (Points, TotalBets, WonBets, LostBets).
-//      Now 1 key per user (Stats) — saves 3 storage reads + 3 writes on
-//      every add_pts call and 3 reads on every get_stats call.
-//      TopPlayerSlot retained as a reverse lookup for O(1) in-place update.
-//      TopPlayerCount moves to instance storage (free to read with other keys).
+// OPT: single key per user. `points` carries the decay epoch it was written
+// in; won/lost/bonus counters are lifetime totals (issue #69/#64).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -57,39 +68,89 @@ pub enum DataKey {
     // Lever G: token address so reward() can mint PULSE internally — one
     // cross-call from the market instead of two (add_pts + mint).
     TokenContract,
-    Stats(Address), // was: Points + TotalBets + WonBets + LostBets (4 keys → 1)
+    Stats(Address),
+    PendingReward(Address), // issue #73: deferred reward queue
     TopPlayerAt(u32),
     TopPlayerCount,
-    TopPlayerSlot(Address),
-    TopPlayerSeqAt(u32), // u64 — FIFO insertion sequence for the player at a slot
-    SeqCounter,          // u64 — monotonic counter feeding TopPlayerSeqAt
-    MinPoints, // u64 — points of the weakest entry currently in the top list
-    MinSlot,   // u32 — slot index of that weakest entry
+    TopPlayerSlot(Address), // reverse lookup: address -> slot
+    TopPlayerSeqAt(u32),    // u64 — FIFO insertion sequence for the player at a slot
+    SeqCounter,             // u64 — monotonic counter feeding TopPlayerSeqAt
+    MinPoints,              // u64 — decayed points of the weakest entry in the top list
+    MinSlot,                // u32 — slot index of that weakest entry
     Paused,
-}
-
-// OPT: PlayerEntry now embeds points directly (avoids a Stats read during sort)
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PlayerEntry {
-    pub address: Address,
-    pub points: u64,
 }
 
 // External-facing stats struct (ABI stable)
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct PlayerStats {
     pub points: u64,
-    // Total activity: settled wins + settled losses + bonus awards.
     pub total_bets: u32,
     pub won_bets: u32,
     pub lost_bets: u32,
 }
 
-// Internal packed stats —
+// OPT: PlayerEntry embeds points directly (avoids a Stats read during sort)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerEntry {
+    pub address: Address,
+    pub points: u64,
+    /// Issue #69: the decay epoch `points` is expressed in.
+    ///
+    /// Carrying it on the entry rather than in a side key is what keeps decay
+    /// affordable: comparing two entries needs no extra ledger reads, so the
+    /// eviction and ordering paths stay inside the 100-entry transaction
+    /// footprint that a per-entry lookup would have blown.
+    pub epoch: u32,
+}
 
-// ── Contract ──────────────────────────────────────────────────────────────────
+/// Internal per-user record. `points` decays; the counters are lifetime totals
+/// derived into `PlayerStats::total_bets` at read time as
+/// won_bets + lost_bets + bonus_bets so bonus-only users are never invisible
+/// (issues #19/#64) and the three counters can never drift apart.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredStats {
+    pub points: u64,
+    pub epoch: u32, // the decay epoch `points` is expressed in
+    pub won_bets: u32,
+    pub lost_bets: u32,
+    pub bonus_bets: u32,
+}
+
+impl StoredStats {
+    fn zero() -> Self {
+        StoredStats {
+            points: 0,
+            epoch: 0,
+            won_bets: 0,
+            lost_bets: 0,
+            bonus_bets: 0,
+        }
+    }
+
+    fn to_player_stats(&self) -> PlayerStats {
+        PlayerStats {
+            points: self.points,
+            total_bets: self.won_bets + self.lost_bets + self.bonus_bets,
+            won_bets: self.won_bets,
+            lost_bets: self.lost_bets,
+        }
+    }
+}
+
+/// A deferred reward (issue #73): queued by the market at claim time and
+/// materialised when the user calls claim_pending_rewards.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingReward {
+    pub points: u64,
+    pub tokens: i128,
+    pub won_delta: u32,
+    pub lost_delta: u32,
+    pub bet_delta: u32,
+}
 
 #[contract]
 pub struct LeaderboardContract;
@@ -107,8 +168,12 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::MarketContract, &market_contract);
-        env.storage().instance().set(&DataKey::ReferralContract, &referral_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::MarketContract, &market_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReferralContract, &referral_contract);
         env.storage().instance().set(&DataKey::TopPlayerCount, &0_u32);
         env.storage().instance().set(&DataKey::MinPoints, &0_u64);
         env.storage().instance().set(&DataKey::MinSlot, &0_u32);
@@ -116,7 +181,16 @@ impl LeaderboardContract {
         Ok(())
     }
 
-    pub fn set_token_contract(env: Env, admin: Address, token: Address) -> Result<(), LeaderboardError> {
+    /// The cross-contract ABI version this deployment implements (issue #84).
+    pub fn interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
+    }
+
+    pub fn set_token_contract(
+        env: Env,
+        admin: Address,
+        token: Address,
+    ) -> Result<(), LeaderboardError> {
         let stored: Address = env
             .storage()
             .instance()
@@ -126,21 +200,12 @@ impl LeaderboardContract {
             return Err(LeaderboardError::NotAdmin);
         }
         admin.require_auth();
-        env.storage().instance().set(&DataKey::TokenContract, &token);
-        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Self::write_token_contract(&env, token);
         Ok(())
     }
 
-    /// The cross-contract ABI version this deployment implements (issue #84).
-    /// Callers that invoke add_pts/add_bonus_pts/reward/reward_bonus should
-    /// check this before calling so an upgrade with a breaking signature
-    /// change fails loudly instead of misbehaving.
-    pub fn interface_version(_env: Env) -> u32 {
-        INTERFACE_VERSION
-    }
-
     /// Halt point/reward accrual in an emergency. Admin only. View functions
-    /// (get_points, get_top_players, ...) keep working.
+    /// keep working so the frontend can still read state.
     pub fn pause(env: Env, admin: Address) -> Result<(), LeaderboardError> {
         let stored: Address = env
             .storage()
@@ -152,7 +217,7 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((Symbol::new(&env, "paused"), admin), true);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
 
@@ -168,27 +233,20 @@ impl LeaderboardContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
-            .get(&DataKey::Paused)
+            .get::<_, bool>(&DataKey::Paused)
             .unwrap_or(false)
     }
 
-    /// Original ABI name — kept for callers that deploy against the pre-#23
-    /// interface (prediction_market and referral_registry tests use it).
-    pub fn set_token(
-        env: Env,
-        admin: Address,
-        token: Address,
-    ) -> Result<(), LeaderboardError> {
-        Self::set_token_contract(env, admin, token)
-    }
+    // ── Immediate accrual paths ──────────────────────────────────────────────
 
+    /// Called by the market contract when a bet is placed: lifetime win/loss
+    /// accounting + points, no token minting.
     pub fn add_pts(
         env: Env,
         caller: Address,
@@ -197,176 +255,56 @@ impl LeaderboardContract {
         is_won: bool,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
-        let market: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != market {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
+        Self::require_market_contract(&env, &caller)?;
         caller.require_auth();
-
-        let mut stats: PlayerStats = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Stats(user.clone()))
-            .unwrap_or(PlayerStats {
-                points: 0,
-                total_bets: 0,
-                won_bets: 0,
-                lost_bets: 0,
-            });
-
-        stats.points += pts;
-        stats.total_bets += 1;
-        if is_won {
-            stats.won_bets += 1;
-        } else {
-            stats.lost_bets += 1;
-        }
-
-        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
-        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
-
-        Self::update_top_players(&env, user.clone(), stats.points);
-        // Instance storage (TopPlayerCount, MinPoints, MinSlot, Admin, etc.)
-        // has its own TTL that is never bumped by persistent-key writes above —
-        // refresh it on every write so the leaderboard's cached min survives.
+        Self::credit_points(&env, &user, pts, Some(is_won));
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
-        env.events().publish(
-            (Symbol::new(&env, "leaderboard_updated"), user),
-            (stats.points, stats.won_bets, stats.lost_bets),
-        );
         Ok(())
     }
 
-    // ── reward() / reward_bonus() ──────────────────────────────────────────
-    // Restored ABI: prediction_market.claim() and referral_registry.
-    // register_referral() still invoke these entries, which the issue #23
-    // rewrite dropped. Points/win-loss accounting matches add_pts/
-    // add_bonus_pts; the PULSE mint happens here so the callers only pay one
-    // cross-contract hop (Lever G).
-
+    /// One-shot immediate reward: points + win/loss accounting + PULSE mint
+    /// in a single cross-contract hop (Lever G).
     pub fn reward(
         env: Env,
         caller: Address,
         user: Address,
         points: u64,
         tokens: i128,
-        is_winner: bool,
+        is_won: bool,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
+        Self::require_market_contract(&env, &caller)?;
         caller.require_auth();
-        let market: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != market {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
         if points == 0 {
             return Err(LeaderboardError::InvalidPoints);
         }
-
-        let mut stats: PlayerStats = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Stats(user.clone()))
-            .unwrap_or(PlayerStats {
-                points: 0,
-                total_bets: 0,
-                won_bets: 0,
-                lost_bets: 0,
-            });
-        stats.points += points;
-        stats.total_bets += 1;
-        if is_winner {
-            stats.won_bets += 1;
-        } else {
-            stats.lost_bets += 1;
-        }
-        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
-        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
-
-        Self::update_top_players(&env, user.clone(), stats.points);
+        Self::credit_points(&env, &user, points, Some(is_won));
+        Self::mint_tokens(&env, &user, tokens)?;
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
-
-        if tokens > 0 {
-            Self::mint_reward(&env, &user, tokens)?;
-        }
-        env.events().publish(
-            (Symbol::new(&env, "leaderboard_updated"), user),
-            (stats.points, is_winner, tokens),
-        );
         Ok(())
     }
 
+    /// Called by the referral contract for welcome / per-bet referral bonuses.
+    /// Increments bonus_bets (not won/lost) so total_bets stays accurate and
+    /// won_bets/lost_bets are never polluted with non-bet activity.
     pub fn reward_bonus(
         env: Env,
         caller: Address,
         user: Address,
-        points: u64,
+        pts: u64,
         tokens: i128,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
+        Self::require_referral_contract(&env, &caller)?;
         caller.require_auth();
-        let referral: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReferralContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != referral {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
-        if points == 0 {
-            return Err(LeaderboardError::InvalidPoints);
-        }
-
-        let mut stats: PlayerStats = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Stats(user.clone()))
-            .unwrap_or(PlayerStats {
-                points: 0,
-                total_bets: 0,
-                won_bets: 0,
-                lost_bets: 0,
-            });
-        stats.points += points;
-        stats.total_bets += 1; // bonus awards count as activity
-        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
-        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
-
-        Self::update_top_players(&env, user.clone(), stats.points);
+        Self::credit_bonus(&env, &user, pts);
+        Self::mint_tokens(&env, &user, tokens)?;
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
-
-        if tokens > 0 {
-            Self::mint_reward(&env, &user, tokens)?;
-        }
-        env.events().publish(
-            (Symbol::new(&env, "leaderboard_updated"), user),
-            (stats.points, tokens),
-        );
         Ok(())
     }
 
-    // Kept for ABI compatibility — total_bets is derived from won + lost +
-    // bonus at read time, so a standalone "bet recorded" call is a no-op.
-    pub fn record_bet(env: Env, caller: Address, _user: Address) -> Result<(), LeaderboardError> {
-        let market: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != market {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
-        caller.require_auth();
-        Ok(())
-    }
-
+    /// Legacy: called by the referral contract to award bonus points.
+    /// Prefer reward_bonus() for new integrations (adds token minting).
     pub fn add_bonus_pts(
         env: Env,
         caller: Address,
@@ -374,109 +312,176 @@ impl LeaderboardContract {
         pts: u64,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
-        let referral: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReferralContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != referral {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
+        Self::require_referral_contract(&env, &caller)?;
         caller.require_auth();
-
-        let mut stats: PlayerStats = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Stats(user.clone()))
-            .unwrap_or(PlayerStats {
-                points: 0,
-                total_bets: 0,
-                won_bets: 0,
-                lost_bets: 0,
-            });
-
-        stats.points += pts;
-        stats.total_bets += 1; // bonus counts as activity
-
-        env.storage().persistent().set(&DataKey::Stats(user.clone()), &stats);
-        env.storage().persistent().extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
-
-        Self::update_top_players(&env, user.clone(), stats.points);
+        Self::credit_bonus(&env, &user, pts);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
-        env.events().publish(
-            (Symbol::new(&env, "leaderboard_updated"), user),
-            stats.points,
-        );
         Ok(())
     }
 
-    pub fn get_points(env: Env, user: Address) -> u64 {
-        env.storage()
-            .persistent()
-            .get::<_, PlayerStats>(&DataKey::Stats(user))
-            .map(|s| s.points)
-            .unwrap_or(0)
+    /// Notification hook from the market that a bet was recorded. Only auth
+    /// and caller identity are verified — no accrual happens here.
+    pub fn record_bet(
+        env: Env,
+        caller: Address,
+        _user: Address,
+    ) -> Result<(), LeaderboardError> {
+        Self::require_market_contract(&env, &caller)?;
+        caller.require_auth();
+        Ok(())
     }
 
-    pub fn get_stats(env: Env, user: Address) -> PlayerStats {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Stats(user))
-            .unwrap_or(PlayerStats {
-                points: 0,
-                total_bets: 0,
-                won_bets: 0,
-                lost_bets: 0,
-            })
+    // ── Deferred rewards (issue #73) ─────────────────────────────────────────
+
+    /// Queue a reward instead of applying it immediately. A missing, paused,
+    /// incompatible, or out-of-budget leaderboard must not be able to roll
+    /// back the caller's primary operation, so the queue is written by the
+    /// market inside its own failure-tolerant path.
+    pub fn queue_reward(
+        env: Env,
+        caller: Address,
+        user: Address,
+        points: u64,
+        tokens: i128,
+        is_won: bool,
+    ) -> Result<(), LeaderboardError> {
+        Self::require_not_paused(&env)?;
+        Self::require_market_contract(&env, &caller)?;
+        caller.require_auth();
+        Self::accumulate_pending(&env, &user, points, tokens, is_won, false);
+        Ok(())
     }
 
-    pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TopPlayerCount)
-            .unwrap_or(0);
+    /// Materialise everything queued for `user`: points and counters are
+    /// applied (on top of the decayed balance) and queued PULSE is minted.
+    /// Permissionless — a user always has standing to collect their own
+    /// pending rewards.
+    pub fn claim_pending_rewards(env: Env, user: Address) -> Result<(), LeaderboardError> {
+        let key = DataKey::PendingReward(user.clone());
+        let pending: PendingReward = match env.storage().persistent().get(&key) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        env.storage().persistent().remove(&key);
 
-        if offset >= count || page_size == 0 {
-            return vec![&env];
+        if pending.points > 0 || pending.bet_delta > 0 {
+            let mut s = Self::load_stored(&env, &user);
+            s.points = Self::decay(s.points, Self::current_epoch(&env).saturating_sub(s.epoch));
+            s.epoch = Self::current_epoch(&env);
+            s.points += pending.points;
+            s.won_bets += pending.won_delta;
+            s.lost_bets += pending.lost_delta;
+            Self::save_stored(&env, &user, &s);
+            Self::update_top_players(&env, user.clone(), s.points);
         }
 
-        let end = (offset + page_size).min(count);
+        if pending.tokens > 0 {
+            Self::mint_tokens(&env, &user, pending.tokens)?;
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    pub fn get_pending_reward(env: Env, user: Address) -> Option<PendingReward> {
+        env.storage().persistent().get(&DataKey::PendingReward(user))
+    }
+
+    // ── Views ────────────────────────────────────────────────────────────────
+
+    /// Points as of *now*, with decay applied (issue #69). This is a read —
+    /// it never writes the decayed value back; the next accrual does that.
+    pub fn get_points(env: Env, user: Address) -> u64 {
+        Self::decayed_stats(&env, &user).points
+    }
+
+    /// Stats as of *now*. `points` carries decay; the activity counters are
+    /// lifetime totals and are deliberately left alone (issue #69 is about
+    /// ranking freshness, not rewriting a player's history).
+    pub fn get_stats(env: Env, user: Address) -> PlayerStats {
+        Self::decayed_stats(&env, &user)
+    }
+
+    /// Returns the number of players currently in the top list (≤ MAX_TOP_PLAYERS).
+    pub fn get_player_count(env: Env) -> u32 {
+        Self::top_count(&env)
+    }
+
+    pub fn get_top_player_count(env: Env) -> u32 {
+        Self::top_count(&env)
+    }
+
+    /// Page through the top list ranked on *current* (decayed) scores.
+    pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
+        let count = Self::top_count(&env);
+
+        if offset >= count || page_size == 0 {
+            return Vec::new(&env);
+        }
+
+        let page_size = page_size.min(MAX_PAGE_SIZE);
+
+        // Issue #69: the reported order is computed here, on decayed values,
+        // rather than trusted from storage order. Each entry carries its own
+        // epoch, so this costs no reads beyond the slots themselves — and it
+        // means a bounded bubble on the write path never shows up as a wrong
+        // ranking to a reader. Points are normalised to the current epoch, so
+        // a caller sees a score together with the epoch it is current as of.
+        let now = Self::current_epoch(&env);
+        let mut ranked: Vec<PlayerEntry> = Vec::new(&env);
+        for i in 0..count {
+            if let Some(mut entry) = env
+                .storage()
+                .persistent()
+                .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(i))
+            {
+                entry.points = Self::entry_points_now(&env, &entry);
+                entry.epoch = now;
+                ranked.push_back(entry);
+            }
+        }
+
+        // Selection sort, descending — bounded by MAX_TOP_PLAYERS.
+        let n = ranked.len() as u32;
+        for i in 0..n {
+            let mut max_idx = i;
+            for j in (i + 1)..n {
+                if ranked.get(j).unwrap().points > ranked.get(max_idx).unwrap().points {
+                    max_idx = j;
+                }
+            }
+            if max_idx != i {
+                let a = ranked.get(i).unwrap().clone();
+                let b = ranked.get(max_idx).unwrap().clone();
+                ranked.set(i, b);
+                ranked.set(max_idx, a);
+            }
+        }
+
+        let end = (offset + page_size).min(n);
         let mut result = Vec::new(&env);
         for i in offset..end {
-            if let Some(entry) = env.storage().persistent().get(&DataKey::TopPlayerAt(i)) {
-                result.push_back(entry);
-            }
+            result.push_back(ranked.get(i).unwrap());
         }
         result
     }
 
-    pub fn get_top_player_count(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::TopPlayerCount)
-            .unwrap_or(0)
-    }
-
-    /// Pre-#23 ABI name — same value as get_top_player_count().
-    pub fn get_player_count(env: Env) -> u32 {
-        Self::get_top_player_count(env)
-    }
-
-    // ── Rank (issue #67) ───────────────────────────────────────────────────
-    // A 1-based rank inside the top list; 0 means "not in the list". The
-    // reverse lookup is validated against the forward entry first so an
-    // orphaned/stale TopPlayerSlot can never produce a fake rank.
-
+    /// Rank is the 1-based position among *current* (decayed) scores:
+    /// 1 + number of players strictly ahead. Players outside the top list get
+    /// UNRANKED_RANK, never 0, so an unranked player can never sort above
+    /// (numerically lower than) a real position (issue #91). The reverse
+    /// lookup is validated against the forward entry first so an orphaned or
+    /// stale TopPlayerSlot can never produce a fake rank.
     pub fn get_rank(env: Env, user: Address) -> u32 {
-        let Some((slot, entry)) = Self::top_slot_entry(&env, &user) else {
-            return 0;
+        let count = Self::top_count(&env);
+        let slot = match Self::resolved_slot(&env, &user, count) {
+            Some(s) => s,
+            None => return UNRANKED_RANK,
         };
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TopPlayerCount)
+        let mine = Self::forward_entry(&env, slot)
+            .map(|e| Self::entry_points_now(&env, &e))
             .unwrap_or(0);
+
+        let now = Self::current_epoch(&env);
         let mut rank: u32 = 1;
         for i in 0..count {
             if i == slot {
@@ -487,7 +492,7 @@ impl LeaderboardContract {
                 .persistent()
                 .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(i))
             {
-                if e.points > entry.points {
+                if Self::decay(e.points, now.saturating_sub(e.epoch)) > mine {
                     rank += 1;
                 }
             }
@@ -495,18 +500,32 @@ impl LeaderboardContract {
         rank
     }
 
+    /// Points of the weakest entry currently in the top list, decayed to now.
     pub fn get_min_points(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MinPoints)
-            .unwrap_or(0)
+        let slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
+        match env
+            .storage()
+            .persistent()
+            .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(slot))
+        {
+            Some(entry) => Self::entry_points_now(&env, &entry),
+            None => env
+                .storage()
+                .instance()
+                .get(&DataKey::MinPoints)
+                .unwrap_or(0),
+        }
     }
 
     pub fn get_min_slot(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MinSlot)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0)
+    }
+
+    /// Rebuild `TopPlayerSlot` from live `TopPlayerAt` entries, compact holes
+    /// left by TTL expiry, and refresh the min cache. Anyone may call this
+    /// (keeper/repair); it only writes keys that restore the index invariant.
+    pub fn reconcile_top_slots(env: Env) {
+        Self::repair_top_index(&env);
     }
 
     /// Permissionless keeper: extend a player's Stats + top-list mapping and
@@ -518,65 +537,212 @@ impl LeaderboardContract {
                 .persistent()
                 .extend_ttl(&stats_key, TTL_BUMP, TTL_HIGH);
         }
-        if let Some((slot, _)) = Self::top_slot_entry(&env, &user) {
-            env.storage().persistent().extend_ttl(
-                &DataKey::TopPlayerAt(slot),
-                TTL_BUMP,
-                TTL_HIGH,
-            );
-            env.storage().persistent().extend_ttl(
-                &DataKey::TopPlayerSlot(user),
-                TTL_BUMP,
-                TTL_HIGH,
-            );
+        let count = Self::top_count(&env);
+        if let Some(slot) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::TopPlayerSlot(user.clone()))
+        {
+            if Self::forward_entry(&env, slot).is_some() && slot < count {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::TopPlayerAt(slot), TTL_BUMP, TTL_HIGH);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::TopPlayerSlot(user),
+                    TTL_BUMP,
+                    TTL_HIGH,
+                );
+            }
         }
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
     }
 
-    // ── Internal: maintain a persistent sorted top list ──────────────────────
+    // ── Internal: accrual ────────────────────────────────────────────────────
 
-    /// Validated reverse lookup. Returns the user's slot together with the
-    /// entry stored there, but only when the forward and reverse indexes
-    /// agree. Any orphaned TopPlayerSlot (entry expired via TTL, overwritten
-    /// by an eviction, or otherwise inconsistent) is removed so the caller
-    /// can never:
-    ///   • panic on a .unwrap() of a missing entry, or
-    ///   • update the wrong player's entry through a bogus mapping.
-    fn top_slot_entry(env: &Env, user: &Address) -> Option<(u32, PlayerEntry)> {
-        let slot: u32 = env
+    /// Add settled-bet points. The stored balance is brought forward to the
+    /// current epoch first, so accrual always builds on what the score has
+    /// *become*, not on what it once was (issue #69).
+    fn credit_points(env: &Env, user: &Address, pts: u64, is_won: Option<bool>) {
+        let mut s = Self::load_stored(env, user);
+        s.points = Self::decay(s.points, Self::current_epoch(env).saturating_sub(s.epoch));
+        s.epoch = Self::current_epoch(env);
+        s.points += pts;
+        match is_won {
+            Some(true) => s.won_bets += 1,
+            Some(false) => s.lost_bets += 1,
+            None => {}
+        }
+        Self::save_stored(env, user, &s);
+        Self::update_top_players(env, user.clone(), s.points);
+        env.events().publish(
+            (Symbol::new(env, "leaderboard_updated"), user.clone()),
+            (s.points, s.won_bets, s.lost_bets),
+        );
+    }
+
+    /// Add referral/welcome bonus points. Counts as activity (bonus_bets) but
+    /// never as a won or lost bet (issue #64).
+    fn credit_bonus(env: &Env, user: &Address, pts: u64) {
+        let mut s = Self::load_stored(env, user);
+        s.points = Self::decay(s.points, Self::current_epoch(env).saturating_sub(s.epoch));
+        s.epoch = Self::current_epoch(env);
+        s.points += pts;
+        s.bonus_bets += 1;
+        Self::save_stored(env, user, &s);
+        Self::update_top_players(env, user.clone(), s.points);
+        env.events().publish(
+            (Symbol::new(env, "leaderboard_updated"), user.clone()),
+            (s.points, s.bonus_bets),
+        );
+    }
+
+    fn accumulate_pending(
+        env: &Env,
+        user: &Address,
+        points: u64,
+        tokens: i128,
+        is_winner: bool,
+        is_bonus: bool,
+    ) {
+        let key = DataKey::PendingReward(user.clone());
+        let mut pending: PendingReward = env
             .storage()
             .persistent()
-            .get(&DataKey::TopPlayerSlot(user.clone()))?;
-        match env
-            .storage()
-            .persistent()
-            .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(slot))
-        {
-            Some(entry) if entry.address == *user => Some((slot, entry)),
-            _ => {
-                // Orphaned or stale reverse mapping.
-                env.storage().persistent().remove(&DataKey::TopPlayerSlot(user.clone()));
-                None
+            .get(&key)
+            .unwrap_or(PendingReward {
+                points: 0,
+                tokens: 0,
+                won_delta: 0,
+                lost_delta: 0,
+                bet_delta: 0,
+            });
+        pending.points += points;
+        pending.tokens += tokens;
+        pending.bet_delta += 1;
+        if !is_bonus {
+            if is_winner {
+                pending.won_delta += 1;
+            } else {
+                pending.lost_delta += 1;
             }
         }
+        env.storage().persistent().set(&key, &pending);
+        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+    }
+
+    // ── Internal: maintain a persistent sorted top list ──────────────────────
+
+    /// Write `TopPlayerAt(slot)` and `TopPlayerSlot(address)` together, and
+    /// bump both TTLs. This is the only way the two keys are created/updated.
+    fn set_top_slot(env: &Env, slot: u32, entry: &PlayerEntry) {
+        let at_key = DataKey::TopPlayerAt(slot);
+        env.storage().persistent().set(&at_key, entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&at_key, TTL_BUMP, TTL_HIGH);
+        let slot_key = DataKey::TopPlayerSlot(entry.address.clone());
+        env.storage().persistent().set(&slot_key, &slot);
+        env.storage()
+            .persistent()
+            .extend_ttl(&slot_key, TTL_BUMP, TTL_HIGH);
+    }
+
+    fn load_stored(env: &Env, user: &Address) -> StoredStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or_else(|| {
+                StoredStats {
+                    epoch: Self::current_epoch(env),
+                    ..StoredStats::zero()
+                }
+            })
+    }
+
+    fn save_stored(env: &Env, user: &Address, s: &StoredStats) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Stats(user.clone()), s);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Stats(user.clone()), TTL_BUMP, TTL_HIGH);
+    }
+
+    fn top_count(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TopPlayerCount)
+            .unwrap_or(0)
+    }
+
+    fn forward_entry(env: &Env, slot: u32) -> Option<PlayerEntry> {
+        env.storage().persistent().get(&DataKey::TopPlayerAt(slot))
+    }
+
+    /// Remove both sides of the mapping for `slot`. No-op if the forward
+    /// entry is already gone (TTL); still drops a leftover reverse key when
+    /// the forward entry is present.
+    fn clear_top_slot(env: &Env, slot: u32) {
+        if let Some(old) = Self::forward_entry(env, slot) {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TopPlayerSlot(old.address));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TopPlayerAt(slot));
+    }
+
+    /// Resolve a user's slot only if the reverse lookup is consistent with
+    /// the forward index. Stale reverse keys are deleted. If the reverse key
+    /// is missing, scan the forward index to recover from `TopPlayerSlot` TTL
+    /// (avoids inserting a duplicate).
+    fn resolved_slot(env: &Env, user: &Address, count: u32) -> Option<u32> {
+        if let Some(slot) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::TopPlayerSlot(user.clone()))
+        {
+            match Self::forward_entry(env, slot) {
+                Some(entry) if entry.address == *user && slot < count => return Some(slot),
+                _ => {
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::TopPlayerSlot(user.clone()));
+                }
+            }
+        }
+
+        for i in 0..count {
+            if let Some(entry) = Self::forward_entry(env, i) {
+                if entry.address == *user {
+                    Self::set_top_slot(env, i, &entry);
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     /// Bubbles a (possibly new) entry up from `slot` until the list is
-    /// descending again. Forward and reverse indexes are always written
-    /// together so the pair cannot drift apart; TTL freshness is refreshed
-    /// at the owner-touch points (insert / update / eviction) instead of
-    /// per swap, to keep the write footprint bounded.
+    /// descending again, comparing decayed scores. Forward and reverse
+    /// indexes are always written together; FIFO sequences travel with the
+    /// player (not the slot) and the cached minimum is re-pointed at the same
+    /// player when it moves.
     fn bubble_up(env: &Env, entry: &PlayerEntry, mut slot: u32) {
-        while slot > 0 {
+        // Bounded: a fill-to-capacity burst of ascending inserts would
+        // otherwise rewrite O(n) slots per call and blow the transaction
+        // write-footprint limit. Read paths re-sort on decayed values anyway.
+        let mut steps = 0_u32;
+        while slot > 0 && steps < MAX_BUBBLE_STEPS {
+            steps += 1;
             let prev: Option<PlayerEntry> =
                 env.storage().persistent().get(&DataKey::TopPlayerAt(slot - 1));
             match prev {
-                Some(prev) if prev.points < entry.points => {
-                    // Write both indexes together. TTLs are NOT bumped per swap:
-                    // each extend_ttl counts against the ledger write footprint,
-                    // and a bubble can rewrite dozens of slots in one call.
-                    // TTL freshness is maintained at the owner-touch points
-                    // (insert / in-place update / eviction) instead.
+                Some(prev)
+                    if Self::entry_points_now(env, &prev)
+                        < Self::entry_points_now(env, entry) =>
+                {
                     let key_hi = DataKey::TopPlayerAt(slot - 1);
                     let key_lo = DataKey::TopPlayerAt(slot);
                     env.storage().persistent().set(&key_hi, entry);
@@ -589,9 +755,14 @@ impl LeaderboardContract {
                         &DataKey::TopPlayerSlot(prev.address.clone()),
                         &slot,
                     );
-                    // Keep the min-cache slot pointing at the same PLAYER when
-                    // entries move: whichever of the two swapped entries held
-                    // the cached min must be remapped to its new slot.
+                    // FIFO sequences travel with the player, not the slot.
+                    let seq_hi = Self::seq_at(env, slot - 1);
+                    let seq_lo = Self::seq_at(env, slot);
+                    let sk_hi = DataKey::TopPlayerSeqAt(slot - 1);
+                    let sk_lo = DataKey::TopPlayerSeqAt(slot);
+                    env.storage().persistent().set(&sk_hi, &seq_lo);
+                    env.storage().persistent().set(&sk_lo, &seq_hi);
+                    // Keep the cached minimum pointing at the same PLAYER.
                     let cached_min_slot: u32 =
                         env.storage().instance().get(&DataKey::MinSlot).unwrap_or(slot);
                     if slot == cached_min_slot {
@@ -601,93 +772,9 @@ impl LeaderboardContract {
                     }
                     slot -= 1;
                 }
-                // A missing entry above means the list has a TTL-expired hole;
-                // stop here — reconciliation handles compaction at the next
-                // full-list eviction.
                 _ => break,
             }
         }
-    }
-
-    /// Appends a brand-new entry at `slot`, bumping the count, bubbling it
-    /// into place and refreshing the min cache when the list becomes full.
-    fn insert_new(env: &Env, user: &Address, points: u64, slot: u32) {
-        let entry = PlayerEntry {
-            address: user.clone(),
-            points,
-        };
-        let key = DataKey::TopPlayerAt(slot);
-        env.storage().persistent().set(&key, &entry);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(user.clone()), &slot);
-        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::TopPlayerSlot(user.clone()), TTL_BUMP, TTL_HIGH);
-        // FIFO: stamp the slot with a fresh, monotonically increasing sequence
-        // so equal-points ties are broken by insertion order, not slot index.
-        Self::stamp_seq(env, slot);
-        env.storage().instance().set(&DataKey::TopPlayerCount, &(slot + 1));
-
-        Self::bubble_up(env, &entry, slot);
-
-        // Maintain the cached min incrementally (O(1)): a strict `<` keeps
-        // the EARLIEST (oldest) player seen at the lowest score, matching
-        // recompute_min's FIFO rule, while avoiding a full-list scan on the
-        // hot append path. The cache is authoritative once the list is full;
-        // while filling, it tracks the lowest score seen so far.
-        let cur_min: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinPoints)
-            .unwrap_or(u64::MAX);
-        // `slot == 0` means the list was empty before this append, so any
-        // stored cache value is initialization filler, not a real minimum.
-        if slot == 0 || points < cur_min {
-            // bubble_up may have moved the entry out of `slot`; the reverse
-            // mapping always holds its final position.
-            let final_slot: u32 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::TopPlayerSlot(user.clone()))
-                .unwrap_or(slot);
-            env.storage().instance().set(&DataKey::MinPoints, &points);
-            env.storage().instance().set(&DataKey::MinSlot, &final_slot);
-        }
-    }
-
-    /// The cached minimum must always point at the OLDEST player holding the
-    /// lowest score (FIFO), so equal-min newcomers evict in insertion order.
-    fn recompute_min(env: &Env, count: u32) {
-        let mut min_pts = u64::MAX;
-        let mut min_slot: u32 = 0;
-        // The FIFO sequence of the running min is loaded lazily: it is only
-        // needed to break ties, so lists without ties never pay the extra
-        // per-entry ledger-read footprint.
-        let mut min_seq: Option<u64> = None;
-        for i in 0..count {
-            if let Some(e) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PlayerEntry>(&DataKey::TopPlayerAt(i))
-            {
-                if e.points < min_pts {
-                    min_pts = e.points;
-                    min_slot = i;
-                    min_seq = None;
-                } else if e.points == min_pts {
-                    // Among equal-min players the oldest (lowest sequence)
-                    // wins MinSlot, so eviction deterministically targets it.
-                    let cur_seq = *min_seq.get_or_insert_with(|| Self::seq_at(env, min_slot));
-                    let seq = Self::seq_at(env, i);
-                    if seq < cur_seq {
-                        min_slot = i;
-                        min_seq = Some(seq);
-                    }
-                }
-            }
-        }
-        env.storage().instance().set(&DataKey::MinPoints, &min_pts);
-        env.storage().instance().set(&DataKey::MinSlot, &min_slot);
     }
 
     fn seq_at(env: &Env, s: u32) -> u64 {
@@ -697,7 +784,8 @@ impl LeaderboardContract {
             .unwrap_or(0)
     }
 
-    // FIFO age stamp: assign the next monotonically increasing sequence to a slot.
+    /// FIFO age stamp: assign the next monotonically increasing sequence to a
+    /// slot so equal-score ties are evicted oldest-first (issue #25 / #70).
     fn stamp_seq(env: &Env, s: u32) {
         let counter: u64 = env
             .storage()
@@ -711,168 +799,235 @@ impl LeaderboardContract {
         env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
     }
 
-    /// Reconciliation pass — runs only when corruption is detected (a cached
-    /// minimum whose slot is empty, e.g. after a TTL expiry). Rebuilds the
-    /// list densely from the entries that actually survive: sorted, with a
-    /// corrected count and refreshed reverse mappings. Bounded by
-    /// MAX_TOP_PLAYERS, so the hot path keeps its O(1) cost.
-    fn repair_top_list(env: &Env) -> u32 {
-        // 1. Collect every surviving entry.
-        let mut entries: Vec<PlayerEntry> = Vec::new(env);
-        for i in 0..MAX_TOP_PLAYERS {
-            if let Some(e) = env
-                .storage()
-                .persistent()
-                .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(i))
-            {
-                entries.push_back(e);
-            }
+    /// Refresh the cached minimum over the bounded list, comparing decayed
+    /// scores. Among equal minima the OLDEST insertion (lowest sequence)
+    /// wins MinSlot, so tie eviction is deterministic FIFO (issue #25/#70).
+    /// Sequences are read lazily — only when a tie is actually met — keeping
+    /// the per-call ledger-read footprint low.
+    fn refresh_min(env: &Env, count: u32) {
+        if count == 0 {
+            env.storage().instance().set(&DataKey::MinPoints, &0_u64);
+            env.storage().instance().set(&DataKey::MinSlot, &0_u32);
+            return;
         }
-
-        // 2. Sort descending (stable) — bounded (≤ MAX_TOP_PLAYERS) swaps.
-        let n = entries.len() as u32;
-        for i in 0..n {
-            let mut max_idx = i;
-            for j in (i + 1)..n {
-                if entries.get(j).unwrap().points > entries.get(max_idx).unwrap().points {
-                    max_idx = j;
+        let mut min_pts = u64::MAX;
+        let mut min_slot: u32 = 0;
+        let mut min_seq: Option<u64> = None;
+        for i in 0..count {
+            if let Some(e) = Self::forward_entry(env, i) {
+                let pts = Self::entry_points_now(env, &e);
+                if pts < min_pts {
+                    min_pts = pts;
+                    min_slot = i;
+                    min_seq = None;
+                } else if pts == min_pts {
+                    let cur = *min_seq.get_or_insert_with(|| Self::seq_at(env, min_slot));
+                    let seq = Self::seq_at(env, i);
+                    if seq < cur {
+                        min_slot = i;
+                        min_seq = Some(seq);
+                    }
                 }
             }
-            if max_idx != i {
-                let a = entries.get(i).unwrap().clone();
-                let b = entries.get(max_idx).unwrap().clone();
-                entries.set(i, b);
-                entries.set(max_idx, a);
-            }
         }
-
-        // 3. Write the dense list back with fresh TTLs and correct reverse
-        //    lookups, then drop whatever is left in the old tail slots.
-        for slot in 0..n {
-            let entry = entries.get(slot).unwrap();
-            let key = DataKey::TopPlayerAt(slot);
-            env.storage().persistent().set(&key, &entry);
-            env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
-            env.storage().persistent().set(&DataKey::TopPlayerSlot(entry.address.clone()), &slot);
-            env.storage().persistent().extend_ttl(
-                &DataKey::TopPlayerSlot(entry.address.clone()),
-                TTL_BUMP,
-                TTL_HIGH,
-            );
-        }
-        for slot in n..MAX_TOP_PLAYERS {
-            env.storage().persistent().remove(&DataKey::TopPlayerAt(slot));
-        }
-
-        // 4. Fix the count + min caches.
-        env.storage().instance().set(&DataKey::TopPlayerCount, &n);
-        if n > 0 {
-            let min_entry = entries.get(n - 1).unwrap();
-            env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-            env.storage().instance().set(&DataKey::MinSlot, &(n - 1));
-        }
-        n
+        env.storage().instance().set(&DataKey::MinPoints, &min_pts);
+        env.storage().instance().set(&DataKey::MinSlot, &min_slot);
     }
 
-    fn update_top_players(env: &Env, user: Address, new_points: u64) {
-        // Fast path: the user is already in the list — in-place update backed
-        // by a validated reverse lookup (issue #67).
-        if let Some((slot, mut entry)) = Self::top_slot_entry(env, &user) {
-            entry.points = new_points;
-            let key = DataKey::TopPlayerAt(slot);
-            env.storage().persistent().set(&key, &entry);
-            env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+    /// Appends a brand-new entry at `slot`, bumps the count, bubbles it into
+    /// place and stamps its FIFO insertion sequence.
+    fn insert_new(env: &Env, user: &Address, points: u64, slot: u32) {
+        let entry = PlayerEntry {
+            address: user.clone(),
+            points,
+            epoch: Self::current_epoch(env),
+        };
+        Self::set_top_slot(env, slot, &entry);
+        Self::stamp_seq(env, slot);
+        env.storage().instance().set(&DataKey::TopPlayerCount, &(slot + 1));
 
+        Self::bubble_up(env, &entry, slot);
+
+        // A full list makes the cached minimum authoritative for eviction.
+        if slot + 1 == MAX_TOP_PLAYERS {
+            Self::refresh_min(env, Self::top_count(env));
+        }
+    }
+
+    /// Compact holes and rewrite every reverse lookup from surviving forward
+    /// entries. Returns the new live count.
+    fn repair_top_index(env: &Env) -> u32 {
+        let count = Self::top_count(env);
+        let mut write: u32 = 0;
+        for read in 0..count {
+            if let Some(entry) = Self::forward_entry(env, read) {
+                if write != read {
+                    Self::set_top_slot(env, write, &entry);
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::TopPlayerAt(read));
+                }
+                write += 1;
+            } else {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::TopPlayerAt(read));
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayerCount, &write);
+        Self::refresh_min(env, write);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        write
+    }
+
+    /// Insert or update a player's top-list entry, maintaining descending
+    /// order and the cached minimum. Equal-score newcomers displace the
+    /// OLDEST tied-at-minimum entry (deterministic FIFO via sequences).
+    fn update_top_players(env: &Env, user: Address, new_points: u64) {
+        let count = Self::top_count(env);
+
+        // A stale (dead-forward) reverse key proves a hole exists in the list
+        // — compact it so `count` stays authoritative before appending.
+        let had_reverse = env
+            .storage()
+            .persistent()
+            .has(&DataKey::TopPlayerSlot(user.clone()));
+
+        // Fast path: already ranked — rewrite in place and re-bubble.
+        if let Some(slot) = Self::resolved_slot(env, &user, count) {
+            let entry = PlayerEntry {
+                address: user,
+                points: new_points,
+                epoch: Self::current_epoch(env),
+            };
+            Self::set_top_slot(env, slot, &entry);
             Self::bubble_up(env, &entry, slot);
 
-            // Recompute whenever the update can invalidate the min cache:
-            // - the updated player IS the cached min (their change moves the min), or
-            // - their new points are at/below the cached min (they now hold/tie it).
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TopPlayerCount)
-                .unwrap_or(0);
-            let cached_min_pts: u64 = env
-                .storage()
-                .instance()
-                .get(&DataKey::MinPoints)
-                .unwrap_or(u64::MAX);
+            // Only a change at/into the cached minimum can invalidate it.
             let cached_min_slot: u32 =
                 env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
-            if count > 0 && (slot == cached_min_slot || new_points <= cached_min_pts) {
-                Self::recompute_min(env, count);
+            if slot == cached_min_slot || slot + 1 == count {
+                Self::refresh_min(env, count);
             }
             return;
         }
 
-        // New user: append while there is room.
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TopPlayerCount)
-            .unwrap_or(0);
+        // The user has no live entry. If their reverse key was present but
+        // stale, a TTL hole exists — compact the list so the count (and
+        // therefore the append slot / eviction target) stays authoritative.
+        let count = if had_reverse {
+            let c = Self::repair_top_index(env);
+            if c < MAX_TOP_PLAYERS {
+                Self::insert_new(env, &user, new_points, c);
+                return;
+            }
+            c
+        } else {
+            count
+        };
+
         if count < MAX_TOP_PLAYERS {
             Self::insert_new(env, &user, new_points, count);
             return;
         }
 
-        // List full: evict the weakest entry if the newcomer beats it — or
-        // ties it, in which case the OLDEST tied-at-min player is displaced
-        // (deterministic FIFO via per-slot insertion sequences).
-        let mut min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
-        let mut old_entry: Option<PlayerEntry> =
-            env.storage().persistent().get(&DataKey::TopPlayerAt(min_slot));
+        // List full: the cached-minimum entry competes with the newcomer. An
+        // equal-score incumbent is displaced (FIFO among ties); only strictly
+        // weaker newcomers are turned away.
+        let min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
+        let Some(min_entry) = Self::forward_entry(env, min_slot) else {
+            // The cached minimum points at an expired hole — compact once and
+            // retry with a freshly rebuilt index.
+            Self::repair_top_index(env);
+            Self::update_top_players(env, user, new_points);
+            return;
+        };
 
-        // If the cached minimum points at a missing entry (TTL expiry or any
-        // earlier corruption), reconcile the whole list before deciding.
-        if old_entry.is_none() {
-            let n = Self::repair_top_list(env);
-            if n < MAX_TOP_PLAYERS {
-                Self::insert_new(env, &user, new_points, n);
-                return;
-            }
-            min_slot = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
-            old_entry = env.storage().persistent().get(&DataKey::TopPlayerAt(min_slot));
+        if new_points < Self::entry_points_now(env, &min_entry) {
+            return;
         }
 
-        match old_entry {
-            Some(old) if new_points >= old.points => {
-                // The newcomer displaces the weakest — clear the evicted
-                // player's reverse mapping so they cannot read a stale rank.
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::TopPlayerSlot(old.address.clone()));
+        Self::clear_top_slot(env, min_slot);
 
-                let new_entry = PlayerEntry {
-                    address: user.clone(),
-                    points: new_points,
-                };
-                let key = DataKey::TopPlayerAt(min_slot);
-                env.storage().persistent().set(&key, &new_entry);
-                env.storage().persistent().set(&DataKey::TopPlayerSlot(user.clone()), &min_slot);
-                env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
-                env.storage().persistent().extend_ttl(
-                    &DataKey::TopPlayerSlot(user.clone()),
-                    TTL_BUMP,
-                    TTL_HIGH,
-                );
+        let new_entry = PlayerEntry {
+            address: user,
+            points: new_points,
+            epoch: Self::current_epoch(env),
+        };
+        Self::set_top_slot(env, min_slot, &new_entry);
+        Self::stamp_seq(env, min_slot);
+        Self::bubble_up(env, &new_entry, min_slot);
+        Self::refresh_min(env, Self::top_count(env));
+    }
 
-                // FIFO: the newcomer is the youngest player, so stamp its reused
-                // slot with a fresh (highest) sequence. This makes the NEXT tied
-                // newcomer evict an older survivor instead of this fresh one.
-                Self::stamp_seq(env, min_slot);
+    // ── Point decay (issue #69) ───────────────────────────────────────────
+    //
+    // Scores are time-weighted. Nothing is recomputed on a timer: each
+    // stored score carries the epoch it was written in, and the value for a
+    // later epoch is derived from it. Writes materialise that; reads apply it
+    // on the fly.
 
-                Self::bubble_up(env, &new_entry, min_slot);
+    /// Which decay period the ledger is currently in.
+    fn current_epoch(env: &Env) -> u32 {
+        env.ledger().sequence() / DECAY_PERIOD_LEDGERS
+    }
 
-                // Recompute the min (the weakest now sits at the last slot).
-                Self::recompute_min(env, MAX_TOP_PLAYERS);
+    /// Apply `periods` worth of decay to a score.
+    ///
+    /// Iterated rather than closed-form because the contract has no float and
+    /// integer flooring must happen at each step for the result to be
+    /// self-consistent: decaying by `a` then by `b` has to equal decaying by
+    /// `a + b`, or a player's stats and their top-list entry — which are
+    /// swept on different schedules — would drift apart. The loop is bounded
+    /// by DECAY_ZERO_AFTER_PERIODS.
+    fn decay(points: u64, periods: u32) -> u64 {
+        if points == 0 || periods == 0 {
+            return points;
+        }
+        if periods >= DECAY_ZERO_AFTER_PERIODS {
+            return 0;
+        }
+        let mut value = points as u128;
+        for _ in 0..periods {
+            value = value * DECAY_RETAIN_NUM as u128 / DECAY_RETAIN_DEN as u128;
+            if value == 0 {
+                return 0;
             }
-            _ => {}
+        }
+        value as u64
+    }
+
+    /// A top-list entry's score as of now. Pure arithmetic — the epoch rides
+    /// on the entry, so this costs no ledger read and is safe to call inside
+    /// comparison loops on the write path.
+    fn entry_points_now(env: &Env, entry: &PlayerEntry) -> u64 {
+        let now = Self::current_epoch(env);
+        Self::decay(entry.points, now.saturating_sub(entry.epoch))
+    }
+
+    /// A player's stats brought forward to the current epoch. Read-only.
+    fn decayed_stats(env: &Env, user: &Address) -> PlayerStats {
+        let stored: StoredStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stats(user.clone()))
+            .unwrap_or_else(|| StoredStats {
+                epoch: Self::current_epoch(env),
+                ..StoredStats::zero()
+            });
+        let points = Self::decay(stored.points, Self::current_epoch(env).saturating_sub(stored.epoch));
+        PlayerStats {
+            points,
+            total_bets: stored.won_bets + stored.lost_bets + stored.bonus_bets,
+            won_bets: stored.won_bets,
+            lost_bets: stored.lost_bets,
         }
     }
 
-    #[inline]
+    // ── Internal: auth guards & minting ──────────────────────────────────────
+
     fn require_market_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
         let mkt: Address = env
             .storage()
@@ -885,7 +1040,6 @@ impl LeaderboardContract {
         Ok(())
     }
 
-    #[inline]
     fn require_referral_contract(env: &Env, caller: &Address) -> Result<(), LeaderboardError> {
         let ref_: Address = env
             .storage()
@@ -898,15 +1052,14 @@ impl LeaderboardContract {
         Ok(())
     }
 
-    #[inline]
     fn require_not_paused(env: &Env) -> Result<(), LeaderboardError> {
-        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+        if Self::is_paused(env.clone()) {
             return Err(LeaderboardError::ContractPaused);
         }
         Ok(())
     }
 
-    // Issue #84: check pulse_token's reported ABI version before invoking
+    // Issue #84: check pulse_token's reported ABI version before invoking mint.
     fn require_compatible_token(env: &Env, token: &Address) -> Result<(), LeaderboardError> {
         let version: u32 =
             env.invoke_contract(token, &Symbol::new(env, "interface_version"), vec![env]);
@@ -916,7 +1069,15 @@ impl LeaderboardContract {
         Ok(())
     }
 
-    fn mint_reward(env: &Env, user: &Address, tokens: i128) -> Result<(), LeaderboardError> {
+    fn write_token_contract(env: &Env, token: Address) {
+        env.storage().instance().set(&DataKey::TokenContract, &token);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+    }
+
+    fn mint_tokens(env: &Env, user: &Address, tokens: i128) -> Result<(), LeaderboardError> {
+        if tokens <= 0 {
+            return Ok(());
+        }
         let token: Address = env
             .storage()
             .instance()
@@ -934,6 +1095,8 @@ impl LeaderboardContract {
     }
 }
 
+#[cfg(test)]
+mod decay_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

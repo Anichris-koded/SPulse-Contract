@@ -1,7 +1,7 @@
 use crate::{PULSETokenContract, PULSETokenContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger as _},
-    Address, Env, String, Symbol, TryIntoVal,
+    Address, Env, String, Symbol, TryFromVal, Val,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -358,24 +358,6 @@ fn test_paused_rejects_mint() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #9)")]
-fn test_paused_rejects_transfer() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = setup(&env);
-    let admin = init(&env, &client);
-
-    let minter = Address::generate(&env);
-    client.set_minter(&minter);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    client.mint(&minter, &alice, &50_0000000_i128);
-
-    client.pause(&admin);
-    client.transfer(&alice, &bob, &10_0000000_i128);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #9)")]
 fn test_paused_rejects_burn() {
     let env = Env::default();
     env.mock_all_auths();
@@ -482,16 +464,61 @@ fn test_mint_emits_event() {
     let user = Address::generate(&env);
     client.mint(&minter, &user, &10_0000000_i128);
 
+    // `env.events().all()` returns a `ContractEvents` in soroban-sdk 26, which
+    // exposes its entries as an XDR slice rather than the older indexable Vec
+    // of (address, topics, data) tuples.
     let events = env.events().all();
-    let last = events.events().last().unwrap();
-    let topics = match &last.body {
-        soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.topics,
-    };
-    let name: Symbol = topics
-        .iter()
-        .next()
-        .unwrap()
-        .try_into_val(&env)
-        .unwrap();
+    let emitted = events.events();
+    assert!(!emitted.is_empty(), "mint emitted no event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &emitted.last().unwrap().body;
+    let topic0 = Val::try_from_val(&env, &body.topics[0]).unwrap();
+    let name = Symbol::try_from_val(&env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&env, "mint"));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Issue #95 — pause / circuit breaker
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_pause_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    init(&env, &client);
+    let rando = Address::generate(&env);
+    client.set_paused(&rando, &true);
+}
+
+#[test]
+fn test_pause_blocks_mint_and_burn_but_not_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.set_minter(&minter);
+
+    client.mint(&minter, &alice, &100_0000000_i128);
+    assert_eq!(client.balance(&alice), 100_0000000_i128);
+
+    // Emergency pause: admin halts supply-changing ops…
+    client.set_paused(&_admin, &true);
+    assert!(client.paused());
+    assert!(client.try_mint(&minter, &alice, &10_0000000_i128).is_err());
+    assert!(client.try_burn(&alice, &10_0000000_i128).is_err());
+
+    // …but users can still move their own tokens (no fund lock-in).
+    client.transfer(&alice, &bob, &25_0000000_i128);
+    assert_eq!(client.balance(&bob), 25_0000000_i128);
+
+    // Resume restores minting.
+    client.set_paused(&_admin, &false);
+    assert!(!client.paused());
+    client.mint(&minter, &alice, &10_0000000_i128);
+    assert_eq!(client.balance(&alice), 85_0000000_i128);
 }

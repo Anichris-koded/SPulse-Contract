@@ -1,11 +1,9 @@
 use super::*;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     contract, contractimpl,
-    testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    BytesN, Env, String, Address,
-    Env, String, Symbol, TryFromVal, Val,
+    Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val,
 };
 
 use leaderboard::LeaderboardContract;
@@ -125,6 +123,15 @@ fn advance_time(env: &Env, secs: u64) {
         min_persistent_entry_ttl: 100,
         max_entry_ttl: 10_000_000,
     });
+}
+
+/// Admin withdraw is capped per call (issue #57); loop until the pot is empty.
+fn withdraw_all_admin_fees(t: &TestSetup, recipient: &Address) -> i128 {
+    let mut total = 0;
+    while t.client.get_accumulated_fees() > 0 {
+        total += t.client.withdraw_fees(&t.admin, recipient);
+    }
+    total
 }
 
 fn rewind_time(env: &Env, secs: u64) {
@@ -658,12 +665,17 @@ fn test_withdraw_fees() {
 
     let fees_before = t.client.get_accumulated_fees();
     assert!(fees_before > 0);
+    let cap = fees_before * MAX_WITHDRAWAL_BPS / BPS_DENOM;
 
     let admin_xlm_before = t.xlm.balance(&t.admin);
     let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
-    assert_eq!(withdrawn, fees_before);
+    assert_eq!(withdrawn, cap);
+    assert_eq!(t.client.get_accumulated_fees(), fees_before - cap);
+    assert_eq!(t.xlm.balance(&t.admin), admin_xlm_before + cap);
+
+    let drained = withdraw_all_admin_fees(&t, &t.admin);
+    assert_eq!(drained, fees_before - cap);
     assert_eq!(t.client.get_accumulated_fees(), 0);
-    assert_eq!(t.xlm.balance(&t.admin), admin_xlm_before + fees_before);
 }
 
 // ── 27. Fee recipient withdrawal is capped + timelocked (issue #12) ──────────
@@ -1204,7 +1216,7 @@ fn test_empty_side_resolution_pool_to_fees() {
     let treasury = Address::generate(&t.env);
     t.client.add_fee_recipient(&t.admin, &treasury);
     let before = t.xlm.balance(&treasury);
-    let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
+    let withdrawn = withdraw_all_admin_fees(&t, &treasury);
     assert_eq!(withdrawn, 1_5000000);
     assert_eq!(t.xlm.balance(&treasury), before + 1_5000000);
     assert_eq!(t.client.get_accumulated_fees(), 0);
@@ -1341,7 +1353,7 @@ fn test_e2e_full_inter_contract_flow() {
     let fees_total = t.client.get_accumulated_fees();
     assert!(fees_total > 0);
     let treasury_before = t.xlm.balance(&treasury);
-    let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
+    let withdrawn = withdraw_all_admin_fees(&t, &treasury);
     assert_eq!(withdrawn, fees_total);
     assert_eq!(t.client.get_accumulated_fees(), 0);
     assert_eq!(t.xlm.balance(&treasury), treasury_before + fees_total);
@@ -2173,6 +2185,33 @@ fn test_cancel_does_not_wipe_other_market_fees() {
 }
 
 #[test]
+fn test_cancel_reclaims_pool_fees_not_inflated_ledger() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let alice = Address::generate(&t.env);
+    fund_user(&t, &alice, 200_0000000);
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
+    assert_eq!(t.client.get_market_fees(&id), 1_5000000);
+
+    // Simulate an inflated per-market ledger (10 XLM recorded vs 1.5 earned).
+    t.env.as_contract(&t.client.address, || {
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::MarketFees(id), &10_0000000_i128);
+        t.env
+            .storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &10_0000000_i128);
+    });
+
+    t.client.cancel_market(&t.admin, &id);
+    // Only pool-attributable fees (1.5 XLM) leave the ledger on cancel.
+    assert_eq!(t.client.get_market_fees(&id), 8_5000000);
+    assert_eq!(t.client.get_accumulated_fees(), 8_5000000);
+}
+
+#[test]
 fn test_withdraw_fees_cannot_take_empty_side_principal() {
     let t = setup();
     let id = create_test_market(&t);
@@ -2185,7 +2224,7 @@ fn test_withdraw_fees_cannot_take_empty_side_principal() {
 
     let treasury = Address::generate(&t.env);
     t.client.add_fee_recipient(&t.admin, &treasury);
-    let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
+    let withdrawn = withdraw_all_admin_fees(&t, &treasury);
     assert_eq!(withdrawn, 1_5000000);
 
     // Alice's 98 XLM net is still sitting in the contract for her to claim.
@@ -2219,4 +2258,71 @@ fn test_legacy_fees_start_empty_on_fresh_deploy() {
     t.client.migrate_fee_ledger();
     assert_eq!(t.client.get_legacy_fees(), 0);
     assert_eq!(t.client.get_accumulated_fees(), 0);
+}
+
+#[test]
+fn test_migrate_fee_ledger_snapshots_legacy_balance() {
+    let t = setup();
+    let legacy_amount: i128 = 7_5000000;
+    t.env.as_contract(&t.client.address, || {
+        t.env
+            .storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &legacy_amount);
+        t.env.storage().instance().remove(&DataKey::FeeLedgerMigrated);
+    });
+
+    t.client.migrate_fee_ledger();
+    assert_eq!(t.client.get_legacy_fees(), legacy_amount);
+    assert_eq!(t.client.get_accumulated_fees(), legacy_amount);
+
+    // New bets after migration land on per-market ledgers, not LegacyFees.
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    assert_eq!(t.client.get_legacy_fees(), legacy_amount);
+    assert_eq!(t.client.get_market_fees(&id), 1_5000000);
+    assert_eq!(t.client.get_accumulated_fees(), legacy_amount + 1_5000000);
+}
+
+#[test]
+fn test_admin_withdraw_respects_cap() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 500_0000000);
+    // Build a fee pot large enough that 20% is visibly less than 100%.
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    let fees = t.client.get_accumulated_fees();
+    assert_eq!(fees, 4_5000000);
+
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
+    assert_eq!(withdrawn, cap);
+    assert_eq!(t.client.get_accumulated_fees(), fees - cap);
+    assert!(withdrawn < fees);
+}
+
+#[test]
+fn test_two_step_withdraw_debits_market_ledger() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &100_0000000_i128);
+    assert_eq!(t.client.get_market_fees(&id), 1_5000000);
+
+    let recipient = Address::generate(&t.env);
+    t.client.add_fee_recipient(&t.admin, &recipient);
+    let fees = t.client.get_accumulated_fees();
+    let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+    t.client.request_withdraw_fees(&recipient, &recipient, &cap);
+    advance_time(&t.env, WITHDRAW_DELAY_SECS);
+    let withdrawn = t.client.execute_withdraw_fees(&recipient);
+    assert_eq!(withdrawn, cap);
+    assert_eq!(t.client.get_market_fees(&id), fees - cap);
+    assert_eq!(t.client.get_accumulated_fees(), fees - cap);
 }

@@ -1410,6 +1410,127 @@ fn test_bettor_index_legacy_read_is_bounded() {
     assert_eq!(later_page.get(0).unwrap(), beyond_first_page);
 }
 
+// ── 29b. Issue #53: the bettor index must be paginated, never scanned ────────
+
+#[test]
+fn test_bettor_index_legacy_read_is_capped_at_one_page() {
+    // The DoS scenario from issue #53: a market whose bettor index has grown
+    // far beyond one page. The legacy full-list ABI must return at most
+    // MAX_BETTORS_PER_PAGE entries — never iterate the whole index.
+    let t = setup();
+    t.env.cost_estimate().disable_resource_limits();
+    let id = create_test_market(&t);
+
+    let first = Address::generate(&t.env);
+    let on_first_page = Address::generate(&t.env);
+    let beyond = Address::generate(&t.env);
+
+    t.env.as_contract(&t.client.address, || {
+        // Simulate a 5_000-bettor market without creating 5_000 bets.
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorCount(id), &5_000_u32);
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorAt(id, 0), &first);
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorAt(id, 1), &on_first_page);
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorAt(id, 4_999), &beyond);
+    });
+
+    let legacy = t.client.get_market_bettors(&id);
+    // Only the two live index slots inside the first-page window are
+    // returned — the read never touches slot 4_999 or any other page.
+    assert_eq!(legacy.len(), 2);
+    assert_eq!(legacy.get(0).unwrap(), first);
+    assert_eq!(legacy.get(1).unwrap(), on_first_page);
+
+    // The far entry is still reachable through direct indexed paging.
+    let tail = t.client.get_market_bettors_page(&id, &4_999_u32, &1);
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail.get(0).unwrap(), beyond);
+}
+
+#[test]
+fn test_bettor_index_pages_beyond_count_are_empty() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
+    t.client.place_bet(&user, &id, &true, &10_0000000_i128);
+
+    // Offsets past the live count return empty pages instead of scanning.
+    assert_eq!(
+        t.client
+            .get_market_bettors_page(&id, &1, &10)
+            .len(),
+        0
+    );
+    assert_eq!(
+        t.client
+            .get_market_bettors_page(&id, &u32::MAX, &10)
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_bettor_index_limit_is_clamped_to_max_page() {
+    // A caller-supplied limit above MAX_BETTORS_PER_PAGE is clamped so no
+    // single request can exceed the bounded storage budget.
+    let t = setup();
+    let id = create_test_market(&t);
+    for _ in 0..3u32 {
+        let user = Address::generate(&t.env);
+        fund_user(&t, &user, 200_0000000);
+        t.client.place_bet(&user, &id, &true, &10_0000000_i128);
+    }
+
+    let page = t.client.get_market_bettors_page(&id, &0, &u32::MAX);
+    assert_eq!(page.len(), 3);
+}
+
+#[test]
+fn test_bettor_index_sequential_pages_reconstruct_full_list() {
+    // Walking the index page by page must yield every bettor exactly once,
+    // in insertion order — paging replaces the unbounded scan (issue #53).
+    let t = setup();
+    t.env.cost_estimate().disable_resource_limits();
+    let id = create_test_market(&t);
+
+    let total = 25u32;
+    let mut expected: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&t.env);
+    for _ in 0..total {
+        let user = Address::generate(&t.env);
+        fund_user(&t, &user, 200_0000000);
+        t.client.place_bet(&user, &id, &true, &10_0000000_i128);
+        expected.push_back(user);
+    }
+
+    let mut seen: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&t.env);
+    let mut offset = 0_u32;
+    while offset < expected.len() {
+        let page = t.client.get_market_bettors_page(&id, &offset, &10);
+        assert!(page.len() <= 10);
+        for i in 0..page.len() {
+            seen.push_back(page.get(i).unwrap().clone());
+        }
+        offset += page.len() as u32;
+    }
+
+    assert_eq!(seen.len(), expected.len());
+    for i in 0..expected.len() {
+        assert_eq!(seen.get(i).unwrap(), expected.get(i).unwrap());
+    }
+}
+
 // ── 30. Referral bonus points per referred bet (Issue #99: ref registered) ───
 
 #[test]

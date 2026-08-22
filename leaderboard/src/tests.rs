@@ -107,6 +107,36 @@ fn test_top_players_capped_at_50() {
 }
 
 #[test]
+fn test_pagination_reads_the_persistent_ordered_index() {
+    let (env, client, _admin, market, _referral) = setup();
+    let points = [10_u64, 50, 30, 40, 20];
+
+    for points in points {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &points, &true);
+    }
+
+    // The page is returned directly from slots 1 and 2 of the write-time
+    // ordered index, rather than rebuilding the complete ranking on read.
+    let page = client.get_top_players(&1_u32, &2_u32);
+    assert_eq!(page.len(), 2);
+    assert_eq!(page.get(0).unwrap().points, 40);
+    assert_eq!(page.get(1).unwrap().points, 30);
+}
+
+#[test]
+fn test_pagination_caps_page_size_without_overflowing_offset() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &100_u64, &true);
+
+    // A caller cannot turn one view request into an unbounded storage read,
+    // and a maximal offset remains a safe empty page.
+    assert_eq!(client.get_top_players(&0_u32, &u32::MAX).len(), 1);
+    assert_eq!(client.get_top_players(&u32::MAX, &u32::MAX).len(), 0);
+}
+
+#[test]
 fn test_pagination_offset_beyond_count() {
     let (env, client, _admin, market, _referral) = setup();
     let user = Address::generate(&env);

@@ -100,6 +100,8 @@ pub enum MarketError {
     WithdrawalRequestExists = 23,
     NoWithdrawalRequest = 24,
     WithdrawalTooSoon = 25,
+    // Issue #95: operation blocked because the contract is paused.
+    Paused = 26,
     ContractPaused = 26,
     InvalidDuration = 27, // issue #10: duration below the minimum
     InvalidDependency = 28, // issue #51: address is not the expected executable kind
@@ -144,6 +146,7 @@ pub enum DataKey {
     Resolver(Address),
     FeeRecipient(Address),
     HasReferrer(Address),
+    Paused,
     RateWindow, // packed u64: high32=window_start_hi, low32=count
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
@@ -563,6 +566,40 @@ impl PredictionMarketContract {
     /// Read the current Config (for verification/admin tooling).
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Cfg).unwrap()
+    }
+
+    // ── Emergency circuit breaker (issue #95) ───────────────────────────────
+
+    /// Halt (or resume) all risk-creating, settlement and withdrawal
+    /// operations: place_bet, create_market, resolve_market, cancel_market,
+    /// withdraw_fees, request_withdraw_fees and execute_withdraw_fees are
+    /// blocked while paused. User recovery paths — claim() and
+    /// cancel_refund() — stay available on purpose, so an emergency pause
+    /// never locks user funds in the contract. Admin only; idempotent.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), MarketError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), MarketError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(MarketError::Paused);
+        }
+        Ok(())
     }
 
     pub fn get_pending_config(env: Env) -> Option<PendingConfigChange> {

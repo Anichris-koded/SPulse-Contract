@@ -38,6 +38,8 @@ pub enum ReferralError {
     AlreadyRegistered = 4,
     SelfReferral = 5,
     NotAdmin = 6,
+    // Issue #95: operation blocked by the contract being paused.
+    Paused = 7,
     // Issue #99: the address given as `referrer` has never registered.
     ReferrerNotRegistered = 7,
     ContractPaused = 7,
@@ -167,6 +169,32 @@ impl ReferralRegistryContract {
         Ok(())
     }
 
+    /// Issue #95 circuit breaker: halt registration and credit disbursements
+    /// during an emergency. Admin only; idempotent. Read/view paths stay open.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), ReferralError> {
+        Self::require_admin(&env, &caller)?;
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ReferralError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(ReferralError::Paused);
+        }
+        Ok(())
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -244,6 +272,9 @@ impl ReferralRegistryContract {
         let _: Val = env.invoke_contract(
             &leaderboard,
             &Symbol::new(&env, "add_bonus_pts"),
+            vec![
+                &env,
+                this.clone().into_val(&env),
             vec![
                 &env,
                 this.clone().into_val(&env),

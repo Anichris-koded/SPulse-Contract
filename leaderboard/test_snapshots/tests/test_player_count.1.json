@@ -152,14 +152,6 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "bonus_bets"
-                    },
-                    "val": {
-                      "u32": 0
-                    }
-                  },
-                  {
-                    "key": {
                       "symbol": "lost_bets"
                     },
                     "val": {
@@ -172,6 +164,14 @@
                     },
                     "val": {
                       "u64": "15"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_bets"
+                    },
+                    "val": {
+                      "u32": 2
                     }
                   },
                   {
@@ -212,14 +212,6 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "bonus_bets"
-                    },
-                    "val": {
-                      "u32": 0
-                    }
-                  },
-                  {
-                    "key": {
                       "symbol": "lost_bets"
                     },
                     "val": {
@@ -236,6 +228,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "total_bets"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "won_bets"
                     },
                     "val": {
@@ -243,6 +243,60 @@
                     }
                   }
                 ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307200
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "StatsEpoch"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 0
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307200
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "StatsEpoch"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 0
               }
             }
           },
@@ -275,7 +329,15 @@
                       "symbol": "address"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "epoch"
+                    },
+                    "val": {
+                      "u32": 0
                     }
                   },
                   {
@@ -283,7 +345,15 @@
                       "symbol": "points"
                     },
                     "val": {
-                      "u64": "15"
+                      "u64": "20"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "seq"
+                    },
+                    "val": {
+                      "u64": "1"
                     }
                   }
                 ]
@@ -319,7 +389,15 @@
                       "symbol": "address"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "epoch"
+                    },
+                    "val": {
+                      "u32": 0
                     }
                   },
                   {
@@ -327,7 +405,15 @@
                       "symbol": "points"
                     },
                     "val": {
-                      "u64": "20"
+                      "u64": "15"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "seq"
+                    },
+                    "val": {
+                      "u64": "0"
                     }
                   }
                 ]
@@ -357,7 +443,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 0
+                "u32": 1
               }
             }
           },
@@ -384,7 +470,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "u32": 0
               }
             }
           },
@@ -440,7 +526,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "10"
+                        "u64": "15"
                       }
                     },
                     {
@@ -452,7 +538,7 @@
                         ]
                       },
                       "val": {
-                        "u32": 0
+                        "u32": 1
                       }
                     },
                     {
@@ -465,6 +551,18 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "SeqCounter"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "2"
                       }
                     },
                     {
@@ -486,7 +584,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       },
       {
         "entry": {
@@ -580,7 +678,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       }
     ]
   },

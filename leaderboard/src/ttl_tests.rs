@@ -170,6 +170,42 @@ fn test_min_points_and_min_slot_survive_ttl_refresh_cycle() {
 }
 
 #[test]
+fn test_equal_min_players_do_not_corrupt_min_cache() {
+    // Regression for the tie-handling bug: when several players share the
+    // minimum score, the single-slot min cache must not point at a stale entry
+    // and equal-scoring newcomers must be allowed to displace an equal-min
+    // entry (not be wrongly rejected).
+    let (env, client, _admin, market, _referral) = setup();
+
+    // Fill to capacity with strictly descending points.
+    for i in 0u64..MAX_TOP_PLAYERS as u64 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &(1000 - i), &true);
+    }
+    let min_before = client.get_min_points();
+    assert_eq!(min_before, 1000 - (MAX_TOP_PLAYERS as u64 - 1));
+    assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);
+
+    // Two newcomers with points EQUAL to the current min each displace an
+    // equal-min entry; the cache must stay correct (value unchanged).
+    let p1 = Address::generate(&env);
+    client.add_pts(&market, &p1, &min_before, &true);
+    assert_eq!(client.get_min_points(), min_before);
+    assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);
+
+    let p2 = Address::generate(&env);
+    client.add_pts(&market, &p2, &min_before, &true);
+    assert_eq!(client.get_min_points(), min_before);
+    assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);
+
+    // A score strictly below the min must still be rejected (board unchanged).
+    let low = Address::generate(&env);
+    client.add_pts(&market, &low, &(min_before - 1), &true);
+    assert_eq!(client.get_min_points(), min_before);
+    assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);
+}
+
+#[test]
 fn test_instance_ttl_not_bumped_again_while_above_threshold() {
     // extend_ttl is a threshold-gated no-op when the TTL is already high
     // enough — verifies we're not silently masking a missing extend_ttl call

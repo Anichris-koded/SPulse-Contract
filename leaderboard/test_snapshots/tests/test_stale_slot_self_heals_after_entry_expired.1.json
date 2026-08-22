@@ -233,6 +233,14 @@
                     "val": {
                       "u64": "150"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "seq"
+                    },
+                    "val": {
+                      "u64": "1"
+                    }
                   }
                 ]
               }
@@ -317,7 +325,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "0"
+                        "u64": "150"
                       }
                     },
                     {
@@ -329,7 +337,7 @@
                         ]
                       },
                       "val": {
-                        "u32": 0
+                        "u32": 1
                       }
                     },
                     {
@@ -342,6 +350,18 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "SeqCounter"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "2"
                       }
                     },
                     {

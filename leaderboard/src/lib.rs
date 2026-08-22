@@ -107,8 +107,7 @@ pub enum DataKey {
     TopPlayerAt(u32),
     TopPlayerCount,
     TopPlayerSlot(Address),
-    TopPlayerSeqAt(u32), // u64 — FIFO insertion sequence for the player at a slot
-    SeqCounter,          // u64 — monotonic counter feeding TopPlayerSeqAt
+    SeqCounter,          // u64 — monotonic counter feeding PlayerEntry::seq
     MinPoints, // u64 — points of the weakest entry currently in the top list
     MinSlot,   // u32 — slot index of that weakest entry
     Paused,
@@ -825,18 +824,8 @@ impl LeaderboardContract {
 
         Self::bubble_up(env, &entry, slot);
 
-        // The last slot now holds the weakest entry — cache it for the
-        // full-list eviction path.
-        if slot + 1 == MAX_TOP_PLAYERS {
-            let min_slot = MAX_TOP_PLAYERS - 1;
-            let min_entry: PlayerEntry = env
-                .storage()
-                .persistent()
-                .get(&DataKey::TopPlayerAt(min_slot))
-                .unwrap();
-            env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-            env.storage().instance().set(&DataKey::MinSlot, &min_slot);
-        }
+        // Keep the min cache consistent after a (possibly first) insertion.
+        Self::recompute_min(env);
     }
 
     /// Reconciliation pass — runs only when corruption is detected (a cached
@@ -879,7 +868,8 @@ impl LeaderboardContract {
         // 3. Write the dense list back with fresh TTLs and correct reverse
         //    lookups, then drop whatever is left in the old tail slots.
         for slot in 0..n {
-            let entry = entries.get(slot).unwrap();
+            let mut entry = entries.get(slot).unwrap();
+            entry.seq = Self::next_seq(env);
             let key = DataKey::TopPlayerAt(slot);
             env.storage().persistent().set(&key, &entry);
             env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
@@ -904,6 +894,52 @@ impl LeaderboardContract {
         n
     }
 
+    /// Monotonic FIFO sequence counter — fed into `PlayerEntry::seq` so that,
+    /// when several players share the minimum score, the *oldest* (smallest
+    /// seq) is evicted first instead of whichever sits at the lowest slot.
+    fn next_seq(env: &Env) -> u64 {
+        let s: u64 = env.storage().instance().get(&DataKey::SeqCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::SeqCounter, &(s + 1));
+        s
+    }
+
+    fn recompute_min(env: &Env) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TopPlayerCount)
+            .unwrap_or(0);
+        if count == 0 {
+            env.storage().instance().set(&DataKey::MinPoints, &0_u64);
+            env.storage().instance().set(&DataKey::MinSlot, &0_u32);
+            return;
+        }
+        let mut min_slot: u32 = 0;
+        let mut min_points: u64 = u64::MAX;
+        let mut min_seq: u64 = u64::MAX;
+        let mut found = false;
+        for slot in 0..count {
+            if let Some(e) = env
+                .storage()
+                .persistent()
+                .get::<_, PlayerEntry>(&DataKey::TopPlayerAt(slot))
+            {
+                // Among equal-min entries keep the *oldest* (smallest seq) so
+                // tie eviction is FIFO, not lowest-slot (issue #70).
+                if !found || e.points < min_points || (e.points == min_points && e.seq < min_seq) {
+                    min_points = e.points;
+                    min_slot = slot;
+                    min_seq = e.seq;
+                    found = true;
+                }
+            }
+        }
+        if found {
+            env.storage().instance().set(&DataKey::MinPoints, &min_points);
+            env.storage().instance().set(&DataKey::MinSlot, &min_slot);
+        }
+    }
+
     fn update_top_players(env: &Env, user: Address, new_points: u64) {
         // Fast path: the user is already in the list — in-place update backed
         // by a validated reverse lookup (issue #67).
@@ -916,22 +952,8 @@ impl LeaderboardContract {
 
             Self::bubble_up(env, &entry, slot);
 
-            // The weakest entry sits at the last slot — keep the min cache fresh.
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TopPlayerCount)
-                .unwrap_or(0);
-            if count > 0 {
-                let min_slot = count - 1;
-                let min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &min_slot);
-            }
+            // Keep the min cache consistent after an in-place update.
+            Self::recompute_min(env);
             return;
         }
 
@@ -990,15 +1012,9 @@ impl LeaderboardContract {
 
                 Self::bubble_up(env, &new_entry, min_slot);
 
-                // Recompute the min (weakest now sits at the last slot).
-                let new_min_slot = MAX_TOP_PLAYERS - 1;
-                let new_min_entry: PlayerEntry = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TopPlayerAt(new_min_slot))
-                    .unwrap();
-                env.storage().instance().set(&DataKey::MinPoints, &new_min_entry.points);
-                env.storage().instance().set(&DataKey::MinSlot, &new_min_slot);
+                // Recompute the min over the bounded list (handles ties —
+                // the weakest entry may now sit at any slot).
+                Self::recompute_min(env);
             }
             _ => {}
         }

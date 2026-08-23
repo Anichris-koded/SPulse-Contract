@@ -412,6 +412,39 @@ impl LeaderboardContract {
     pub fn record_bet(env: Env, caller: Address, _user: Address) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
         Self::require_market_contract(&env, &caller)?;
+
+        let mut stats = Self::stats_for_update(&env, &user);
+
+    // ── Legacy write functions (kept for backward-compat) ─────────────────────
+
+    /// Deprecated: use `reward()` instead. This function always returns
+    /// `UnauthorizedCaller` and will be removed in a future version.
+    pub fn add_pts(
+        _env: Env,
+        _caller: Address,
+        _user: Address,
+        _pts: u64,
+        _is_won: bool,
+    ) -> Result<(), LeaderboardError> {
+        Err(LeaderboardError::UnauthorizedCaller)
+    }
+
+    /// Legacy: called by the referral contract to award bonus points.
+    /// Prefer reward_bonus() for new integrations (adds token minting).
+    pub fn add_bonus_pts(
+        env: Env,
+        caller: Address,
+        user: Address,
+        pts: u64,
+    ) -> Result<(), LeaderboardError> {
+        let referral: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReferralContract)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if caller != referral {
+            return Err(LeaderboardError::UnauthorizedCaller);
+        }
         caller.require_auth();
         Ok(())
     }

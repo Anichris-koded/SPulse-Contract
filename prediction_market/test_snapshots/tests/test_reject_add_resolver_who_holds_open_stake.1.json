@@ -329,17 +329,12 @@
         }
       ]
     ],
-    [],
-    [],
-    [],
-    [],
-    [],
     []
   ],
   "ledger": {
     "protocol_version": 26,
-    "sequence_number": 6000100,
-    "timestamp": 1000001,
+    "sequence_number": 100,
+    "timestamp": 1000000,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 10,
     "min_persistent_entry_ttl": 100,
@@ -1151,7 +1146,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12307300
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1181,7 +1176,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12307300
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1208,7 +1203,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12307300
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1363,7 +1358,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12307300
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1390,7 +1385,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12307300
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1595,7 +1590,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12307300
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1888,7 +1883,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12307300
+        "live_until": 6307300
       }
     ]
   },

@@ -173,9 +173,7 @@ fn test_bonus_only_user_has_nonzero_total_bets() {
     let (env, client, _admin, _market, referral) = setup();
     let user = Address::generate(&env);
 
-    // add_bonus_pts: per-referred-bet bonus path.
     client.add_bonus_pts(&referral, &user, &3_u64);
-    // add_bonus_pts: welcome-bonus path (tokens=0 so no mint wiring is needed).
     client.add_bonus_pts(&referral, &user, &5_u64);
 
     let stats = client.get_stats(&user);
@@ -202,14 +200,10 @@ fn test_rank_calculation() {
     assert_eq!(client.get_rank(&charlie), 2);
     assert_eq!(client.get_rank(&alice), 3);
     assert_eq!(client.get_rank(&dave), UNRANKED_RANK);
-    assert_eq!(client.get_rank(&bob), Some(1));
-    assert_eq!(client.get_rank(&charlie), Some(2));
-    assert_eq!(client.get_rank(&alice), Some(3));
-    assert_eq!(client.get_rank(&dave), None);
 }
 
 #[test]
-fn test_rank_is_none_for_player_outside_top_50() {
+fn test_rank_unranked_for_player_outside_top_50() {
     let (env, client, _admin, market, _referral) = setup();
 
     for points in 1u64..=50 {
@@ -217,10 +211,11 @@ fn test_rank_is_none_for_player_outside_top_50() {
         client.add_pts(&market, &user, &points, &true);
     }
     let outside_top_50 = Address::generate(&env);
+    // 0 points: stats are recorded but the player never enters the top list.
     client.add_pts(&market, &outside_top_50, &0_u64, &false);
 
     assert_eq!(client.get_top_player_count(), 50);
-    assert_eq!(client.get_rank(&outside_top_50), None);
+    assert_eq!(client.get_rank(&outside_top_50), UNRANKED_RANK);
 }
 
 #[test]
@@ -294,9 +289,7 @@ fn test_low_scorer_rejected_when_full() {
     // Weak user has stats/points recorded, but is NOT in the top list.
     assert_eq!(client.get_points(&weak), 5);
     assert_eq!(client.get_rank(&weak), UNRANKED_RANK);
-    assert_eq!(client.get_rank(&weak), None);
     assert_eq!(client.get_player_count(), 50);
-    assert_eq!(client.get_rank(&weak), 0);
     assert_eq!(client.get_top_player_count(), 50);
 }
 
@@ -306,7 +299,6 @@ fn test_bottom_player_rising_updates_min() {
     // so a later newcomer is compared against the NEW (higher) minimum.
     let (env, client, _admin, market, _referral) = setup();
     let weakest = Address::generate(&env);
-    // First entry is the weakest at 100; the rest are 110, 120, … (all higher).
     client.add_pts(&market, &weakest, &100_u64, &true);
     for i in 1u64..50 {
         let user = Address::generate(&env);
@@ -324,8 +316,6 @@ fn test_bottom_player_rising_updates_min() {
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &105_u64, &true);
     assert_eq!(client.get_rank(&newcomer), UNRANKED_RANK);
-    assert_eq!(client.get_rank(&newcomer), None);
-    assert_eq!(client.get_rank(&newcomer), 0);
     assert_eq!(client.get_top_player_count(), 50);
 }
 
@@ -529,7 +519,7 @@ fn test_get_rank_cleans_stale_reverse_lookup() {
         env.storage().persistent().remove(&DataKey::TopPlayerAt(0));
     });
 
-    assert_eq!(client.get_rank(&alice), 0);
+    assert_eq!(client.get_rank(&alice), UNRANKED_RANK);
     env.as_contract(&client.address, || {
         let slot: Option<u32> = env
             .storage()
@@ -564,7 +554,7 @@ fn test_reconcile_compacts_ttl_holes_and_restores_slots() {
     assert_eq!(top.get(1).unwrap().address, alice);
     assert_eq!(client.get_rank(&bob), 1);
     assert_eq!(client.get_rank(&alice), 2);
-    assert_eq!(client.get_rank(&charlie), 0);
+    assert_eq!(client.get_rank(&charlie), UNRANKED_RANK);
 }
 
 #[test]
@@ -599,6 +589,9 @@ fn test_unranked_rank_is_above_every_list_rank() {
     let outside_rank = client.get_rank(&outside);
     assert_eq!(outside_rank, UNRANKED_RANK);
     assert!(outside_rank > client.get_rank(&weakest));
+}
+
+#[test]
 fn test_upsert_repairs_stale_slot_instead_of_panicking() {
     // In-place path used to unwrap TopPlayerAt; a TTL hole must re-insert.
     let (env, client, _admin, market, _referral) = setup();
@@ -653,7 +646,7 @@ fn test_eviction_clears_reverse_lookup() {
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
 
-    assert_eq!(client.get_rank(&lowest), 0);
+    assert_eq!(client.get_rank(&lowest), UNRANKED_RANK);
     assert_eq!(client.get_rank(&newcomer), 1);
     env.as_contract(&client.address, || {
         let slot: Option<u32> = env
@@ -667,10 +660,10 @@ fn test_eviction_clears_reverse_lookup() {
 // ── Issue #67: extra reverse-lookup cases kept from main ──────────────────────
 
 #[test]
-fn test_rank_is_none_for_user_not_in_list() {
+fn test_rank_unranked_for_user_not_in_list() {
     let (env, client, _admin, _market, _referral) = setup();
     let stranger = Address::generate(&env);
-    assert_eq!(client.get_rank(&stranger), None);
+    assert_eq!(client.get_rank(&stranger), UNRANKED_RANK);
 }
 
 #[test]
@@ -682,7 +675,7 @@ fn test_stale_slot_self_heals_after_entry_expired() {
     let (env, client, _admin, market, _referral) = setup();
     let user = Address::generate(&env);
     client.add_pts(&market, &user, &100_u64, &true);
-    assert_eq!(client.get_rank(&user), Some(1));
+    assert_eq!(client.get_rank(&user), 1);
 
     env.as_contract(&client.address, || {
         env.storage().persistent().remove(&DataKey::TopPlayerAt(0));
@@ -690,8 +683,7 @@ fn test_stale_slot_self_heals_after_entry_expired() {
 
     client.add_pts(&market, &user, &50_u64, &true);
     assert_eq!(client.get_points(&user), 150);
-    assert_eq!(client.get_rank(&user), 1);
-    assert_eq!(client.get_rank(&user), Some(1)); // re-entered the list
+    assert_eq!(client.get_rank(&user), 1); // re-entered the list
 
     let top = client.get_top_players(&0_u32, &20_u32);
     let matches = top.iter().filter(|e| e.address == user).count();
@@ -727,12 +719,9 @@ fn test_eviction_repairs_expired_min_entry() {
     assert_eq!(top.get(0).unwrap().address, newcomer);
     assert_eq!(top.get(0).unwrap().points, 500);
     assert_eq!(client.get_rank(&newcomer), 1);
-    assert_eq!(client.get_rank(&weakest), 0);
-    assert_eq!(client.get_rank(&newcomer), Some(1));
     // The expired player (100) is gone; even though their orphaned
     // TopPlayerSlot survives, get_rank must not report a stale rank.
     assert_eq!(client.get_rank(&weakest), UNRANKED_RANK);
-    assert_eq!(client.get_rank(&weakest), None);
     // 101 is the new minimum — the repaired min cache agrees.
     assert_eq!(client.get_min_points(), 101);
 }
@@ -752,16 +741,14 @@ fn test_eviction_clears_reverse_mapping() {
         client.add_pts(&market, &user, &(100 + i), &true);
     }
     let weakest = weakest.unwrap();
-    assert_eq!(client.get_rank(&weakest), Some(50));
+    assert_eq!(client.get_rank(&weakest), 50);
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &1000_u64, &true);
-    assert_eq!(client.get_rank(&newcomer), Some(1));
+    assert_eq!(client.get_rank(&newcomer), 1);
 
     // Displaced player: unranked and no lingering reverse mapping.
     assert_eq!(client.get_rank(&weakest), UNRANKED_RANK);
-    // Displaced player: no rank and no lingering reverse mapping.
-    assert_eq!(client.get_rank(&weakest), None);
     let still_mapped = env.as_contract(&client.address, || {
         env.storage().persistent().has(&DataKey::TopPlayerSlot(weakest.clone()))
     });
@@ -784,7 +771,7 @@ fn test_stale_min_rejected_before_eviction() {
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &50_u64, &true);
-    assert_eq!(client.get_rank(&newcomer), Some(50));
+    assert_eq!(client.get_rank(&newcomer), 50);
     assert_eq!(client.get_player_count(), 50);
     let last = client.get_top_players(&40_u32, &20_u32);
     assert_eq!(last.get(9).unwrap().points, 50);

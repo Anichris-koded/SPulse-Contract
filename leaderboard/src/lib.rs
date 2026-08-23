@@ -55,6 +55,10 @@ pub enum LeaderboardError {
     /// reward()/reward_bonus() called with tokens > 0 but no TokenContract
     /// has been set via set_token_contract.
     TokenNotConfigured = 8,
+    /// Governance (#20): address has no stats/top-list presence to act on.
+    PlayerNotFound = 9,
+    /// Governance (#20): the address is banned from accruing rewards.
+    PlayerBanned = 10,
 }
 
 // OPT: single key per user. `points` carries the decay epoch it was written
@@ -69,6 +73,8 @@ pub enum DataKey {
     // cross-call from the market instead of two (add_pts + mint).
     TokenContract,
     Stats(Address),
+    StatsEpoch(Address),   // legacy key from the #69 lineage; cleared by governance
+    BannedPlayer(Address), // issue #20: persistent ban flag
     PendingReward(Address), // issue #73: deferred reward queue
     TopPlayerAt(u32),
     TopPlayerCount,
@@ -255,6 +261,7 @@ impl LeaderboardContract {
         is_won: bool,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
+        Self::require_not_banned(&env, &user)?;
         Self::require_market_contract(&env, &caller)?;
         caller.require_auth();
         Self::credit_points(&env, &user, pts, Some(is_won));
@@ -273,6 +280,7 @@ impl LeaderboardContract {
         is_won: bool,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
+        Self::require_not_banned(&env, &user)?;
         Self::require_market_contract(&env, &caller)?;
         caller.require_auth();
         if points == 0 {
@@ -295,6 +303,7 @@ impl LeaderboardContract {
         tokens: i128,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
+        Self::require_not_banned(&env, &user)?;
         Self::require_referral_contract(&env, &caller)?;
         caller.require_auth();
         Self::credit_bonus(&env, &user, pts);
@@ -312,6 +321,7 @@ impl LeaderboardContract {
         pts: u64,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
+        Self::require_not_banned(&env, &user)?;
         Self::require_referral_contract(&env, &caller)?;
         caller.require_auth();
         Self::credit_bonus(&env, &user, pts);
@@ -346,6 +356,7 @@ impl LeaderboardContract {
         is_won: bool,
     ) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
+        Self::require_not_banned(&env, &user)?;
         Self::require_market_contract(&env, &caller)?;
         caller.require_auth();
         Self::accumulate_pending(&env, &user, points, tokens, is_won, false);
@@ -357,6 +368,7 @@ impl LeaderboardContract {
     /// Permissionless — a user always has standing to collect their own
     /// pending rewards.
     pub fn claim_pending_rewards(env: Env, user: Address) -> Result<(), LeaderboardError> {
+        Self::require_not_banned(&env, &user)?;
         let key = DataKey::PendingReward(user.clone());
         let pending: PendingReward = match env.storage().persistent().get(&key) {
             Some(p) => p,
@@ -526,6 +538,168 @@ impl LeaderboardContract {
     /// (keeper/repair); it only writes keys that restore the index invariant.
     pub fn reconcile_top_slots(env: Env) {
         Self::repair_top_index(&env);
+    }
+
+    // ── Governance (issue #20): remove / ban / reset ─────────────────────────
+
+    /// Remove a player entirely: erases Stats, PendingReward and top-list
+    /// presence, compacting the index so no hole is left behind. Admin only.
+    /// Returns PlayerNotFound when the address has nothing to remove.
+    pub fn remove_player(
+        env: Env,
+        admin: Address,
+        user: Address,
+    ) -> Result<(), LeaderboardError> {
+        Self::require_admin(&env, &admin)?;
+
+        let stats_key = DataKey::Stats(user.clone());
+        let has_stats = env.storage().persistent().has(&stats_key);
+        let has_pending = env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingReward(user.clone()));
+        let count = Self::top_count(&env);
+        let slot_opt = Self::resolved_slot(&env, &user, count);
+
+        if !has_stats && !has_pending && slot_opt.is_none() {
+            return Err(LeaderboardError::PlayerNotFound);
+        }
+
+        env.storage().persistent().remove(&stats_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::StatsEpoch(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingReward(user.clone()));
+
+        if let Some(slot) = slot_opt {
+            Self::clear_top_slot(&env, slot);
+            Self::repair_top_index(&env);
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    /// Ban a player: erases all residual state (stats, pending rewards,
+    /// top-list slot) and persists a ban flag. Every future accrual path
+    /// rejects them with PlayerBanned until unbanned. Admin only.
+    pub fn ban_player(
+        env: Env,
+        admin: Address,
+        user: Address,
+    ) -> Result<(), LeaderboardError> {
+        Self::require_admin(&env, &admin)?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Stats(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::StatsEpoch(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingReward(user.clone()));
+
+        let count = Self::top_count(&env);
+        if let Some(slot) = Self::resolved_slot(&env, &user, count) {
+            Self::clear_top_slot(&env, slot);
+            Self::repair_top_index(&env);
+        }
+
+        let ban_key = DataKey::BannedPlayer(user.clone());
+        env.storage().persistent().set(&ban_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&ban_key, TTL_BUMP, TTL_HIGH);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    /// Zero out a player's points while preserving their lifetime
+    /// won/lost/bonus counters, and re-run the top-list maintenance so their
+    /// entry sinks to its new position. Admin only.
+    pub fn reset_player(
+        env: Env,
+        admin: Address,
+        user: Address,
+    ) -> Result<(), LeaderboardError> {
+        Self::require_admin(&env, &admin)?;
+
+        let stats_key = DataKey::Stats(user.clone());
+        let stored_opt: Option<StoredStats> = env.storage().persistent().get(&stats_key);
+        let count = Self::top_count(&env);
+        let slot_opt = Self::resolved_slot(&env, &user, count);
+
+        if stored_opt.is_none() && slot_opt.is_none() {
+            return Err(LeaderboardError::PlayerNotFound);
+        }
+
+        let mut stored = stored_opt.unwrap_or_else(|| StoredStats {
+            epoch: Self::current_epoch(&env),
+            ..StoredStats::zero()
+        });
+        stored.points = 0;
+        stored.epoch = Self::current_epoch(&env);
+        Self::save_stored(&env, &user.clone(), &stored);
+        if let Some(slot) = slot_opt {
+            let entry = PlayerEntry {
+                address: user.clone(),
+                points: 0,
+                epoch: Self::current_epoch(&env),
+            };
+            Self::set_top_slot(&env, slot, &entry);
+            // Sink to the correct position: swap downward past stronger players.
+            let mut cur = slot;
+            while cur + 1 < Self::top_count(&env) {
+                match Self::forward_entry(&env, cur + 1) {
+                    Some(next) if Self::entry_points_now(&env, &next) > 0 => {
+                        Self::set_top_slot(&env, cur, &next);
+                        Self::set_top_slot(&env, cur + 1, &entry);
+                        cur += 1;
+                    }
+                    _ => break,
+                }
+            }
+            Self::refresh_min(&env, Self::top_count(&env));
+        } else {
+            Self::refresh_min(&env, Self::top_count(&env));
+        }
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    /// Whether the address is currently banned (issue #20).
+    pub fn is_banned(env: Env, user: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::BannedPlayer(user))
+            .unwrap_or(false)
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), LeaderboardError> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaderboardError::NotInitialized)?;
+        if *admin != stored {
+            return Err(LeaderboardError::NotAdmin);
+        }
+        admin.require_auth();
+        Ok(())
+    }
+
+    fn require_not_banned(env: &Env, user: &Address) -> Result<(), LeaderboardError> {
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::BannedPlayer(user.clone()))
+            .unwrap_or(false)
+        {
+            return Err(LeaderboardError::PlayerBanned);
+        }
+        Ok(())
     }
 
     /// Permissionless keeper: extend a player's Stats + top-list mapping and

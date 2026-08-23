@@ -260,7 +260,9 @@ impl ReferralRegistryContract {
         caller.require_auth();
         Self::require_market_contract(&env, &caller)?;
         // Lever A: resolve referrer via packed Profile (new) or legacy key (old).
-        let referrer: Option<Address> = Self::load_profile(&env, &user).and_then(|p| p.referrer);
+        let referrer: Option<Address> = Self::load_profile(&env, &user)
+            .and_then(|p| p.referrer)
+            .filter(|ref_addr| Self::is_registered(env.clone(), ref_addr.clone()));
         match referrer {
             Some(ref_addr) => {
                 let xlm_sac: Address = env

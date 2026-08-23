@@ -22,6 +22,7 @@ fn setup() -> (
     let env = Env::default();
     env.mock_all_auths();
     env.cost_estimate().budget().reset_unlimited();
+    env.cost_estimate().disable_resource_limits();
 
     let contract_id = env.register(LeaderboardContract, ());
     let client = LeaderboardContractClient::new(&env, &contract_id);

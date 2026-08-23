@@ -1,7 +1,6 @@
 use super::*;
 use soroban_sdk::{
     contract, contractimpl,
-    testutils::{Address as _, Events},
     testutils::{storage::Persistent as _, Address as _, Events},
     token::{Client as TokenClient, StellarAssetClient},
     Env, String, Symbol, TryFromVal, Val,
@@ -567,15 +566,6 @@ fn test_register_referral_survives_incompatible_leaderboard() {
     let t = setup_with_incompatible_leaderboard();
 
     let user = Address::generate(&t.env);
-    let result = t
-        .client
-        .try_register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
-    assert_eq!(
-        result.unwrap_err().unwrap(),
-        ReferralError::IncompatibleInterface
-    );
-    // The registration itself must not have partially applied.
-    assert!(!t.client.is_registered(&user));
     t.client
         .register_referral(&user, &String::from_str(&t.env, "Someone"), &None);
     // The optional reward queue may fail, but registration remains committed.
@@ -593,10 +583,17 @@ fn test_credit_survives_incompatible_leaderboard() {
     // concerned with credit()'s own version check.
     t.env.as_contract(&t.referral_id, || {
         t.env.storage().persistent().set(
+            &DataKey::Profile(referrer.clone()),
+            &UserProfile {
+                display_name: String::from_str(&t.env, "Referrer"),
+                referrer: None,
+            },
+        );
+        t.env.storage().persistent().set(
             &DataKey::Profile(user.clone()),
             &UserProfile {
                 display_name: String::from_str(&t.env, "Bettor"),
-                referrer: Some(referrer),
+                referrer: Some(referrer.clone()),
             },
         );
     });
@@ -607,10 +604,6 @@ fn test_credit_survives_incompatible_leaderboard() {
     sac_admin.mint(&t.referral_id, &100_0000000_i128);
 
     let result = t.client.try_credit(&t.market, &user, &1_0000000_i128);
-    assert_eq!(
-        result.unwrap_err().unwrap(),
-        ReferralError::IncompatibleInterface
-    );
     assert_eq!(result.unwrap().unwrap(), true);
     assert_eq!(t.client.get_earnings(&referrer), 1_0000000_i128);
 }
@@ -839,6 +832,8 @@ fn test_migrate_user_rejects_non_admin() {
     let user = Address::generate(&t.env);
     let not_admin = Address::generate(&t.env);
     t.client.migrate_user(&not_admin, &user);
+}
+
 #[test]
 fn test_register_and_refresh_extend_referrer_ttl() {
     let t = setup();
@@ -863,6 +858,9 @@ fn test_register_and_refresh_extend_referrer_ttl() {
     assert!(count_ttl >= TTL_BUMP);
     t.client.refresh_referrer_ttl(&referrer);
     assert_eq!(t.client.get_referral_count(&referrer), 1);
+}
+
+#[test]
 fn test_register_referral_emits_event() {
     let t = setup();
     let user = Address::generate(&t.env);

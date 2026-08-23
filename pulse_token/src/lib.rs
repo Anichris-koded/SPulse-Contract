@@ -21,7 +21,8 @@ pub enum TokenError {
     NotAdmin = 6,
     InsufficientAllowance = 7,
     InvalidExpirationLedger = 8,
-    ContractPaused = 9,
+    // Issue #95: operation blocked because the contract is paused.
+    Paused = 9,
     AlreadyMinter = 10,
     NotMinter = 11,
     MinterListFull = 12,
@@ -193,6 +194,26 @@ impl PULSETokenContract {
         Ok(())
     }
 
+    /// Issue #95 circuit breaker: pause all supply-changing operations while
+    /// an emergency is handled. The caller must be the admin; idempotent.
+    /// Transfers/allowances stay available so user funds are never locked.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), TokenError> {
+        let admin: Address = Self::require_admin(&env)?;
+        if caller != admin {
+            return Err(TokenError::NotAdmin);
+        }
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &paused);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     pub fn get_authorized_minters(env: Env) -> soroban_sdk::Vec<Address> {
         let count: u32 = env
             .storage()
@@ -241,7 +262,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(to.clone()), &(balance + amount));
         let supply: i128 = env
             .storage()
             .instance()
@@ -258,7 +278,6 @@ impl PULSETokenContract {
     }
 
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) -> Result<(), TokenError> {
-        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TokenError::InvalidAmount);
         }
@@ -274,7 +293,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let to_balance = Self::balance(env.clone(), to.clone());
         let to_key = DataKey::Balance(to.clone());
         env.storage()
@@ -283,7 +301,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
             amount,
@@ -397,11 +414,10 @@ impl PULSETokenContract {
             .set(&to_key, &(to_balance + amount));
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Balance(from), TTL_BUMP, TTL_HIGH);
+            .extend_ttl(&DataKey::Balance(from.clone()), TTL_BUMP, TTL_HIGH);
         env.storage()
             .persistent()
             .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
             amount,
@@ -426,7 +442,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&from_key, TTL_BUMP, TTL_HIGH);
-            .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         let supply: i128 = env
             .storage()
             .instance()
@@ -483,7 +498,7 @@ impl PULSETokenContract {
 
     fn require_not_paused(env: &Env) -> Result<(), TokenError> {
         if Self::is_paused(env.clone()) {
-            return Err(TokenError::ContractPaused);
+            return Err(TokenError::Paused);
         }
         Ok(())
     }

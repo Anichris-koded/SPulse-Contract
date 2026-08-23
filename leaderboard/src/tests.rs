@@ -806,3 +806,16 @@ fn test_add_pts_emits_leaderboard_updated() {
     let name = Symbol::try_from_val(&env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
 }
+
+#[test]
+fn test_add_pts_always_rejected() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    let rando = Address::generate(&env);
+    let result = client.add_pts(&rando, &user, &10_u64, &true);
+    assert!(result.is_err(), "add_pts should always return an error");
+    match result {
+        Err(LeaderboardError::UnauthorizedCaller) => {}
+        other => panic!("add_pts returned unexpected error: {:?}", other),
+    }
+}

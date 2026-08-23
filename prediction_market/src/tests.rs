@@ -2162,6 +2162,145 @@ fn test_many_winners_payouts_exact_and_dust_swept() {
     assert_eq!(t.xlm.balance(&w1), 1_000_0000000_i128 - 30_000_001_i128 + p1);
 }
 
+// ── #2: the balance invariant holds at every stage of the claim lifecycle ────
+#[test]
+fn test_payout_invariant_holds_through_partial_claims() {
+    // contract_balance == Σ unclaimed stored payouts + accumulated fees
+    // must hold after resolution, after each individual claim, and after
+    // the final claim — no dust may appear or vanish mid-lifecycle (#47).
+    let t = setup();
+    let id = create_test_market(&t);
+
+    let w1 = Address::generate(&t.env);
+    let w2 = Address::generate(&t.env);
+    let w3 = Address::generate(&t.env);
+    fund_user(&t, &w1, 1_000_0000000);
+    fund_user(&t, &w2, 1_000_0000000);
+    fund_user(&t, &w3, 1_000_0000000);
+
+    // Deliberately uneven stakes that do not divide the pool evenly.
+    t.client.place_bet(&w1, &id, &true, &10_300_007_i128); // net clears MIN_BET
+    t.client.place_bet(&w2, &id, &true, &20_000_011_i128);
+    t.client.place_bet(&w3, &id, &true, &30_000_013_i128);
+    let loser = Address::generate(&t.env);
+    fund_user(&t, &loser, 1_000_0000000);
+    t.client.place_bet(&loser, &id, &false, &33_333_333_i128);
+
+    advance_time(&t.env, 3601);
+    let fees_before = t.client.get_accumulated_fees();
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let market = t.client.get_market(&id);
+    let pool: i128 = market.total_yes + market.total_no;
+    let win: i128 = market.total_yes;
+
+    let n1 = t.client.get_bet(&id, &w1).amount;
+    let n2 = t.client.get_bet(&id, &w2).amount;
+    let n3 = t.client.get_bet(&id, &w3).amount;
+    let payouts = [
+        (n1 * pool) / win,
+        (n2 * pool) / win,
+        (n3 * pool) / win,
+    ];
+    assert_eq!(t.client.get_payout(&id, &w1), payouts[0]);
+    assert_eq!(t.client.get_payout(&id, &w2), payouts[1]);
+    assert_eq!(t.client.get_payout(&id, &w3), payouts[2]);
+    let sum_payouts: i128 = payouts.iter().sum();
+
+    // Deterministic dust is swept to fees exactly once, at settlement.
+    let dust = pool - sum_payouts;
+    assert!(dust >= 0);
+    assert_eq!(t.client.get_accumulated_fees(), fees_before + dust);
+
+    // After resolution: balance == unclaimed payouts + (fees + dust).
+    let market_contract = t.client.address.clone();
+    let bal_after_resolve = t.xlm.balance(&market_contract);
+    assert_eq!(bal_after_resolve, sum_payouts + fees_before + dust);
+
+    // Each partial claim drains exactly that winner's stored payout and
+    // leaves the fee accumulator untouched.
+    let mut claimed: i128 = 0;
+    for (i, w) in [&w1, &w2].iter().enumerate() {
+        let before = t.xlm.balance(&market_contract);
+        t.client.claim(w, &id);
+        let dropped = before - t.xlm.balance(&market_contract);
+        assert_eq!(dropped, payouts[i]);
+        claimed += dropped;
+        assert_eq!(
+            t.xlm.balance(&market_contract),
+            bal_after_resolve - claimed
+        );
+        assert_eq!(t.client.get_accumulated_fees(), fees_before + dust);
+    }
+
+    // The final claim empties the payout side completely; only earned fees
+    // remain in the contract.
+    let before = t.xlm.balance(&market_contract);
+    t.client.claim(&w3, &id);
+    assert_eq!(before - t.xlm.balance(&market_contract), payouts[2]);
+    assert_eq!(t.xlm.balance(&market_contract), fees_before + dust);
+
+    // A loser claiming gets nothing and moves no funds.
+    let loser_before = t.xlm.balance(&loser);
+    t.client.claim(&loser, &id);
+    assert_eq!(t.xlm.balance(&loser), loser_before);
+    assert_eq!(t.xlm.balance(&market_contract), fees_before + dust);
+}
+
+// ── #2: hedged positions are paid on their winning-side net only ─────────────
+#[test]
+fn test_hedged_position_payout_uses_winning_side_net_only() {
+    // With two-sided positions allowed (#98), a bettor holding net on BOTH
+    // sides must be paid proportionally on their winning-side net alone.
+    // The #47 invariant Σ payouts + dust == pool must still hold.
+    let t = setup();
+    let id = create_test_market(&t);
+
+    let hedger = Address::generate(&t.env);
+    let pure_winner = Address::generate(&t.env);
+    fund_user(&t, &hedger, 1_000_0000000);
+    fund_user(&t, &pure_winner, 1_000_0000000);
+
+    t.client.place_bet(&hedger, &id, &true, &60_0000000_i128);
+    t.client.place_bet(&hedger, &id, &false, &40_0000000_i128); // hedge
+    t.client.place_bet(&pure_winner, &id, &true, &50_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    let fees_before = t.client.get_accumulated_fees();
+    t.client.resolve_market(&t.admin, &id, &true);
+
+    let market = t.client.get_market(&id);
+    let pool: i128 = market.total_yes + market.total_no;
+    let win: i128 = market.total_yes; // hedger's yes-net + pure winner
+
+    let position = t.client.get_position(&id, &hedger);
+    let hedge_net_yes = position.net_yes;
+    let pure_net = t.client.get_bet(&id, &pure_winner).amount;
+    assert_eq!(hedge_net_yes + pure_net, win);
+
+    let p_hedge = (hedge_net_yes * pool) / win;
+    let p_pure = (pure_net * pool) / win;
+    assert_eq!(t.client.get_payout(&id, &hedger), p_hedge);
+    assert_eq!(t.client.get_payout(&id, &pure_winner), p_pure);
+
+    // Invariant holds with a hedged participant in the winner set.
+    let dust = pool - p_hedge - p_pure;
+    assert!(dust >= 0);
+    assert_eq!(t.client.get_accumulated_fees(), fees_before + dust);
+
+    // Hedger's losing-side stake stays pooled: their claim pays out only
+    // the winning-side share, never their own no-stake back on top.
+    t.client.claim(&hedger, &id);
+    t.client.claim(&pure_winner, &id);
+
+    let market_contract = t.client.address.clone();
+    assert_eq!(
+        t.xlm.balance(&market_contract),
+        fees_before + dust
+    );
+    assert_eq!(p_hedge, hedge_net_yes * pool / win);
+}
+
 // ── #2: single winner receives the whole pool (no dust) ─────────────────────
 #[test]
 fn test_single_winner_gets_whole_net_pool() {

@@ -290,13 +290,13 @@ fn test_a_newcomer_enters_on_a_score_the_old_model_would_have_rejected() {
 
     assert_ne!(
         client.get_rank(&newcomer),
-        0,
+        UNRANKED_RANK,
         "a score of 70 must displace an incumbent now worth 59, even though \
          that incumbent still has 100 in storage"
     );
     assert_eq!(
         client.get_rank(&weakest),
-        0,
+        UNRANKED_RANK,
         "the decayed weakest entry should have been evicted"
     );
     assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);

@@ -144,7 +144,6 @@ pub enum DataKey {
     BettorAt(u64, u32),
     Resolver(Address),
     FeeRecipient(Address),
-    HasReferrer(Address),
     RateWindow, // packed u64: high32=window_start_hi, low32=count
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
@@ -888,10 +887,6 @@ impl PredictionMarketContract {
             .persistent()
             .extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
 
-        // ── HasReferrer cache write ───────────────────────────────────────
-        let hr_key = DataKey::HasReferrer(user.clone());
-        let cached: Option<bool> = env.storage().persistent().get(&hr_key);
-
         // ── External calls (issue 89: after ALL state writes) ─────────────
 
         // ── XLM transfer user → this contract ────────────────────────────
@@ -899,13 +894,11 @@ impl PredictionMarketContract {
         let this = env.current_contract_address();
         xlm.transfer(&user, &this, &amount);
 
-        // ── Referral (skip if cached no-referrer) ─────────────────────────
-        let _paid_referrer = if cached == Some(false) {
-            false
-        } else {
+        // ── Referral (always check referral contract directly) ────────────
+        let _paid_referrer = {
             Self::require_compatible_referral(&env, &cfg.referral)?;
             xlm.transfer(&this, &cfg.referral, &referral_fee);
-            let result: bool = env.invoke_contract(
+            env.invoke_contract(
                 &cfg.referral,
                 &Symbol::new(&env, "credit"),
                 vec![
@@ -914,14 +907,7 @@ impl PredictionMarketContract {
                     user.clone().into_val(&env),
                     referral_fee.into_val(&env),
                 ],
-            );
-            if cached.is_none() {
-                env.storage().persistent().set(&hr_key, &result);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&hr_key, TTL_BUMP, TTL_HIGH);
-            }
-            result
+            )
         };
 
         // ── Release reentrancy lock ──────────────────────────────────────

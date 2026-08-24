@@ -807,6 +807,165 @@ fn test_stale_min_rejected_before_eviction() {
     assert_eq!(last.get(9).unwrap().points, 50);
 }
 
+// ── Issue #68: the write-time ordered index ─────────────────────────────────
+// These tests pin the invariants the pagination change relies on: slots are
+// ordered at write time, the reverse lookup tracks every swap, and the min
+// cache follows evictions — so get_top_players can read a page directly.
+
+#[test]
+fn test_reverse_index_tracks_slots_after_bubbling() {
+    // Insert out of order so each write bubbles an entry upward; every
+    // player's TopPlayerSlot must agree with the slot get_top_players
+    // returns them in (no stale reverse keys after swaps).
+    let (env, client, _admin, market, _referral) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let charlie = Address::generate(&env);
+    let dave = Address::generate(&env);
+    client.add_pts(&market, &alice, &10_u64, &true);
+    client.add_pts(&market, &bob, &50_u64, &true);
+    client.add_pts(&market, &charlie, &30_u64, &true);
+    client.add_pts(&market, &dave, &40_u64, &true);
+
+    let top = client.get_top_players(&0_u32, &20_u32);
+    assert_eq!(top.len(), 4);
+    // [bob 50, dave 40, charlie 30, alice 10]
+    let expected = [
+        (bob.clone(), 0u32),
+        (dave.clone(), 1u32),
+        (charlie.clone(), 2u32),
+        (alice.clone(), 3u32),
+    ];
+    for (addr, slot) in expected {
+        let stored: Option<u32> = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::TopPlayerSlot(addr.clone()))
+        });
+        assert_eq!(
+            stored,
+            Some(slot),
+            "reverse lookup for {:?} drifted from slot {slot}",
+            addr
+        );
+    }
+}
+
+#[test]
+fn test_in_place_boost_rewrites_both_reverse_lookups() {
+    // Boosting a mid-list player to the top bubbles through every entry above
+    // them; each swap must rewrite both sides of the mapping.
+    let (env, client, _admin, market, _referral) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+    client.add_pts(&market, &a, &30_u64, &true);
+    client.add_pts(&market, &b, &20_u64, &true);
+    client.add_pts(&market, &c, &10_u64, &true);
+
+    // Boost the weakest to the top.
+    client.add_pts(&market, &c, &100_u64, &true);
+
+    let top = client.get_top_players(&0_u32, &20_u32);
+    assert_eq!(top.get(0).unwrap().address, c);
+    assert_eq!(top.get(1).unwrap().address, a);
+    assert_eq!(top.get(2).unwrap().address, b);
+
+    let slot_of = |env: &Env, addr: &Address| -> Option<u32> {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::TopPlayerSlot(addr.clone()))
+        })
+    };
+    assert_eq!(slot_of(&env, &c), Some(0));
+    assert_eq!(slot_of(&env, &a), Some(1));
+    assert_eq!(slot_of(&env, &b), Some(2));
+}
+
+#[test]
+fn test_eviction_refreshes_min_cache_and_reverse_mapping() {
+    // Fill the board with strictly descending points (no bubble), evict the
+    // weakest with a top scorer, and verify MinPoints/MinSlot now describe
+    // the new weakest entry while the evicted player's reverse key is gone.
+    let (env, client, _admin, market, _referral) = setup();
+    for i in 0u64..MAX_TOP_PLAYERS as u64 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &(1000 - i), &true);
+    }
+    let weakest = client
+        .get_top_players(&(MAX_TOP_PLAYERS - 1), &1)
+        .get(0)
+        .unwrap()
+        .address
+        .clone();
+    assert_eq!(client.get_min_points(), 951);
+
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &5000_u64, &true);
+
+    assert_eq!(client.get_rank(&weakest), UNRANKED_RANK);
+    let still_mapped = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .has(&DataKey::TopPlayerSlot(weakest.clone()))
+    });
+    assert!(!still_mapped, "evicted player must lose their reverse mapping");
+
+    // The min cache now tracks the weakest survivor at the last slot.
+    assert_eq!(client.get_min_slot(), MAX_TOP_PLAYERS - 1);
+    let tail = client.get_top_players(&(MAX_TOP_PLAYERS - 1), &1);
+    assert_eq!(tail.get(0).unwrap().points, client.get_min_points());
+}
+
+#[test]
+fn test_pagination_pages_are_contiguous_and_gap_free() {
+    // Interleaved points so insertion order != rank order. Paging through
+    // the index with a small page must reconstruct the exact same descending
+    // list with no gaps and no duplicates.
+    let (env, client, _admin, market, _referral) = setup();
+    for i in 0u64..35 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &(i * 11 % 35 + 1), &true);
+    }
+    assert_eq!(client.get_top_player_count(), 35);
+
+    let mut seen: soroban_sdk::Vec<PlayerEntry> = soroban_sdk::vec![&env];
+    let mut offset = 0u32;
+    loop {
+        let page = client.get_top_players(&offset, &7_u32);
+        if page.len() == 0 {
+            break;
+        }
+        for entry in page.iter() {
+            seen.push_back(entry.clone());
+        }
+        offset += 7;
+        if offset >= client.get_top_player_count() {
+            break;
+        }
+    }
+
+    assert_eq!(seen.len(), 35, "paging must visit every ranked player");
+
+    // No duplicates, and the concatenated pages are one descending list.
+    for i in 0..seen.len() {
+        let addr = seen.get(i).unwrap().address.clone();
+        let dupes = seen
+            .iter()
+            .filter(|e| e.address == addr)
+            .count();
+        assert_eq!(dupes, 1, "paging must not duplicate a player");
+    }
+
+    let mut previous = u64::MAX;
+    for entry in seen.iter() {
+        let pts = client.get_points(&entry.address);
+        assert!(pts <= previous, "page boundary broke the descending order");
+        previous = pts;
+    }
+}
+
 #[test]
 fn test_add_pts_emits_leaderboard_updated() {
     let (env, client, _admin, market, _referral) = setup();
@@ -822,17 +981,4 @@ fn test_add_pts_emits_leaderboard_updated() {
     let topic0 = Val::try_from_val(&env, &body.topics[0]).unwrap();
     let name = Symbol::try_from_val(&env, &topic0).unwrap();
     assert_eq!(name, Symbol::new(&env, "leaderboard_updated"));
-}
-
-#[test]
-fn test_add_pts_always_rejected() {
-    let (env, client, _admin, market, _referral) = setup();
-    let user = Address::generate(&env);
-    let rando = Address::generate(&env);
-    let result = client.add_pts(&rando, &user, &10_u64, &true);
-    assert!(result.is_err(), "add_pts should always return an error");
-    match result {
-        Err(LeaderboardError::UnauthorizedCaller) => {}
-        other => panic!("add_pts returned unexpected error: {:?}", other),
-    }
 }

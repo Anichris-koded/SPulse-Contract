@@ -898,7 +898,7 @@ impl PredictionMarketContract {
         let _paid_referrer = {
             Self::require_compatible_referral(&env, &cfg.referral)?;
             xlm.transfer(&this, &cfg.referral, &referral_fee);
-            env.invoke_contract(
+            let result: bool = env.invoke_contract(
                 &cfg.referral,
                 &Symbol::new(&env, "credit"),
                 vec![
@@ -907,7 +907,8 @@ impl PredictionMarketContract {
                     user.clone().into_val(&env),
                     referral_fee.into_val(&env),
                 ],
-            )
+            );
+            result
         };
 
         // ── Release reentrancy lock ──────────────────────────────────────

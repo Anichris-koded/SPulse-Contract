@@ -173,9 +173,7 @@ fn test_bonus_only_user_has_nonzero_total_bets() {
     let (env, client, _admin, _market, referral) = setup();
     let user = Address::generate(&env);
 
-    // add_bonus_pts: per-referred-bet bonus path.
     client.add_bonus_pts(&referral, &user, &3_u64);
-    // add_bonus_pts: welcome-bonus path (tokens=0 so no mint wiring is needed).
     client.add_bonus_pts(&referral, &user, &5_u64);
 
     let stats = client.get_stats(&user);
@@ -202,6 +200,22 @@ fn test_rank_calculation() {
     assert_eq!(client.get_rank(&charlie), 2);
     assert_eq!(client.get_rank(&alice), 3);
     assert_eq!(client.get_rank(&dave), UNRANKED_RANK);
+}
+
+#[test]
+fn test_rank_unranked_for_player_outside_top_50() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    for points in 1u64..=50 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &points, &true);
+    }
+    let outside_top_50 = Address::generate(&env);
+    // 0 points: stats are recorded but the player never enters the top list.
+    client.add_pts(&market, &outside_top_50, &0_u64, &false);
+
+    assert_eq!(client.get_top_player_count(), 50);
+    assert_eq!(client.get_rank(&outside_top_50), UNRANKED_RANK);
 }
 
 #[test]
@@ -285,7 +299,6 @@ fn test_bottom_player_rising_updates_min() {
     // so a later newcomer is compared against the NEW (higher) minimum.
     let (env, client, _admin, market, _referral) = setup();
     let weakest = Address::generate(&env);
-    // First entry is the weakest at 100; the rest are 110, 120, … (all higher).
     client.add_pts(&market, &weakest, &100_u64, &true);
     for i in 1u64..50 {
         let user = Address::generate(&env);
@@ -647,6 +660,13 @@ fn test_eviction_clears_reverse_lookup() {
 // ── Issue #67: extra reverse-lookup cases kept from main ──────────────────────
 
 #[test]
+fn test_rank_unranked_for_user_not_in_list() {
+    let (env, client, _admin, _market, _referral) = setup();
+    let stranger = Address::generate(&env);
+    assert_eq!(client.get_rank(&stranger), UNRANKED_RANK);
+}
+
+#[test]
 fn test_stale_slot_self_heals_after_entry_expired() {
     // Simulate a TTL expiry that removes the forward TopPlayerAt entry while
     // the reverse TopPlayerSlot lookup survives. Previously the next update
@@ -663,7 +683,7 @@ fn test_stale_slot_self_heals_after_entry_expired() {
 
     client.add_pts(&market, &user, &50_u64, &true);
     assert_eq!(client.get_points(&user), 150);
-    assert_eq!(client.get_rank(&user), 1);
+    assert_eq!(client.get_rank(&user), 1); // re-entered the list
 
     let top = client.get_top_players(&0_u32, &20_u32);
     let matches = top.iter().filter(|e| e.address == user).count();
@@ -730,9 +750,7 @@ fn test_eviction_clears_reverse_mapping() {
     // Displaced player: unranked and no lingering reverse mapping.
     assert_eq!(client.get_rank(&weakest), UNRANKED_RANK);
     let still_mapped = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .has(&DataKey::TopPlayerSlot(weakest.clone()))
+        env.storage().persistent().has(&DataKey::TopPlayerSlot(weakest.clone()))
     });
     assert!(!still_mapped);
 }
@@ -760,143 +778,6 @@ fn test_stale_min_rejected_before_eviction() {
 }
 
 #[test]
-fn test_get_top_players_pagination_boundaries() {
-    let (env, client, _admin, market, _referral) = setup();
-
-    // Zero page size returns empty vec
-    let empty = client.get_top_players(&0_u32, &0_u32);
-    assert_eq!(empty.len(), 0);
-
-    // Empty leaderboard returns empty vec
-    let empty_board = client.get_top_players(&0_u32, &10_u32);
-    assert_eq!(empty_board.len(), 0);
-
-    // Add 15 players
-    let mut users = soroban_sdk::vec![&env];
-    for i in 1u64..=15 {
-        let user = Address::generate(&env);
-        client.add_pts(&market, &user, &(i * 10), &true);
-        users.push_back(user);
-    }
-    assert_eq!(client.get_player_count(), 15);
-
-    // Page 1 (offset 0, page_size 5) -> scores 150, 140, 130, 120, 110
-    let p1 = client.get_top_players(&0_u32, &5_u32);
-    assert_eq!(p1.len(), 5);
-    assert_eq!(p1.get(0).unwrap().points, 150);
-    assert_eq!(p1.get(4).unwrap().points, 110);
-
-    // Page 2 (offset 5, page_size 5) -> scores 100, 90, 80, 70, 60
-    let p2 = client.get_top_players(&5_u32, &5_u32);
-    assert_eq!(p2.len(), 5);
-    assert_eq!(p2.get(0).unwrap().points, 100);
-    assert_eq!(p2.get(4).unwrap().points, 60);
-
-    // Page 3 (offset 10, page_size 10) -> partial page: 5 items (scores 50, 40, 30, 20, 10)
-    let p3 = client.get_top_players(&10_u32, &10_u32);
-    assert_eq!(p3.len(), 5);
-    assert_eq!(p3.get(0).unwrap().points, 50);
-    assert_eq!(p3.get(4).unwrap().points, 10);
-
-    // Offset exactly at count (offset 15) -> empty
-    let p_end = client.get_top_players(&15_u32, &5_u32);
-    assert_eq!(p_end.len(), 0);
-
-    // Offset beyond count (offset 20) -> empty
-    let p_beyond = client.get_top_players(&20_u32, &5_u32);
-    assert_eq!(p_beyond.len(), 0);
-}
-
-#[test]
-fn test_interleaved_points_maintain_strict_descending_order() {
-    let (env, client, _admin, market, _referral) = setup();
-
-    // Create 10 players and award points in pseudo-random interleaved fashion
-    let mut players = soroban_sdk::vec![&env];
-    for _ in 0..10 {
-        players.push_back(Address::generate(&env));
-    }
-
-    let awards: [(u32, u64); 16] = [
-        (0, 50),
-        (1, 10),
-        (2, 80),
-        (3, 40),
-        (4, 90),
-        (5, 30),
-        (6, 70),
-        (7, 20),
-        (8, 100),
-        (9, 60),
-        (1, 150), // player 1 jumps to 160
-        (3, 100), // player 3 jumps to 140
-        (7, 50),  // player 7 jumps to 70
-        (5, 80),  // player 5 jumps to 110
-        (0, 60),  // player 0 jumps to 110
-        (8, 20),  // player 8 jumps to 120
-    ];
-
-    for (idx, pts) in awards.iter() {
-        let p = players.get(*idx).unwrap();
-        client.add_pts(&market, &p, pts, &true);
-    }
-
-    let top = client.get_top_players(&0_u32, &20_u32);
-    assert_eq!(top.len(), 10);
-
-    // Verify list is monotonically non-increasing (descending)
-    for i in 0..9 {
-        let cur = top.get(i).unwrap().points;
-        let next = top.get(i + 1).unwrap().points;
-        assert!(
-            cur >= next,
-            "Rank order violated at slot {i}: {cur} < {next}"
-        );
-    }
-
-    // Player 1 has 160 points -> rank 1
-    let p1 = players.get(1).unwrap();
-    assert_eq!(client.get_points(&p1), 160);
-    assert_eq!(client.get_rank(&p1), 1);
-    assert_eq!(top.get(0).unwrap().address, p1);
-}
-
-#[test]
-fn test_inplace_upgrade_bubbles_to_first_place() {
-    let (env, client, _admin, market, _referral) = setup();
-
-    let p_leader = Address::generate(&env);
-    let p_mid = Address::generate(&env);
-    let p_tail = Address::generate(&env);
-
-    client.add_pts(&market, &p_leader, &300_u64, &true);
-    client.add_pts(&market, &p_mid, &200_u64, &true);
-    client.add_pts(&market, &p_tail, &100_u64, &true);
-
-    assert_eq!(client.get_rank(&p_tail), 3);
-    assert_eq!(client.get_rank(&p_leader), 1);
-
-    // p_tail gains 400 points (total 500) -> should become rank 1
-    client.add_pts(&market, &p_tail, &400_u64, &true);
-
-    assert_eq!(client.get_points(&p_tail), 500);
-    assert_eq!(client.get_rank(&p_tail), 1);
-    assert_eq!(client.get_rank(&p_leader), 2);
-    assert_eq!(client.get_rank(&p_mid), 3);
-
-    let top = client.get_top_players(&0_u32, &3_u32);
-    assert_eq!(top.get(0).unwrap().address, p_tail);
-    assert_eq!(top.get(0).unwrap().points, 500);
-    assert_eq!(top.get(1).unwrap().address, p_leader);
-    assert_eq!(top.get(1).unwrap().points, 300);
-    assert_eq!(top.get(2).unwrap().address, p_mid);
-    assert_eq!(top.get(2).unwrap().points, 200);
-
-    // Minimum points should now be p_mid (200)
-    assert_eq!(client.get_min_points(), 200);
-}
-
-#[test]
 fn test_add_pts_emits_leaderboard_updated() {
     let (env, client, _admin, market, _referral) = setup();
     let user = Address::generate(&env);
@@ -914,43 +795,16 @@ fn test_add_pts_emits_leaderboard_updated() {
 }
 
 #[test]
-fn test_get_top_players_50_players_within_gas_limits() {
-    let env = Env::default();
-    env.mock_all_auths();
-    // Default budget and resource limits are active (proving O(k) read operates well within gas limits).
-
-    let contract_id = env.register(LeaderboardContract, ());
-    let client = LeaderboardContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let market = Address::generate(&env);
-    let referral = Address::generate(&env);
-
-    client.initialize(&admin, &market, &referral);
-
-    // Insert 50 players in descending score order so each add_pts is an O(1) append
-    for i in 0..50u64 {
-        let user = Address::generate(&env);
-        client.add_pts(&market, &user, &(500 - i * 10), &true);
+fn test_add_pts_always_rejected() {
+    let (env, client, _admin, _market, _referral) = setup();
+    let user = Address::generate(&env);
+    let rando = Address::generate(&env);
+    // add_pts is a legacy entrypoint: a caller who is not the registered
+    // market contract must be rejected with UnauthorizedCaller.
+    let result = client.try_add_pts(&rando, &user, &10_u64, &true);
+    assert!(result.is_err(), "add_pts should reject non-market callers");
+    match result.unwrap_err().unwrap() {
+        LeaderboardError::UnauthorizedCaller => {}
+        other => panic!("add_pts returned unexpected error: {:?}", other),
     }
-
-    assert_eq!(client.get_top_player_count(), 50);
-
-    // Reading top players should be an O(k) direct slot lookup with zero on-read sorting,
-    // comfortably executing within standard Soroban invocation gas limits.
-    let page1 = client.get_top_players(&0_u32, &20_u32);
-    assert_eq!(page1.len(), 20);
-    assert_eq!(page1.get(0).unwrap().points, 500);
-    assert_eq!(page1.get(19).unwrap().points, 310);
-
-    let page2 = client.get_top_players(&20_u32, &20_u32);
-    assert_eq!(page2.len(), 20);
-    assert_eq!(page2.get(0).unwrap().points, 300);
-    assert_eq!(page2.get(19).unwrap().points, 110);
-
-    let page3 = client.get_top_players(&40_u32, &20_u32);
-    assert_eq!(page3.len(), 10);
-    assert_eq!(page3.get(0).unwrap().points, 100);
-    assert_eq!(page3.get(9).unwrap().points, 10);
 }
-

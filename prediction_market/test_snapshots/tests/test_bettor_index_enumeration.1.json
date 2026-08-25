@@ -791,7 +791,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -818,7 +818,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -845,7 +845,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1067,7 +1067,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1142,18 +1142,6 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
-                            "symbol": "SeqCounter"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "u64": "0"
                       }
                     },
                     {
@@ -1322,15 +1310,15 @@
                   },
                   {
                     "key": {
-                      "symbol": "net_no"
+                      "symbol": "is_yes"
                     },
                     "val": {
-                      "i128": "0"
+                      "bool": true
                     }
                   },
                   {
                     "key": {
-                      "symbol": "net_yes"
+                      "symbol": "net"
                     },
                     "val": {
                       "i128": "98000000"
@@ -1393,18 +1381,18 @@
                   },
                   {
                     "key": {
-                      "symbol": "net_no"
+                      "symbol": "is_yes"
                     },
                     "val": {
-                      "i128": "196000000"
+                      "bool": false
                     }
                   },
                   {
                     "key": {
-                      "symbol": "net_yes"
+                      "symbol": "net"
                     },
                     "val": {
-                      "i128": "0"
+                      "i128": "196000000"
                     }
                   }
                 ]
@@ -1464,15 +1452,15 @@
                   },
                   {
                     "key": {
-                      "symbol": "net_no"
+                      "symbol": "is_yes"
                     },
                     "val": {
-                      "i128": "0"
+                      "bool": true
                     }
                   },
                   {
                     "key": {
-                      "symbol": "net_yes"
+                      "symbol": "net"
                     },
                     "val": {
                       "i128": "294000000"
@@ -1613,16 +1601,43 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "FeeLedger"
+                    "symbol": "Governor"
                   },
                   {
-                    "u64": "1"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "i128": "12000000"
+                "bool": true
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 199
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "HasReferrer"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "bool": false
               }
             }
           },
@@ -1640,22 +1655,49 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "Governor"
+                    "symbol": "HasReferrer"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "bool": true
+                "bool": false
               }
             }
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "HasReferrer"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "bool": false
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1795,7 +1837,7 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "MarketAccumulatedFees"
+                    "symbol": "MarketFees"
                   },
                   {
                     "u64": "1"
@@ -1804,7 +1846,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "12000000"
+                "i128": "9000000"
               }
             }
           },
@@ -1836,7 +1878,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "12000000"
+                        "i128": "9000000"
                       }
                     },
                     {
@@ -1900,6 +1942,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "FeeLedgerMigrated"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "GovernorCount"
                           }
                         ]
@@ -1924,24 +1978,24 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "MarketCount"
+                            "symbol": "LegacyFees"
                           }
                         ]
                       },
                       "val": {
-                        "u64": "1"
+                        "i128": "0"
                       }
                     },
                     {
                       "key": {
                         "vec": [
                           {
-                            "symbol": "OpenFees"
+                            "symbol": "MarketCount"
                           }
                         ]
                       },
                       "val": {
-                        "i128": "12000000"
+                        "u64": "1"
                       }
                     },
                     {

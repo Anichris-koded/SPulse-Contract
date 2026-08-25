@@ -674,7 +674,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -701,7 +701,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -728,7 +728,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -950,7 +950,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1025,18 +1025,6 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
-                            "symbol": "SeqCounter"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "u64": "0"
                       }
                     },
                     {
@@ -1205,15 +1193,15 @@
                   },
                   {
                     "key": {
-                      "symbol": "net_no"
+                      "symbol": "is_yes"
                     },
                     "val": {
-                      "i128": "0"
+                      "bool": true
                     }
                   },
                   {
                     "key": {
-                      "symbol": "net_yes"
+                      "symbol": "net"
                     },
                     "val": {
                       "i128": "0"
@@ -1310,6 +1298,33 @@
           "ext": "v0"
         },
         "live_until": 199
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "HasReferrer"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "bool": false
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1428,7 +1443,7 @@
                       "symbol": "total_yes"
                     },
                     "val": {
-                      "i128": "0"
+                      "i128": "980000000"
                     }
                   }
                 ]
@@ -1438,6 +1453,33 @@
           "ext": "v0"
         },
         "live_until": 12307300
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MarketFees"
+                  },
+                  {
+                    "u64": "1"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "i128": "0"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1527,6 +1569,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "FeeLedgerMigrated"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "GovernorCount"
                           }
                         ]
@@ -1551,24 +1605,24 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "MarketCount"
+                            "symbol": "LegacyFees"
                           }
                         ]
                       },
                       "val": {
-                        "u64": "1"
+                        "i128": "0"
                       }
                     },
                     {
                       "key": {
                         "vec": [
                           {
-                            "symbol": "OpenFees"
+                            "symbol": "MarketCount"
                           }
                         ]
                       },
                       "val": {
-                        "i128": "0"
+                        "u64": "1"
                       }
                     },
                     {

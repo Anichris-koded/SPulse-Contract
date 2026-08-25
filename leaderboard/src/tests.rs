@@ -808,3 +808,164 @@ fn test_add_pts_always_rejected() {
         other => panic!("add_pts returned unexpected error: {:?}", other),
     }
 }
+
+// ── Tests for Issue #61: Write-time sorting & gas optimization ────────────────
+
+#[test]
+fn test_pagination() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    // Insert 15 players with distinct scores (10, 20, ..., 150)
+    let mut users = soroban_sdk::vec![&env];
+    for i in 1..=15u64 {
+        let u = Address::generate(&env);
+        client.add_pts(&market, &u, &(i * 10), &true);
+        users.push_back(u);
+    }
+
+    assert_eq!(client.get_top_player_count(), 15);
+
+    // Page 1: offset 0, page_size 5 (scores: 150, 140, 130, 120, 110)
+    let p1 = client.get_top_players(&0, &5);
+    assert_eq!(p1.len(), 5);
+    assert_eq!(p1.get(0).unwrap().points, 150);
+    assert_eq!(p1.get(4).unwrap().points, 110);
+
+    // Page 2: offset 5, page_size 5 (scores: 100, 90, 80, 70, 60)
+    let p2 = client.get_top_players(&5, &5);
+    assert_eq!(p2.len(), 5);
+    assert_eq!(p2.get(0).unwrap().points, 100);
+    assert_eq!(p2.get(4).unwrap().points, 60);
+
+    // Page 3: offset 10, page_size 5 (scores: 50, 40, 30, 20, 10)
+    let p3 = client.get_top_players(&10, &5);
+    assert_eq!(p3.len(), 5);
+    assert_eq!(p3.get(0).unwrap().points, 50);
+    assert_eq!(p3.get(4).unwrap().points, 10);
+
+    // Out of bounds offset returns empty vec
+    let p_empty = client.get_top_players(&15, &5);
+    assert_eq!(p_empty.len(), 0);
+
+    // Partial last page: offset 12, page_size 10 (3 remaining: 30, 20, 10)
+    let p_partial = client.get_top_players(&12, &10);
+    assert_eq!(p_partial.len(), 3);
+    assert_eq!(p_partial.get(0).unwrap().points, 30);
+    assert_eq!(p_partial.get(2).unwrap().points, 10);
+}
+
+#[test]
+fn test_interleaved_scoring() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let charlie = Address::generate(&env);
+    let dave = Address::generate(&env);
+
+    // 1. Charlie gets 30 pts -> [Charlie(30)]
+    client.add_pts(&market, &charlie, &30, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 1);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(0).unwrap().points, 30);
+
+    // 2. Alice gets 50 pts -> [Alice(50), Charlie(30)] (Alice bubbles to slot 0)
+    client.add_pts(&market, &alice, &50, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 2);
+    assert_eq!(top.get(0).unwrap().address, alice);
+    assert_eq!(top.get(1).unwrap().address, charlie);
+
+    // 3. Bob gets 100 pts -> [Bob(100), Alice(50), Charlie(30)]
+    client.add_pts(&market, &bob, &100, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top.get(0).unwrap().address, bob);
+    assert_eq!(top.get(1).unwrap().address, alice);
+    assert_eq!(top.get(2).unwrap().address, charlie);
+
+    // 4. Charlie gets +80 pts (total 110) -> [Charlie(110), Bob(100), Alice(50)]
+    // Charlie jumps from slot 2 past Alice and Bob to slot 0 via write-time bubble_up
+    client.add_pts(&market, &charlie, &80, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(0).unwrap().points, 110);
+    assert_eq!(top.get(1).unwrap().address, bob);
+    assert_eq!(top.get(1).unwrap().points, 100);
+    assert_eq!(top.get(2).unwrap().address, alice);
+    assert_eq!(top.get(2).unwrap().points, 50);
+
+    // 5. Dave gets 75 pts -> inserted between Bob(100) and Alice(50)
+    client.add_pts(&market, &dave, &75, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 4);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(1).unwrap().address, bob);
+    assert_eq!(top.get(2).unwrap().address, dave);
+    assert_eq!(top.get(3).unwrap().address, alice);
+
+    // 6. Alice gets +60 pts (total 110) -> equal points with Charlie.
+    // FIFO tie-breaking: Charlie is older seq, so Charlie stays #1, Alice is #2
+    client.add_pts(&market, &alice, &60, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 4);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(1).unwrap().address, alice);
+    assert_eq!(top.get(2).unwrap().address, bob);
+    assert_eq!(top.get(3).unwrap().address, dave);
+}
+
+#[test]
+fn test_full_leaderboard_gas_usage() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    // Fill all 50 slots of the leaderboard
+    for i in 1..=50u64 {
+        let u = Address::generate(&env);
+        client.add_pts(&market, &u, &(i * 10), &true);
+    }
+    assert_eq!(client.get_top_player_count(), 50);
+
+    // Verify reading the entire leaderboard (50 elements) is O(page_size)
+    // and returns strictly descending scores (500 down to 10)
+    let top = client.get_top_players(&0, &MAX_TOP_PLAYERS);
+    assert_eq!(top.len(), 50);
+    assert_eq!(top.get(0).unwrap().points, 500);
+    assert_eq!(top.get(49).unwrap().points, 10);
+
+    // Verify strictly descending order across all 50 slots
+    for i in 0..49 {
+        assert!(
+            top.get(i).unwrap().points >= top.get(i + 1).unwrap().points,
+            "Slots must be sorted descending"
+        );
+    }
+
+    // Evict the weakest player (score 10 at slot 49) with a newcomer of score 255
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &255, &true);
+
+    let updated_top = client.get_top_players(&0, &MAX_TOP_PLAYERS);
+    assert_eq!(updated_top.len(), 50);
+    // Newcomer should have bubbled up to its correct pre-sorted slot
+    let mut found_newcomer = false;
+    for i in 0..50 {
+        let entry = updated_top.get(i).unwrap();
+        if entry.address == newcomer {
+            assert_eq!(entry.points, 255);
+            found_newcomer = true;
+        }
+    }
+    assert!(found_newcomer, "Newcomer must be in top players");
+
+    // All slots must remain strictly descending after eviction
+    for i in 0..49 {
+        assert!(
+            updated_top.get(i).unwrap().points >= updated_top.get(i + 1).unwrap().points,
+            "Slots must remain sorted after eviction"
+        );
+    }
+}
+

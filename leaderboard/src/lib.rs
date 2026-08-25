@@ -351,7 +351,7 @@ impl LeaderboardContract {
             .bet_delta
             .saturating_sub(pending.won_delta + pending.lost_delta);
         Self::commit_stats(&env, &user, &s);
-        Self::update_top_players(&env, user.clone(), s.points);
+        Self::upsert_top(&env, user.clone(), s.points);
 
         if pending.tokens > 0 {
             Self::mint_reward(&env, &user, pending.tokens)?;
@@ -896,7 +896,7 @@ impl LeaderboardContract {
             None => {}
         }
         Self::commit_stats(env, user, &s);
-        Self::update_top_players(env, user.clone(), s.points);
+        Self::upsert_top(env, user.clone(), s.points);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         env.events().publish(
             (Symbol::new(&env, "leaderboard_updated"), user.clone()),
@@ -909,7 +909,7 @@ impl LeaderboardContract {
         s.points += pts;
         s.bonus_bets += 1; // Issue #64: count bonus award without touching won/lost
         Self::commit_stats(env, user, &s);
-        Self::update_top_players(env, user.clone(), s.points);
+        Self::upsert_top(env, user.clone(), s.points);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         env.events().publish(
             (Symbol::new(&env, "leaderboard_updated"), user.clone()),
@@ -1210,7 +1210,13 @@ impl LeaderboardContract {
     /// - Not listed, room left: append and bubble.
     /// - Not listed, list full: evict the weakest live entry (decayed, oldest
     ///   seq on ties) when the newcomer is at least as strong.
-    fn update_top_players(env: &Env, user: Address, new_points: u64) {
+    /// Write-time sorting implementation (issue #61):
+    /// Maintains `TopPlayerAt` slots in strictly descending order on every write:
+    /// - Already listed: updates points/epoch in place, bubbles up, refreshes min.
+    /// - Not listed, room left: appends at count and bubbles up.
+    /// - Not listed, list full: evicts the weakest live entry (decayed, oldest
+    ///   seq on ties) when the newcomer is at least as strong, then bubbles up.
+    fn upsert_top(env: &Env, user: Address, new_points: u64) {
         let count = Self::ensure_consistent(env, Self::top_count(env));
 
         if let Some((slot, mut entry)) = Self::top_slot_entry(env, &user) {
@@ -1247,7 +1253,7 @@ impl LeaderboardContract {
         let min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
         let Some(min_entry) = Self::forward_entry(env, min_slot) else {
             Self::repair_top_index(env);
-            Self::update_top_players(env, user, new_points);
+            Self::upsert_top(env, user, new_points);
             return;
         };
         if new_points < Self::entry_points_now(env, &min_entry) {

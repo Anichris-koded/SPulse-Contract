@@ -37,7 +37,6 @@ pub enum TokenError {
     InvalidExpirationLedger = 8,
     // Issue #95: operation blocked because the contract is paused.
     Paused = 9,
-    ContractPaused = 9,
     AlreadyMinter = 10,
     NotMinter = 11,
     MinterListFull = 12,

@@ -233,9 +233,6 @@ impl LeaderboardContract {
             .unwrap_or(false)
     }
 
-    /// Original ABI name — kept for callers that deploy against the pre-#23
-    /// interface (prediction_market and referral_registry tests use it).
-    pub fn set_token(
     // ── Bet-settlement path ───────────────────────────────────────────────────
 
     /// Called by the market contract after a bet is settled. Credits points,
@@ -367,27 +364,6 @@ impl LeaderboardContract {
         env.storage().persistent().get(&DataKey::PendingReward(user))
     }
 
-    pub fn add_pts(
-        env: Env,
-        caller: Address,
-        user: Address,
-        pts: u64,
-        tokens: i128,
-        is_won: bool,
-    ) -> Result<(), LeaderboardError> {
-        Self::require_not_paused(&env)?;
-        let market: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::MarketContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != market {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
-        caller.require_auth();
-        Self::credit_points(&env, &user, pts, Some(is_won));
-        Ok(())
-    }
     // ── reward_bonus / add_bonus_pts (referral path) ─────────────────────────
 
     /// Called by the referral contract for welcome / per-bet referral bonuses.
@@ -436,43 +412,12 @@ impl LeaderboardContract {
 
     /// No-op stub retained for ABI compatibility. total_bets is derived at read
     /// time, so a standalone "bet recorded" call does nothing.
+    /// No-op stub retained for ABI compatibility. total_bets is derived at read
+    /// time, so a standalone "bet recorded" call does nothing.
     pub fn record_bet(env: Env, caller: Address, _user: Address) -> Result<(), LeaderboardError> {
         Self::require_not_paused(&env)?;
         Self::require_market_contract(&env, &caller)?;
-
-        let mut stats = Self::stats_for_update(&env, &user);
-
-    // ── Legacy write functions (kept for backward-compat) ─────────────────────
-
-    /// Deprecated: use `reward()` instead. This function always returns
-    /// `UnauthorizedCaller` and will be removed in a future version.
-    pub fn add_pts(
-        _env: Env,
-        _caller: Address,
-        _user: Address,
-        _pts: u64,
-        _is_won: bool,
-    ) -> Result<(), LeaderboardError> {
-        Err(LeaderboardError::UnauthorizedCaller)
-    }
-
-    /// Legacy: called by the referral contract to award bonus points.
-    /// Prefer reward_bonus() for new integrations (adds token minting).
-    pub fn add_bonus_pts(
-        env: Env,
-        caller: Address,
-        user: Address,
-        pts: u64,
-    ) -> Result<(), LeaderboardError> {
-        let referral: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReferralContract)
-            .ok_or(LeaderboardError::NotInitialized)?;
-        if caller != referral {
-            return Err(LeaderboardError::UnauthorizedCaller);
-        }
-        caller.require_auth();
+        // No-op: total_bets is derived at read time from won_bets + lost_bets + bonus_bets.
         Ok(())
     }
 

@@ -8639,66 +8639,6 @@
                       "symbol": "address"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADO7A2"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "epoch"
-                    },
-                    "val": {
-                      "u32": 0
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "points"
-                    },
-                    "val": {
-                      "u64": "10"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "seq"
-                    },
-                    "val": {
-                      "u64": "50"
-                    }
-                  }
-                ]
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6307200
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "TopPlayerAt"
-                  },
-                  {
-                    "u32": 46
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "map": [
-                  {
-                    "key": {
-                      "symbol": "address"
-                    },
-                    "val": {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADH6C2"
                     }
                   },
@@ -8747,7 +8687,7 @@
                     "symbol": "TopPlayerAt"
                   },
                   {
-                    "u32": 47
+                    "u32": 46
                   }
                 ]
               },
@@ -8807,7 +8747,7 @@
                     "symbol": "TopPlayerAt"
                   },
                   {
-                    "u32": 48
+                    "u32": 47
                   }
                 ]
               },
@@ -8867,7 +8807,7 @@
                     "symbol": "TopPlayerAt"
                   },
                   {
-                    "u32": 49
+                    "u32": 48
                   }
                 ]
               },
@@ -8904,6 +8844,66 @@
                     },
                     "val": {
                       "u64": "49"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307200
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "TopPlayerAt"
+                  },
+                  {
+                    "u32": 49
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "address"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADO7A2"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "epoch"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "points"
+                    },
+                    "val": {
+                      "u64": "10"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "seq"
+                    },
+                    "val": {
+                      "u64": "50"
                     }
                   }
                 ]
@@ -10148,7 +10148,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 46
+                "u32": 45
               }
             }
           },
@@ -10175,7 +10175,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 47
+                "u32": 46
               }
             }
           },
@@ -10202,7 +10202,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 48
+                "u32": 47
               }
             }
           },
@@ -10229,7 +10229,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 49
+                "u32": 48
               }
             }
           },
@@ -10256,7 +10256,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 45
+                "u32": 49
               }
             }
           },
@@ -10324,7 +10324,7 @@
                         ]
                       },
                       "val": {
-                        "u32": 46
+                        "u32": 45
                       }
                     },
                     {

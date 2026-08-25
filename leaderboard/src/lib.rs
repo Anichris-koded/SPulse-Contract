@@ -1262,14 +1262,21 @@ impl LeaderboardContract {
         env.storage()
             .persistent()
             .remove(&DataKey::TopPlayerSlot(min_entry.address.clone()));
+        // Shift surviving elements up to compact the hole left by min_entry
+        for s in min_slot..(MAX_TOP_PLAYERS - 1) {
+            if let Some(next) = Self::forward_entry(env, s + 1) {
+                Self::set_top_slot(env, s, &next);
+            }
+        }
+        let tail_slot = MAX_TOP_PLAYERS - 1;
         let new_entry = PlayerEntry {
             address: user.clone(),
             points: new_points,
             epoch: Self::current_epoch(env),
             seq: Self::next_seq(env),
         };
-        Self::set_top_slot(env, min_slot, &new_entry);
-        Self::bubble_up(env, &new_entry, min_slot);
+        Self::set_top_slot(env, tail_slot, &new_entry);
+        Self::bubble_up(env, &new_entry, tail_slot);
         Self::recompute_min(env);
     }
 }

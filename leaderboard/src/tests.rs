@@ -969,3 +969,98 @@ fn test_full_leaderboard_gas_usage() {
     }
 }
 
+#[test]
+fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+    let u4 = Address::generate(&env);
+
+    // 1. Write in scrambled order: 20, 50, 10, 100
+    client.add_pts(&market, &u1, &20, &true); // u1 = 20
+    client.add_pts(&market, &u2, &50, &true); // u2 = 50 -> bubbles to slot 0
+    client.add_pts(&market, &u3, &10, &true); // u3 = 10 -> slot 2
+    client.add_pts(&market, &u4, &100, &true); // u4 = 100 -> bubbles to slot 0
+
+    // Directly inspect persistent storage (DataKey::TopPlayerAt) WITHOUT calling get_top_players!
+    // This proves the storage slots THEMSELVES are pre-sorted at write time:
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let slot0: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(0)).expect("slot 0");
+        let slot1: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(1)).expect("slot 1");
+        let slot2: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(2)).expect("slot 2");
+        let slot3: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(3)).expect("slot 3");
+
+        assert_eq!(slot0.address, u4, "Slot 0 in persistent storage must be u4 (100 pts)");
+        assert_eq!(slot0.points, 100);
+        assert_eq!(slot1.address, u2, "Slot 1 in persistent storage must be u2 (50 pts)");
+        assert_eq!(slot1.points, 50);
+        assert_eq!(slot2.address, u1, "Slot 2 in persistent storage must be u1 (20 pts)");
+        assert_eq!(slot2.points, 20);
+        assert_eq!(slot3.address, u3, "Slot 3 in persistent storage must be u3 (10 pts)");
+        assert_eq!(slot3.points, 10);
+
+        // Verify reverse lookup keys TopPlayerSlot match exact slots in storage
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone())).unwrap(), 0);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone())).unwrap(), 1);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone())).unwrap(), 2);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone())).unwrap(), 3);
+    });
+
+    // 2. Now boost u3 by +150 (total 160) -> write-time bubble_up must reorder storage
+    client.add_pts(&market, &u3, &150, &true);
+
+    env.as_contract(&contract_id, || {
+        let slot0: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(0)).unwrap();
+        let slot1: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(1)).unwrap();
+        let slot2: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(2)).unwrap();
+        let slot3: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(3)).unwrap();
+
+        assert_eq!(slot0.address, u3, "Slot 0 in storage must now be u3 (160 pts)");
+        assert_eq!(slot0.points, 160);
+        assert_eq!(slot1.address, u4, "Slot 1 in storage must now be u4 (100 pts)");
+        assert_eq!(slot1.points, 100);
+        assert_eq!(slot2.address, u2, "Slot 2 in storage must now be u2 (50 pts)");
+        assert_eq!(slot2.points, 50);
+        assert_eq!(slot3.address, u1, "Slot 3 in storage must now be u1 (20 pts)");
+        assert_eq!(slot3.points, 20);
+    });
+
+    // 3. get_top_players merely reads these pre-sorted slots with no on-read sorting
+    let top = client.get_top_players(&0, &4);
+    assert_eq!(top.get(0).unwrap().address, u3);
+    assert_eq!(top.get(1).unwrap().address, u4);
+    assert_eq!(top.get(2).unwrap().address, u2);
+    assert_eq!(top.get(3).unwrap().address, u1);
+}
+
+#[test]
+fn test_get_top_players_cpu_cost_scales_linearly_with_page_size() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    for i in 1..=50u64 {
+        let u = Address::generate(&env);
+        client.add_pts(&market, &u, &(i * 10), &true);
+    }
+
+    // Reset budget to measure read costs
+    env.cost_estimate().budget().reset_default();
+
+    let _page10 = client.get_top_players(&0, &10);
+    let cpu_10 = env.cost_estimate().budget().cpu_instruction_cost();
+
+    env.cost_estimate().budget().reset_default();
+
+    let _page50 = client.get_top_players(&0, &50);
+    let cpu_50 = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // With O(page_size) direct slot reads (no O(n^2) selection sort or Vec rebuilds),
+    // reading 50 elements is well within the default Soroban CPU instruction budget (100M).
+    assert!(cpu_50 < 10_000_000, "50 pre-sorted slot reads must consume minimal CPU (got {})", cpu_50);
+    // Cost for 50 elements should scale linearly O(k) with page size, not quadratically
+    assert!(cpu_50 <= cpu_10 * 7, "CPU cost must scale linearly O(k) with page size");
+}
+
+

@@ -858,9 +858,31 @@ fn test_reward_mints_tokens() {
     let (env, client, _admin, market, _referral, token_client) = setup_with_token();
     let user = Address::generate(&env);
 
+    // Verify token balance starts at 0
+    assert_eq!(token_client.balance(&user), 0);
+
+    // reward() with 10 PULSE — token contract must be invoked
     client.reward(&market, &user, &30_u64, &10_0000000_i128, &true);
+
+    // Points updated AND token balance changed — proves mint was invoked
     assert_eq!(client.get_points(&user), 30);
     assert_eq!(token_client.balance(&user), 10_0000000_i128);
+    assert_eq!(token_client.total_supply(), 10_0000000_i128);
+}
+
+#[test]
+fn test_reward_updates_points_and_mints_tokens() {
+    let (env, client, _admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Two reward calls: 30 pts + 10 PULSE, then 10 pts + 5 PULSE
+    client.reward(&market, &user, &30_u64, &10_0000000_i128, &true);
+    client.reward(&market, &user, &10_u64, &5_0000000_i128, &false);
+
+    // Points accumulate, tokens accumulate
+    assert_eq!(client.get_points(&user), 40);
+    assert_eq!(token_client.balance(&user), 15_0000000_i128);
+    assert_eq!(token_client.total_supply(), 15_0000000_i128);
 }
 
 #[test]
@@ -879,9 +901,24 @@ fn test_reward_enforces_supply_cap() {
     // Try to mint 1 more — should fail (cap exceeded)
     let result = client.try_reward(&market, &user, &10_u64, &1_0000000_i128, &false);
     assert!(result.is_err(), "reward should fail when supply cap exceeded");
-    // Balance unchanged
+    // Balance and supply unchanged — cap enforced, no state corruption
     assert_eq!(token_client.balance(&user), 5_0000000_i128);
     assert_eq!(token_client.total_supply(), 5_0000000_i128);
+}
+
+#[test]
+fn test_reward_bonus_mints_tokens() {
+    let (env, client, _admin, _market, referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    assert_eq!(token_client.balance(&user), 0);
+
+    // reward_bonus() with 8 PULSE
+    client.reward_bonus(&referral, &user, &5_u64, &8_0000000_i128);
+
+    assert_eq!(client.get_points(&user), 5);
+    assert_eq!(token_client.balance(&user), 8_0000000_i128);
+    assert_eq!(token_client.total_supply(), 8_0000000_i128);
 }
 
 #[test]
@@ -903,7 +940,7 @@ fn test_reward_bonus_enforces_supply_cap() {
 }
 
 #[test]
-fn test_claim_pending_enforces_supply_cap() {
+fn test_claim_pending_preserves_reward_on_cap_exceeded() {
     let (env, client, admin, market, _referral, token_client) = setup_with_token();
     let user = Address::generate(&env);
 
@@ -917,7 +954,39 @@ fn test_claim_pending_enforces_supply_cap() {
     // Claim — should fail because minting would exceed cap
     let result = client.try_claim_pending_rewards(&user);
     assert!(result.is_err(), "claim should fail when pending tokens exceed cap");
+
+    // Critical: the pending reward must be PRESERVED (not lost) so the user
+    // can retry once the cap is raised.
+    let pending = client.get_pending_reward(&user).unwrap();
+    assert_eq!(pending.tokens, 3_0000000_i128);
+    assert_eq!(pending.points, 30);
     assert_eq!(token_client.balance(&user), 0);
+    assert_eq!(token_client.total_supply(), 0);
+}
+
+#[test]
+fn test_claim_pending_succeeds_after_cap_raised() {
+    let (env, client, admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 2 PULSE, queue 3 PULSE
+    token_client.set_supply_cap(&admin, &2_0000000_i128);
+    client.queue_reward(&market, &user, &30_u64, &3_0000000_i128, &true);
+
+    // Claim fails — cap exceeded
+    assert!(client.try_claim_pending_rewards(&user).is_err());
+    assert_eq!(token_client.balance(&user), 0);
+    assert!(client.get_pending_reward(&user).is_some());
+
+    // Raise cap to 5 PULSE
+    token_client.set_supply_cap(&admin, &5_0000000_i128);
+
+    // Claim succeeds now
+    client.claim_pending_rewards(&user);
+    assert_eq!(token_client.balance(&user), 3_0000000_i128);
+    assert_eq!(token_client.total_supply(), 3_0000000_i128);
+    assert!(client.get_pending_reward(&user).is_none());
+    assert_eq!(client.get_points(&user), 30);
 }
 
 #[test]

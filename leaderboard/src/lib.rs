@@ -74,6 +74,7 @@ pub enum DataKey {
     TopPlayerAt(u32),
     TopPlayerCount,
     TopPlayerSlot(Address),
+    TopPlayersMigrated, // bool — one-shot migration of legacy unsorted leaderboard slots
     SeqCounter, // u64 — monotonic counter feeding PlayerEntry::seq
     MinPoints,  // u64 — weakest live entry's (decayed) points
     MinSlot,    // u32 — slot index of that weakest entry
@@ -180,6 +181,9 @@ impl LeaderboardContract {
         env.storage().instance().set(&DataKey::TopPlayerCount, &0_u32);
         env.storage().instance().set(&DataKey::MinPoints, &0_u64);
         env.storage().instance().set(&DataKey::MinSlot, &0_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayersMigrated, &true);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
@@ -205,6 +209,14 @@ impl LeaderboardContract {
     // ── Bet-settlement path ───────────────────────────────────────────────────
 
     /// Called by the market contract after a bet is settled.
+
+    /// Permissionless one-shot migration: sorts any legacy unsorted TopPlayerAt
+    /// slots from pre-upgrade deployments into the new pre-sorted write-time
+    /// layout and rebuilds reverse lookups.
+    pub fn migrate_top_players(env: Env) -> Result<u32, LeaderboardError> {
+        Self::ensure_migrated(&env)
+    }
+
     /// The cross-contract ABI version this deployment implements (issue #84).
     pub fn interface_version(_env: Env) -> u32 {
         INTERFACE_VERSION
@@ -475,6 +487,7 @@ impl LeaderboardContract {
 
     /// Page of the top list, ranked on decayed values at read time.
     pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
+        let _ = Self::ensure_migrated(&env);
         let count = Self::top_count(&env);
         if offset >= count || page_size == 0 {
             return vec![&env];
@@ -1197,37 +1210,107 @@ impl LeaderboardContract {
         }
     }
 
-    /// Bubbles a (possibly new) entry up from `slot` until the list is
-    /// descending again, comparing decayed values (issue #69). Forward and
-    /// reverse indexes are written together so the pair cannot drift apart;
-    /// TTLs are not bumped per swap to keep the write footprint bounded.
-    fn bubble_up(env: &Env, entry: &PlayerEntry, mut slot: u32) {
+    /// Moves a (possibly new) entry up from `slot` until the list is
+    /// descending again, comparing decayed values (issue #69).
+    /// To keep ledger writes strictly bounded within Soroban's transaction
+    /// limit (<= 50 writes), we find the target insertion slot and shift
+    /// the range in a single pass so each affected entry is written at most ONCE,
+    /// rather than repeatedly rewritten in pairwise swaps.
+    fn bubble_up(env: &Env, entry: &PlayerEntry, slot: u32) {
+        if slot == 0 {
+            return;
+        }
+        let now_entry = Self::entry_points_now(env, entry);
+
+        // Find the target insertion position by scanning upwards.
+        // Bounded by MAX_BUBBLE_STEPS.
+        let mut target_slot = slot;
         let mut steps = 0;
-        while slot > 0 && steps < MAX_BUBBLE_STEPS {
-            steps += 1;
-            let prev: Option<PlayerEntry> =
-                env.storage().persistent().get(&DataKey::TopPlayerAt(slot - 1));
-            match prev {
-                Some(prev)
-                    if Self::entry_points_now(env, &prev) < Self::entry_points_now(env, entry) => {
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::TopPlayerAt(slot - 1), entry);
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::TopPlayerAt(slot), &prev);
-                    env.storage().persistent().set(
-                        &DataKey::TopPlayerSlot(entry.address.clone()),
-                        &(slot - 1),
-                    );
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::TopPlayerSlot(prev.address.clone()), &slot);
-                    slot -= 1;
+        while target_slot > 0 && steps < MAX_BUBBLE_STEPS {
+            let prev_slot = target_slot - 1;
+            match Self::forward_entry(env, prev_slot) {
+                Some(prev) if Self::entry_points_now(env, &prev) < now_entry => {
+                    target_slot = prev_slot;
+                    steps += 1;
                 }
                 _ => break,
             }
         }
+
+        if target_slot == slot {
+            return;
+        }
+
+        // Shift entries in `target_slot..slot` down by 1 in a single pass.
+        // Each entry is written exactly ONCE.
+        let mut s = slot;
+        while s > target_slot {
+            let from_slot = s - 1;
+            if let Some(e) = Self::forward_entry(env, from_slot) {
+                Self::set_top_slot(env, s, &e);
+            }
+            s -= 1;
+        }
+
+        // Place `entry` at `target_slot`.
+        Self::set_top_slot(env, target_slot, entry);
+    }
+
+    // ── Migration (issue #61) ──────────────────────────────────────────────────
+
+    /// Ensure legacy unsorted storage from pre-upgrade deployments is migrated
+    /// to the pre-sorted slot layout.
+    fn ensure_migrated(env: &Env) -> Result<u32, LeaderboardError> {
+        if env.storage().instance().has(&DataKey::TopPlayersMigrated) {
+            return Ok(0);
+        }
+        let count = Self::top_count(env);
+        if count == 0 {
+            env.storage().instance().set(&DataKey::TopPlayersMigrated, &true);
+            env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+            return Ok(0);
+        }
+
+        // Read all live entries
+        let mut entries: Vec<PlayerEntry> = Vec::new(env);
+        for i in 0..count {
+            if let Some(mut entry) = Self::forward_entry(env, i) {
+                entry.points = Self::entry_points_now(env, &entry);
+                entry.epoch = Self::current_epoch(env);
+                entries.push_back(entry);
+            }
+        }
+
+        let n = entries.len();
+        // In-memory sort descending by score, breaking ties by oldest seq
+        for i in 0..n {
+            let mut max_idx = i;
+            for j in (i + 1)..n {
+                let a = entries.get(j).unwrap();
+                let b = entries.get(max_idx).unwrap();
+                if a.points > b.points || (a.points == b.points && a.seq < b.seq) {
+                    max_idx = j;
+                }
+            }
+            if max_idx != i {
+                let a = entries.get(i).unwrap();
+                let b = entries.get(max_idx).unwrap();
+                entries.set(i, b);
+                entries.set(max_idx, a);
+            }
+        }
+
+        // Write back pre-sorted slots and rebuild reverse lookups
+        for i in 0..n {
+            let entry = entries.get(i).unwrap();
+            Self::set_top_slot(env, i, &entry);
+        }
+
+        env.storage().instance().set(&DataKey::TopPlayerCount, &n);
+        env.storage().instance().set(&DataKey::TopPlayersMigrated, &true);
+        Self::recompute_min(env);
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
+        Ok(n)
     }
 
     /// Insert or update a player's place in the top list after a point change.

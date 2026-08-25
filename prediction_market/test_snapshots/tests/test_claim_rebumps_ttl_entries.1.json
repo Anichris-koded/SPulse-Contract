@@ -1305,6 +1305,18 @@
                       "val": {
                         "bool": true
                       }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TopPlayersMigrated"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": true
+                      }
                     }
                   ]
                 }

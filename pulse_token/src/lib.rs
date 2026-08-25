@@ -315,8 +315,7 @@ impl PULSETokenContract {
             .unwrap_or(0);
         if cap > 0 && supply + amount > cap {
             return Err(TokenError::SupplyCapExceeded);
-        }
-        // Cap OK — now apply state changes.
+        }        // Cap OK — now apply state changes.
         let balance = Self::balance(env.clone(), to.clone());
         let to_key = DataKey::Balance(to.clone());
         env.storage()
@@ -331,16 +330,6 @@ impl PULSETokenContract {
         env.storage()
             .persistent()
             .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
-        let balance = Self::balance(env.clone(), to.clone());
-        Self::write_balance(&env, &to, balance + amount);
-        let supply: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalSupply)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalSupply, &(supply + amount));
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "mint"), minter, to),

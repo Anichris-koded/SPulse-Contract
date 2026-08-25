@@ -1063,4 +1063,113 @@ fn test_get_top_players_cpu_cost_scales_linearly_with_page_size() {
     assert!(cpu_50 <= cpu_10 * 7, "CPU cost must scale linearly O(k) with page size");
 }
 
+// ── Tests for Issue #61 Migration: Legacy unsorted data migration ─────────────
+
+#[test]
+fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
+    let (env, client, _admin, _market, _referral) = setup();
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+    let u4 = Address::generate(&env);
+
+    // Simulate pre-upgrade legacy state: populate unsorted slots directly
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        // Remove migration flag
+        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+
+        // Put unsorted entries: slot 0=10pts, slot 1=50pts, slot 2=20pts, slot 3=100pts
+        let e0 = PlayerEntry { address: u1.clone(), points: 10, epoch: 0, seq: 0 };
+        let e1 = PlayerEntry { address: u2.clone(), points: 50, epoch: 0, seq: 1 };
+        let e2 = PlayerEntry { address: u3.clone(), points: 20, epoch: 0, seq: 2 };
+        let e3 = PlayerEntry { address: u4.clone(), points: 100, epoch: 0, seq: 3 };
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(0), &e0);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(1), &e1);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(2), &e2);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(3), &e3);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u4.clone()), &3_u32);
+
+        env.storage().instance().set(&DataKey::TopPlayerCount, &4_u32);
+    });
+
+    // Run one-shot migration
+    let migrated_count = client.migrate_top_players();
+    assert_eq!(migrated_count, 4);
+
+    // Verify persistent storage slots are now strictly sorted descending (100, 50, 20, 10)
+    env.as_contract(&contract_id, || {
+        let s0: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(0)).unwrap();
+        let s1: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(1)).unwrap();
+        let s2: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(2)).unwrap();
+        let s3: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(3)).unwrap();
+
+        assert_eq!(s0.address, u4);
+        assert_eq!(s0.points, 100);
+        assert_eq!(s1.address, u2);
+        assert_eq!(s1.points, 50);
+        assert_eq!(s2.address, u3);
+        assert_eq!(s2.points, 20);
+        assert_eq!(s3.address, u1);
+        assert_eq!(s3.points, 10);
+
+        // Reverse lookups updated
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone())).unwrap(), 0);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone())).unwrap(), 1);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone())).unwrap(), 2);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone())).unwrap(), 3);
+    });
+
+    // Subsequent migration call is a no-op returning 0
+    assert_eq!(client.migrate_top_players(), 0);
+}
+
+#[test]
+fn test_get_top_players_auto_migrates_legacy_unsorted_slots() {
+    let (env, client, _admin, _market, _referral) = setup();
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+
+        let e0 = PlayerEntry { address: u1.clone(), points: 15, epoch: 0, seq: 0 };
+        let e1 = PlayerEntry { address: u2.clone(), points: 75, epoch: 0, seq: 1 };
+        let e2 = PlayerEntry { address: u3.clone(), points: 45, epoch: 0, seq: 2 };
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(0), &e0);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(1), &e1);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(2), &e2);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
+
+        env.storage().instance().set(&DataKey::TopPlayerCount, &3_u32);
+    });
+
+    // get_top_players automatically triggers migration on unmigrated state
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top.get(0).unwrap().address, u2);
+    assert_eq!(top.get(0).unwrap().points, 75);
+    assert_eq!(top.get(1).unwrap().address, u3);
+    assert_eq!(top.get(1).unwrap().points, 45);
+    assert_eq!(top.get(2).unwrap().address, u1);
+    assert_eq!(top.get(2).unwrap().points, 15);
+}
+
+
 

@@ -3176,18 +3176,6 @@
                       "val": {
                         "u32": 15
                       }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
-                            "symbol": "TopPlayersMigrated"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "bool": true
-                      }
                     }
                   ]
                 }

@@ -36,10 +36,11 @@ pub enum TokenError {
     InsufficientAllowance = 7,
     InvalidExpirationLedger = 8,
     // Issue #95: operation blocked because the contract is paused.
-    ContractPaused = 9,
+    Paused = 9,
     AlreadyMinter = 10,
     NotMinter = 11,
     MinterListFull = 12,
+    SupplyCapExceeded = 13,
 }
 
 #[contracttype]
@@ -57,6 +58,7 @@ pub enum DataKey {
     MinterAt(u32),
     MinterCount,
     MinterIndex(Address),
+    SupplyCap, // i128 — maximum total_supply (0 = unlimited)
 }
 
 #[contracttype]
@@ -113,6 +115,36 @@ impl PULSETokenContract {
     /// The cross-contract ABI version this deployment implements (issue #84).
     pub fn interface_version(_env: Env) -> u32 {
         INTERFACE_VERSION
+    }
+
+    // ── Supply cap (issue #79) ────────────────────────────────────────────
+    // A cap of 0 means unlimited (backwards-compatible default).
+    // Admin only; emits a SupplyCapSet event so indexers can track policy changes.
+
+    /// Set or clear the maximum total_supply. Admin only.
+    pub fn set_supply_cap(env: Env, admin: Address, cap: i128) -> Result<(), TokenError> {
+        let stored = Self::require_admin(&env)?;
+        if admin != stored {
+            return Err(TokenError::NotAdmin);
+        }
+        admin.require_auth();
+        if cap < 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        env.storage().instance().set(&DataKey::SupplyCap, &cap);
+        env.events().publish(
+            (Symbol::new(&env, "supply_cap_set"), admin),
+            cap,
+        );
+        Ok(())
+    }
+
+    /// Current supply cap. 0 means unlimited.
+    pub fn get_supply_cap(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SupplyCap)
+            .unwrap_or(0)
     }
 
     /// Halt mint/transfer/burn in an emergency. Admin only. View functions
@@ -268,21 +300,36 @@ impl PULSETokenContract {
         if !is_minter {
             return Err(TokenError::UnauthorizedMinter);
         }
-        // An authorization grant that expires silently disables the minter
-        // (e.g. the leaderboard paying out rewards), so refresh it on use.
-        env.storage()
-            .persistent()
-            .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
-        let balance = Self::balance(env.clone(), to.clone());
-        Self::write_balance(&env, &to, balance + amount);
+        // Issue #79: enforce supply cap BEFORE any state change.
+        // Check must happen first — if cap is exceeded, no balance or
+        // supply should be modified.
         let supply: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
-        env.storage()
+        let cap: i128 = env
+            .storage()
             .instance()
-            .set(&DataKey::TotalSupply, &(supply + amount));
+            .get(&DataKey::SupplyCap)
+            .unwrap_or(0);
+        if cap > 0 && supply + amount > cap {
+            return Err(TokenError::SupplyCapExceeded);
+        }        // Cap OK — now apply state changes.
+        let balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
+        env.storage()
+            .persistent()
+            .set(&to_key, &(balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
+        env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
+        // An authorization grant that expires silently disables the minter
+        // (e.g. the leaderboard paying out rewards), so refresh it on use.
+        env.storage()
+            .persistent()
+            .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "mint"), minter, to),
@@ -509,7 +556,7 @@ impl PULSETokenContract {
 
     fn require_not_paused(env: &Env) -> Result<(), TokenError> {
         if Self::is_paused(env.clone()) {
-            return Err(TokenError::ContractPaused);
+            return Err(TokenError::Paused);
         }
         Ok(())
     }

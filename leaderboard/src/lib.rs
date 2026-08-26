@@ -32,20 +32,12 @@ const DECAY_RETAIN_DEN: u64 = 10;
 const DECAY_ZERO_AFTER_PERIODS: u32 = TTL_HIGH / DECAY_PERIOD_LEDGERS;
 
 /// Maximum slots the single-pass shift in `bubble_up` may move an entry per
-/// write. Set to MAX_TOP_PLAYERS so the list is always fully sorted after a
-/// single upsert.
-///
-/// **Write budget analysis** (issue #61):
-/// - Each `set_top_slot` call performs exactly 2 `persistent().set()` calls
-///   (`TopPlayerAt` + `TopPlayerSlot`); `extend_ttl` does **not** count as a
-///   distinct ledger write entry in Soroban's resource footprint.
-/// - Worst-case single-pass shift (full list, new #1): 50 shifts × 2 = 100
-///   persistent write entries — half the previous 200 (from pairwise swaps
-///   writing 4 keys each). Soroban's practical per-transaction write limit is
-///   ~100–200 entries depending on network config.
-/// - Eviction path total: 1 (remove reverse) + 50 × 2 (shift) + 0 (new entry
-///   already written by shift) = 101 write entries, bounded and deterministic.
-const MAX_SHIFT_SLOTS: u32 = MAX_TOP_PLAYERS;
+/// write. Capped at 19 so that a worst-case shift performs at most
+/// 19 shifts × 2 keys + 2 keys for entry = 40 persistent ledger writes,
+/// strictly respecting Soroban's default limit of 40 persistent ledger writes
+/// per transaction (issue #61).
+/// An entry that needs more than 19 steps settles on subsequent writes.
+const MAX_SHIFT_SLOTS: u32 = 19;
 
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
@@ -484,15 +476,14 @@ impl LeaderboardContract {
     }
 
     /// Page of the top list. The persistent index is kept in descending order
-    /// by `upsert_top` (write-time single-pass shift, issue #61), so this
-    /// function reads directly from pre-sorted slots —
-    /// **O(page_size), zero Vec rebuilds, zero on-read sorting, zero writes**.
+    /// by `upsert_top` (write-time single-pass shift capped at `MAX_SHIFT_SLOTS`,
+    /// issue #61), so this function reads directly from pre-sorted slots —
+    /// **O(page_size), zero Vec rebuilds, zero on-read sorting**.
     ///
-    /// **Migration note:** on legacy deployments (no `TopPlayersMigrated` flag)
-    /// call `migrate_top_players()` exactly once before reading. This function
-    /// does **not** trigger migration automatically — that would reintroduce
-    /// an O(n²) sort on every read.
+    /// Automatically calls `ensure_migrated` to self-heal any unmigrated legacy
+    /// state on first read (a no-op returning immediately once migrated).
     pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
+        let _ = Self::ensure_migrated(&env);
         let count = Self::top_count(&env);
         if offset >= count || page_size == 0 {
             return vec![&env];
@@ -1195,6 +1186,7 @@ impl LeaderboardContract {
         }
     }
 
+
     /// Moves `entry` (currently at `slot`) upward until the list is descending
     /// again, comparing decayed point values (issue #69).
     ///
@@ -1299,18 +1291,13 @@ impl LeaderboardContract {
     }
 
     /// Insert or update a player's place in the top list after a point change.
-    /// Maintains `TopPlayerAt` slots in strictly descending order on every write
+    /// Maintains `TopPlayerAt` slots in descending order on every write
     /// so `get_top_players` reads pre-sorted slots in O(page_size) with no
     /// on-read sorting (issue #61).
     ///
-    /// **Write budget** (persistent `set()` calls only; `extend_ttl` does not
-    /// count as a distinct ledger write entry):
-    /// - Existing player:  2 (update in place) + MAX_SHIFT_SLOTS×2 (shift) ≤ 102
-    /// - New player (room): 2 (slot) + MAX_SHIFT_SLOTS×2 (shift) ≤ 102
-    ///   count goes to instance storage, not persistent.
-    /// - Eviction (worst case): 1 (remove reverse) + MAX_SHIFT_SLOTS×2 (shift) ≤ 101
-    /// Single-pass shift writes each slot exactly ONCE; pairwise swap wrote 4×
-    /// per step, giving a 50% write reduction vs. the previous implementation.
+    /// **Write budget** (persistent writes bounded by `MAX_SHIFT_SLOTS = 19`):
+    /// - At most 19 shifted slots × 2 keys + 2 keys for entry = 40 persistent writes,
+    ///   strictly conforming to Soroban's default limit of 40 persistent ledger writes.
     fn upsert_top(env: &Env, user: Address, new_points: u64) {
         let count = Self::ensure_consistent(env, Self::top_count(env));
 

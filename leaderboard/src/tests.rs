@@ -1137,8 +1137,8 @@ fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
     assert_eq!(client.migrate_top_players(), 0);
 }
 
-/// Migration is explicit-only. `get_top_players` on a migrated deployment must
-/// return correctly sorted results without performing migration or writes.
+/// A normal read on a migrated deployment returns the pre-sorted index without
+/// performing another migration or sort.
 #[test]
 fn test_get_top_players_returns_sorted_without_triggering_migration() {
     let (env, client, _admin, market, _referral) = setup();
@@ -1232,7 +1232,7 @@ fn test_upsert_top_under_default_resource_limits() {
 }
 
 #[test]
-fn test_explicit_migration_under_default_limits() {
+fn test_get_top_players_automatically_migrates_under_default_limits() {
     let env = Env::default();
     env.mock_all_auths();
     // Enforce default Soroban limits.
@@ -1264,10 +1264,7 @@ fn test_explicit_migration_under_default_limits() {
         env.storage().instance().set(&DataKey::TopPlayerCount, &3_u32);
     });
 
-    // Migration is explicit and must fit within the default resource limits.
-    let migrated_count = client.migrate_top_players();
-    assert_eq!(migrated_count, 3);
-
+    // The first read performs the one-time migration under default limits.
     let top = client.get_top_players(&0, &10);
     assert_eq!(top.len(), 3);
     assert_eq!(top.get(0).unwrap().address, u2);

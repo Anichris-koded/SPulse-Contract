@@ -460,6 +460,7 @@ impl LeaderboardContract {
     /// 1-based rank inside the top list, computed on decayed values. Players
     /// outside the list get `UNRANKED_RANK` (MAX_TOP_PLAYERS + 1), never 0.
     pub fn get_rank(env: Env, user: Address) -> u32 {
+        let _ = Self::ensure_migrated(&env);
         let Some((slot, entry)) = Self::top_slot_entry(&env, &user) else {
             return UNRANKED_RANK;
         };
@@ -494,6 +495,7 @@ impl LeaderboardContract {
     /// **O(page_size), zero Vec rebuilds, zero on-read sorting**.
     ///
     pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
+        let _ = Self::ensure_migrated(&env);
         let count = Self::top_count(&env);
         if offset >= count || page_size == 0 {
             return vec![&env];
@@ -517,6 +519,7 @@ impl LeaderboardContract {
 
     /// Points of the weakest entry currently in the top list, decayed to now.
     pub fn get_min_points(env: Env) -> u64 {
+        let _ = Self::ensure_migrated(&env);
         let slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
         match Self::forward_entry(&env, slot) {
             Some(entry) => Self::entry_points_now(&env, &entry),

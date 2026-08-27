@@ -144,6 +144,7 @@ impl ReferralRegistryContract {
 
         if let Some(ref ref_addr) = referrer {
             if ref_addr == &user {
+        
                 return Err(ReferralError::SelfReferral);
             }
             if !env.storage().persistent().has(&DataKey::Referrer(ref_addr.clone())) {

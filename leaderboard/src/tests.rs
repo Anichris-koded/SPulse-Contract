@@ -1278,3 +1278,194 @@ fn test_explicit_migration_under_default_limits() {
     assert_eq!(top.get(2).unwrap().points, 15);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #79 — reward paths enforce PULSE supply cap
+// ═══════════════════════════════════════════════════════════════════════════
+
+use pulse_token::{PULSETokenContract, PULSETokenContractClient};
+use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+/// Helper: deploy a fresh PULSE token, set supply cap, wire it into the
+/// leaderboard, and return all necessary handles.
+fn setup_with_token() -> (
+    Env,
+    LeaderboardContractClient<'static>,
+    Address, // admin
+    Address, // market
+    Address, // referral
+    PULSETokenContractClient<'static>,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+    env.cost_estimate().disable_resource_limits();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    // Deploy PULSE token
+    let token_id = env.register(PULSETokenContract, ());
+    let token_client = PULSETokenContractClient::new(&env, &token_id);
+    token_client.initialize(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "PULSE"),
+        &soroban_sdk::String::from_str(&env, "PLSE"),
+        &7u32,
+    );
+
+    // Wire token into leaderboard
+    client.set_token_contract(&admin, &token_id);
+
+    (env, client, admin, market, referral, token_client)
+}
+
+#[test]
+fn test_reward_mints_tokens() {
+    let (env, client, _admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Verify token balance starts at 0
+    assert_eq!(token_client.balance(&user), 0);
+
+    // reward() with 10 PULSE — token contract must be invoked
+    client.reward(&market, &user, &30_u64, &10_0000000_i128, &true);
+
+    // Points updated AND token balance changed — proves mint was invoked
+    assert_eq!(client.get_points(&user), 30);
+    assert_eq!(token_client.balance(&user), 10_0000000_i128);
+    assert_eq!(token_client.total_supply(), 10_0000000_i128);
+}
+
+#[test]
+fn test_reward_updates_points_and_mints_tokens() {
+    let (env, client, _admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Two reward calls: 30 pts + 10 PULSE, then 10 pts + 5 PULSE
+    client.reward(&market, &user, &30_u64, &10_0000000_i128, &true);
+    client.reward(&market, &user, &10_u64, &5_0000000_i128, &false);
+
+    // Points accumulate, tokens accumulate
+    assert_eq!(client.get_points(&user), 40);
+    assert_eq!(token_client.balance(&user), 15_0000000_i128);
+    assert_eq!(token_client.total_supply(), 15_0000000_i128);
+}
+
+#[test]
+fn test_reward_enforces_supply_cap() {
+    let (env, client, admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 5 PULSE
+    token_client.set_supply_cap(&admin, &5_0000000_i128);
+
+    // Mint 5 PULSE — should succeed
+    client.reward(&market, &user, &30_u64, &5_0000000_i128, &true);
+    assert_eq!(token_client.balance(&user), 5_0000000_i128);
+    assert_eq!(token_client.total_supply(), 5_0000000_i128);
+
+    // Try to mint 1 more — should fail (cap exceeded)
+    let result = client.try_reward(&market, &user, &10_u64, &1_0000000_i128, &false);
+    assert!(result.is_err(), "reward should fail when supply cap exceeded");
+    // Balance and supply unchanged — cap enforced, no state corruption
+    assert_eq!(token_client.balance(&user), 5_0000000_i128);
+    assert_eq!(token_client.total_supply(), 5_0000000_i128);
+}
+
+#[test]
+fn test_reward_bonus_mints_tokens() {
+    let (env, client, _admin, _market, referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    assert_eq!(token_client.balance(&user), 0);
+
+    // reward_bonus() with 8 PULSE
+    client.reward_bonus(&referral, &user, &5_u64, &8_0000000_i128);
+
+    assert_eq!(client.get_points(&user), 5);
+    assert_eq!(token_client.balance(&user), 8_0000000_i128);
+    assert_eq!(token_client.total_supply(), 8_0000000_i128);
+}
+
+#[test]
+fn test_reward_bonus_enforces_supply_cap() {
+    let (env, client, admin, _market, referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 3 PULSE
+    token_client.set_supply_cap(&admin, &3_0000000_i128);
+
+    // Mint 3 PULSE via reward_bonus — should succeed
+    client.reward_bonus(&referral, &user, &5_u64, &3_0000000_i128);
+    assert_eq!(token_client.balance(&user), 3_0000000_i128);
+
+    // Try to mint 1 more — should fail
+    let result = client.try_reward_bonus(&referral, &user, &5_u64, &1_0000000_i128);
+    assert!(result.is_err(), "reward_bonus should fail when supply cap exceeded");
+    assert_eq!(token_client.balance(&user), 3_0000000_i128);
+}
+
+#[test]
+fn test_claim_pending_preserves_reward_on_cap_exceeded() {
+    let (env, client, admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 2 PULSE
+    token_client.set_supply_cap(&admin, &2_0000000_i128);
+
+    // Queue a reward for 3 PULSE — queue itself doesn't mint
+    client.queue_reward(&market, &user, &30_u64, &3_0000000_i128, &true);
+    assert_eq!(token_client.balance(&user), 0);
+
+    // Claim — should fail because minting would exceed cap
+    let result = client.try_claim_pending_rewards(&user);
+    assert!(result.is_err(), "claim should fail when pending tokens exceed cap");
+
+    // Critical: the pending reward must be PRESERVED (not lost) so the user
+    // can retry once the cap is raised.
+    let pending = client.get_pending_reward(&user).unwrap();
+    assert_eq!(pending.tokens, 3_0000000_i128);
+    assert_eq!(pending.points, 30);
+    assert_eq!(token_client.balance(&user), 0);
+    assert_eq!(token_client.total_supply(), 0);
+}
+
+#[test]
+fn test_claim_pending_succeeds_after_cap_raised() {
+    let (env, client, admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 2 PULSE, queue 3 PULSE
+    token_client.set_supply_cap(&admin, &2_0000000_i128);
+    client.queue_reward(&market, &user, &30_u64, &3_0000000_i128, &true);
+
+    // Claim fails — cap exceeded
+    assert!(client.try_claim_pending_rewards(&user).is_err());
+    assert_eq!(token_client.balance(&user), 0);
+    assert!(client.get_pending_reward(&user).is_some());
+
+    // Raise cap to 5 PULSE
+    token_client.set_supply_cap(&admin, &5_0000000_i128);
+
+    // Claim succeeds now
+    client.claim_pending_rewards(&user);
+    assert_eq!(token_client.balance(&user), 3_0000000_i128);
+    assert_eq!(token_client.total_supply(), 3_0000000_i128);
+    assert!(client.get_pending_reward(&user).is_none());
+    assert_eq!(client.get_points(&user), 30);
+}
+
+#[test]
+fn test_reward_zero_tokens_succeeds_without_token() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+
+    // reward() with tokens=0 should work even without a token contract set
+    client.reward(&market, &user, &30_u64, &0_i128, &true);
+    assert_eq!(client.get_points(&user), 30);
+}

@@ -558,9 +558,17 @@ impl LeaderboardContract {
                 .extend_ttl(&stats_key, TTL_BUMP, TTL_HIGH);
         }
         if let Some((slot, _)) = Self::top_slot_entry(&env, &user) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::TopPlayerAt(slot), TTL_BUMP, TTL_HIGH);
+            // TopPlayerAt(slot) is only ever persisted for legacy,
+            // not-yet-migrated entries now (set_top_slot writes the current
+            // player into the single TopPlayers blob instead) -- guard the
+            // TTL bump so a normal, already-migrated player doesn't trip a
+            // MissingValue extending a key that was never written.
+            let legacy_key = DataKey::TopPlayerAt(slot);
+            if env.storage().persistent().has(&legacy_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&legacy_key, TTL_BUMP, TTL_HIGH);
+            }
             env.storage().persistent().extend_ttl(
                 &DataKey::TopPlayerSlot(user),
                 TTL_BUMP,

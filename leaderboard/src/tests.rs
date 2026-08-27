@@ -1045,11 +1045,9 @@ fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
     client.add_pts(&market, &u3, &150, &true);
 
     env.as_contract(&contract_id, || {
-        let slots: soroban_sdk::Vec<PlayerEntry> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TopPlayers)
-            .unwrap();
+        let bytes: soroban_sdk::Bytes = env.storage().instance().get(&DataKey::TopPlayers).unwrap();
+        let slots: soroban_sdk::Vec<PlayerEntry> =
+            soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
         let slot0 = slots.get(0).unwrap();
         let slot1 = slots.get(1).unwrap();
         let slot2 = slots.get(2).unwrap();

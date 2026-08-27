@@ -1034,6 +1034,11 @@ fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
         assert_eq!(slot2.points, 50);
         assert_eq!(slot3.address, u1, "Slot 3 in storage must now be u1 (20 pts)");
         assert_eq!(slot3.points, 20);
+
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone())).unwrap(), 0);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone())).unwrap(), 1);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone())).unwrap(), 2);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone())).unwrap(), 3);
     });
 
     // 3. get_top_players merely reads these pre-sorted slots with no on-read sorting
@@ -1133,7 +1138,7 @@ fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
 }
 
 /// Migration is explicit-only. `get_top_players` on a migrated deployment must
-/// return correctly sorted results with zero on-read sorting or writes.
+/// return correctly sorted results without performing migration or writes.
 #[test]
 fn test_get_top_players_returns_sorted_without_triggering_migration() {
     let (env, client, _admin, market, _referral) = setup();
@@ -1154,7 +1159,7 @@ fn test_get_top_players_returns_sorted_without_triggering_migration() {
     assert_eq!(top.get(1).unwrap().address, u3); // 45
     assert_eq!(top.get(2).unwrap().address, u1); // 15
 
-    // Confirm TopPlayersMigrated flag is still set (not cleared by get_top_players)
+    // Confirm the migration flag is untouched by the read.
     let contract_id = client.address.clone();
     env.as_contract(&contract_id, || {
         assert!(env.storage().instance().has(&DataKey::TopPlayersMigrated));
@@ -1227,7 +1232,7 @@ fn test_upsert_top_under_default_resource_limits() {
 }
 
 #[test]
-fn test_get_top_players_auto_migrates_under_default_limits() {
+fn test_explicit_migration_under_default_limits() {
     let env = Env::default();
     env.mock_all_auths();
     // Enforce default Soroban limits.
@@ -1259,7 +1264,10 @@ fn test_get_top_players_auto_migrates_under_default_limits() {
         env.storage().instance().set(&DataKey::TopPlayerCount, &3_u32);
     });
 
-    // get_top_players automatically calls ensure_migrated under default limits
+    // Migration is explicit and must fit within the default resource limits.
+    let migrated_count = client.migrate_top_players();
+    assert_eq!(migrated_count, 3);
+
     let top = client.get_top_players(&0, &10);
     assert_eq!(top.len(), 3);
     assert_eq!(top.get(0).unwrap().address, u2);

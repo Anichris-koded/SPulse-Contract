@@ -480,10 +480,7 @@ impl LeaderboardContract {
     /// issue #61), so this function reads directly from pre-sorted slots —
     /// **O(page_size), zero Vec rebuilds, zero on-read sorting**.
     ///
-    /// Automatically calls `ensure_migrated` to self-heal any unmigrated legacy
-    /// state on first read (a no-op returning immediately once migrated).
     pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
-        let _ = Self::ensure_migrated(&env);
         let count = Self::top_count(&env);
         if offset >= count || page_size == 0 {
             return vec![&env];
@@ -1224,6 +1221,7 @@ impl LeaderboardContract {
         while s > target_slot {
             let from_slot = s - 1;
             if let Some(e) = Self::forward_entry(env, from_slot) {
+                // Update the reverse index along with each shifted forward entry.
                 Self::set_top_slot(env, s, &e);
             }
             s -= 1;
@@ -1335,10 +1333,9 @@ impl LeaderboardContract {
 
         // ── Path C: list full — evict weakest, place new entry at its slot ────
         //
-        // Invariant: when the list is maintained in strictly descending order,
-        // the minimum is always at `count - 1` (the tail slot). We rely on this
-        // to avoid a separate compact-shift pass: we simply overwrite the tail
-        // slot with the new entry and let `bubble_up` move it upward.
+        // Recompute the true minimum because a capped bubble may leave the
+        // weakest entry away from the tail. Replace that slot in place and let
+        // `bubble_up` move the new entry toward its best available position.
         //
         // Write budget:  1 (evict reverse) + 2 (new at tail) + ≤ MAX_SHIFT_SLOTS×2 = ≤ 49.
         Self::recompute_min(env);  // instance-only writes; sets MinSlot = count-1 when sorted
@@ -1358,10 +1355,8 @@ impl LeaderboardContract {
             .persistent()
             .remove(&DataKey::TopPlayerSlot(min_entry.address.clone()));
 
-        // Place the new entry directly at `min_slot` (the tail when sorted).
-        // No compact-shift needed: the evicted slot is already at the tail,
-        // so there are no gaps to fill. If for any reason min_slot < count-1
-        // (e.g. after repair), bubble_up still handles ordering correctly.
+        // Place the new entry directly in the evicted slot; this keeps the
+        // list dense even when the true minimum is not the tail.
         let new_entry = PlayerEntry {
             address: user.clone(),
             points: new_points,

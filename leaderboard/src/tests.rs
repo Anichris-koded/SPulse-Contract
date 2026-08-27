@@ -1330,7 +1330,6 @@ fn test_full_board_reorder_stays_within_default_write_limits() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 use pulse_token::{PULSETokenContract, PULSETokenContractClient};
-use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 
 /// Helper: deploy a fresh PULSE token, set supply cap, wire it into the
 /// leaderboard, and return all necessary handles.

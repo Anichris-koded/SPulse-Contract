@@ -1,9 +1,9 @@
 use super::*;
 use soroban_sdk::{
     contract, contractimpl,
-    testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
+    testutils::{Address as _, Events, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val,
+    Address, BytesN, Env, String, Symbol,
 };
 
 use leaderboard::LeaderboardContract;

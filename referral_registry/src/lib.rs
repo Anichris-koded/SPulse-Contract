@@ -1,15 +1,16 @@
 #![no_std]
+// TODO: migrate to #[contractevent] — see prediction_market/src/lib.rs.
+#![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
-    IntoVal, String, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, vec, Address, Env, IntoVal, String,
+    Symbol, Val,
 };
 
 pub const INTERFACE_VERSION: u32 = 1;
 
 const MAX_REFERRAL_DEPTH: u32 = 5;
 const WELCOME_BONUS_PTS: u64 = 5;
-const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BONUS_PTS: u64 = 3;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;

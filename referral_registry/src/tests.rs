@@ -1,9 +1,8 @@
 use super::*;
 use soroban_sdk::{
-    contract, contractimpl,
-    testutils::{Address as _, Events, Ledger, LedgerInfo},
+    testutils::{Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, String, Symbol,
+    Address, Env, String,
 };
 
 use leaderboard::LeaderboardContract;
@@ -264,17 +263,17 @@ fn test_referral_depth_limit() {
         let user = users.get(i as u32).unwrap();
         let result = if i == max_depth {
             t.client.try_register_referral(
-                user,
+                &user,
                 &String::from_str(&t.env, "U"),
                 &Some(referrer.clone()),
             )
         } else {
             t.client.register_referral(
-                user,
+                &user,
                 &String::from_str(&t.env, "U"),
                 &Some(referrer.clone()),
             );
-            Ok(())
+            Ok(Ok(()))
         };
         if i == max_depth {
             assert!(result.is_err(), "should fail at depth limit");

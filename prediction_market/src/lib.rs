@@ -1,4 +1,9 @@
 #![no_std]
+// TODO: migrate every env.events().publish(...) call to the #[contractevent]
+// macro (soroban-sdk deprecated the raw Events::publish API). That's a
+// mechanical but wide-reaching change across all four contracts' event
+// schemas and their tests — tracked separately, out of scope here.
+#![allow(deprecated)]
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, token, vec,
@@ -1172,12 +1177,6 @@ impl PredictionMarketContract {
             market.total_no
         };
 
-        let mut acc_fees: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AccumulatedFees)
-            .unwrap_or(0);
-
         let mut dust: i128 = 0;
         if winning_side == 0 {
             // Issues #3/#57: never sweep user principal into the fee pot.
@@ -1210,6 +1209,19 @@ impl PredictionMarketContract {
                             .extend_ttl(&payout_key, TTL_BUMP, TTL_HIGH);
                     }
                 }
+            }
+
+            // Issue #47 follow-up: principal is the sum of tracked bettors'
+            // net stakes, but the bettor index can under-enumerate (bounded
+            // pagination, legacy migrated markets) so principal is not
+            // guaranteed to equal total_pool. Any shortfall is unclaimable
+            // by construction (no Payout was written for it) and must be
+            // swept to fees here — same invariant as the non-zero branch:
+            //   Σ payouts + dust == total_pool
+            dust = total_pool - principal;
+            debug_assert!(dust >= 0, "zero-side principal must never exceed the pool");
+            if dust < 0 {
+                dust = 0;
             }
 
             // Pull this market's fees out of the withdrawable pot for the
@@ -1276,9 +1288,9 @@ impl PredictionMarketContract {
             debug_assert!(dust >= 0, "payouts must never exceed the pool");
         }
 
-        // Re-read: the zero-side branch may have debited locked fees out of
-        // the accumulator (ForfeitedPool), so never clobber with a stale local.
-        acc_fees = env
+        // Read fresh: the zero-side branch may have debited locked fees out
+        // of the accumulator (ForfeitedPool), so never use a stale local.
+        let mut acc_fees: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedFees)
@@ -1527,7 +1539,6 @@ impl PredictionMarketContract {
             entry.net_no
         };
         let is_winner = winning_net > 0;
-        let total_pool = market.total_yes + market.total_no;
         let winning_side = if market.outcome {
             market.total_yes
         } else {

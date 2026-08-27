@@ -134,10 +134,8 @@ impl PULSETokenContract {
             return Err(TokenError::InvalidAmount);
         }
         env.storage().instance().set(&DataKey::SupplyCap, &cap);
-        env.events().publish(
-            (Symbol::new(&env, "supply_cap_set"), admin),
-            cap,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "supply_cap_set"), admin), cap);
         Ok(())
     }
 
@@ -160,7 +158,8 @@ impl PULSETokenContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "paused"), admin), true);
+        env.events()
+            .publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -173,7 +172,8 @@ impl PULSETokenContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
+        env.events()
+            .publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -205,12 +205,12 @@ impl PULSETokenContract {
         }
         let minter_key = DataKey::AuthorizedMinter(minter.clone());
         env.storage().persistent().set(&minter_key, &true);
-        env.storage().persistent().extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
-        // Track in the audit list
-        let index_key = DataKey::MinterIndex(minter.clone());
         env.storage()
             .persistent()
-            .set(&index_key, &count);
+            .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
+        // Track in the audit list
+        let index_key = DataKey::MinterIndex(minter.clone());
+        env.storage().persistent().set(&index_key, &count);
         env.storage()
             .persistent()
             .extend_ttl(&index_key, TTL_BUMP, TTL_HIGH);
@@ -221,7 +221,8 @@ impl PULSETokenContract {
             .instance()
             .set(&DataKey::MinterCount, &(count + 1));
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "minter_added"), minter), true);
+        env.events()
+            .publish((Symbol::new(&env, "minter_added"), minter), true);
         Ok(())
     }
 
@@ -294,11 +295,7 @@ impl PULSETokenContract {
         }
         minter.require_auth();
         let minter_key = DataKey::AuthorizedMinter(minter.clone());
-        let is_minter: bool = env
-            .storage()
-            .persistent()
-            .get(&minter_key)
-            .unwrap_or(false);
+        let is_minter: bool = env.storage().persistent().get(&minter_key).unwrap_or(false);
         if !is_minter {
             return Err(TokenError::UnauthorizedMinter);
         }
@@ -317,26 +314,24 @@ impl PULSETokenContract {
             .unwrap_or(0);
         if cap > 0 && supply + amount > cap {
             return Err(TokenError::SupplyCapExceeded);
-        }        // Cap OK — now apply state changes.
+        } // Cap OK — now apply state changes.
         let balance = Self::balance(env.clone(), to.clone());
         let to_key = DataKey::Balance(to.clone());
-        env.storage()
-            .persistent()
-            .set(&to_key, &(balance + amount));
+        env.storage().persistent().set(&to_key, &(balance + amount));
         env.storage()
             .persistent()
             .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
-        env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalSupply, &(supply + amount));
         // An authorization grant that expires silently disables the minter
         // (e.g. the leaderboard paying out rewards), so refresh it on use.
         env.storage()
             .persistent()
             .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
         Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "mint"), minter, to),
-            amount,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "mint"), minter, to), amount);
         Ok(())
     }
 
@@ -355,10 +350,8 @@ impl PULSETokenContract {
         let to_balance = Self::balance(env.clone(), to.clone());
         Self::write_balance(&env, &to, to_balance + amount);
         Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "transfer"), from, to), amount);
         Ok(())
     }
 
@@ -463,10 +456,8 @@ impl PULSETokenContract {
         let to_balance = Self::balance(env.clone(), to.clone());
         Self::write_balance(&env, &to, to_balance + amount);
         Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "transfer"), from, to), amount);
         Ok(())
     }
 
@@ -490,7 +481,8 @@ impl PULSETokenContract {
             .instance()
             .set(&DataKey::TotalSupply, &(supply - amount));
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "burn"), from), amount);
+        env.events()
+            .publish((Symbol::new(&env, "burn"), from), amount);
         Ok(())
     }
 
@@ -540,7 +532,9 @@ impl PULSETokenContract {
     fn write_balance(env: &Env, account: &Address, amount: i128) {
         let key = DataKey::Balance(account.clone());
         env.storage().persistent().set(&key, &amount);
-        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
     }
 
     /// Refresh the instance entry holding `TotalSupply`, `Admin`, `Paused`

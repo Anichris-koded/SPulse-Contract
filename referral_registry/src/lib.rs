@@ -124,7 +124,9 @@ impl ReferralRegistryContract {
     ) -> Result<(), ReferralError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::TokenContract, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenContract, &token);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
@@ -145,13 +147,16 @@ impl ReferralRegistryContract {
 
         if let Some(ref ref_addr) = referrer {
             if ref_addr == &user {
-        
                 return Err(ReferralError::SelfReferral);
             }
-            if !env.storage().persistent().has(&DataKey::Referrer(ref_addr.clone())) {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::Referrer(ref_addr.clone()))
+            {
                 return Err(ReferralError::InvalidReferrer);
             }
-            let depth = Self::referral_depth(&env, &ref_addr);
+            let depth = Self::referral_depth(&env, ref_addr);
             if depth >= MAX_REFERRAL_DEPTH {
                 return Err(ReferralError::DepthLimitExceeded);
             }
@@ -170,9 +175,11 @@ impl ReferralRegistryContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::DisplayName(user.clone()), TTL_BUMP, TTL_HIGH);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DisplayName(user.clone()),
+            TTL_BUMP,
+            TTL_HIGH,
+        );
 
         let lb = Self::leaderboard_contract(&env)?;
         let this = env.current_contract_address();
@@ -238,11 +245,7 @@ impl ReferralRegistryContract {
                 );
 
                 let earnings_key = DataKey::Earnings(ref_addr.clone());
-                let earnings: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&earnings_key)
-                    .unwrap_or(0);
+                let earnings: i128 = env.storage().persistent().get(&earnings_key).unwrap_or(0);
                 env.storage()
                     .persistent()
                     .set(&earnings_key, &(earnings + amount));
@@ -256,15 +259,11 @@ impl ReferralRegistryContract {
     }
 
     pub fn get_referrer(env: Env, user: Address) -> Option<Address> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Referrer(user))
+        env.storage().persistent().get(&DataKey::Referrer(user))
     }
 
     pub fn get_display_name(env: Env, user: Address) -> Option<String> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DisplayName(user))
+        env.storage().persistent().get(&DataKey::DisplayName(user))
     }
 
     pub fn get_referrer_count(env: Env, referrer: Address) -> u32 {

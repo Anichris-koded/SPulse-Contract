@@ -1,5 +1,8 @@
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Events}, Env, Symbol, TryFromVal, Val};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    Env, Symbol, TryFromVal, Val,
+};
 
 fn setup() -> (
     Env,
@@ -264,7 +267,13 @@ fn test_eviction_replaces_lowest_when_full() {
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
     // A full-board reorder is completed in one bounded vector write.
-    while client.get_top_players(&0_u32, &1_u32).get(0).unwrap().address != newcomer {
+    while client
+        .get_top_players(&0_u32, &1_u32)
+        .get(0)
+        .unwrap()
+        .address
+        != newcomer
+    {
         client.add_pts(&market, &newcomer, &1_u64, &true);
     }
 
@@ -716,7 +725,13 @@ fn test_eviction_repairs_expired_min_entry() {
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
-    while client.get_top_players(&0_u32, &1_u32).get(0).unwrap().address != newcomer {
+    while client
+        .get_top_players(&0_u32, &1_u32)
+        .get(0)
+        .unwrap()
+        .address
+        != newcomer
+    {
         client.add_pts(&market, &newcomer, &1_u64, &true);
     }
 
@@ -756,7 +771,9 @@ fn test_eviction_clears_reverse_mapping() {
     // Displaced player: unranked and no lingering reverse mapping.
     assert_eq!(client.get_rank(&weakest), UNRANKED_RANK);
     let still_mapped = env.as_contract(&client.address, || {
-        env.storage().persistent().has(&DataKey::TopPlayerSlot(weakest.clone()))
+        env.storage()
+            .persistent()
+            .has(&DataKey::TopPlayerSlot(weakest.clone()))
     });
     assert!(!still_mapped);
 }
@@ -995,40 +1012,68 @@ fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
     let contract_id = client.address.clone();
     env.as_contract(&contract_id, || {
         let bytes: soroban_sdk::Bytes = env.storage().instance().get(&DataKey::TopPlayers).unwrap();
-        let slots: soroban_sdk::Vec<PlayerEntry> = soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
+        let slots: soroban_sdk::Vec<PlayerEntry> =
+            soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
         let slot0 = slots.get(0).unwrap();
         let slot1 = slots.get(1).unwrap();
         let slot2 = slots.get(2).unwrap();
         let slot3 = slots.get(3).unwrap();
 
-        assert_eq!(slot0.address, u4, "Slot 0 in persistent storage must be u4 (100 pts)");
+        assert_eq!(
+            slot0.address, u4,
+            "Slot 0 in persistent storage must be u4 (100 pts)"
+        );
         assert_eq!(slot0.points, 100);
-        assert_eq!(slot1.address, u2, "Slot 1 in persistent storage must be u2 (50 pts)");
+        assert_eq!(
+            slot1.address, u2,
+            "Slot 1 in persistent storage must be u2 (50 pts)"
+        );
         assert_eq!(slot1.points, 50);
-        assert_eq!(slot2.address, u1, "Slot 2 in persistent storage must be u1 (20 pts)");
+        assert_eq!(
+            slot2.address, u1,
+            "Slot 2 in persistent storage must be u1 (20 pts)"
+        );
         assert_eq!(slot2.points, 20);
-        assert_eq!(slot3.address, u3, "Slot 3 in persistent storage must be u3 (10 pts)");
+        assert_eq!(
+            slot3.address, u3,
+            "Slot 3 in persistent storage must be u3 (10 pts)"
+        );
         assert_eq!(slot3.points, 10);
-
     });
 
     // 2. Now boost u3 by +150 (total 160) -> write-time bubble_up must reorder storage
     client.add_pts(&market, &u3, &150, &true);
 
     env.as_contract(&contract_id, || {
-        let slots: soroban_sdk::Vec<PlayerEntry> = env.storage().persistent().get(&DataKey::TopPlayers).unwrap();
+        let slots: soroban_sdk::Vec<PlayerEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TopPlayers)
+            .unwrap();
         let slot0 = slots.get(0).unwrap();
         let slot1 = slots.get(1).unwrap();
         let slot2 = slots.get(2).unwrap();
         let slot3 = slots.get(3).unwrap();
 
-        assert_eq!(slot0.address, u3, "Slot 0 in storage must now be u3 (160 pts)");
+        assert_eq!(
+            slot0.address, u3,
+            "Slot 0 in storage must now be u3 (160 pts)"
+        );
         assert_eq!(slot0.points, 160);
-        assert_eq!(slot1.address, u4, "Slot 1 in storage must now be u4 (100 pts)");
+        assert_eq!(
+            slot1.address, u4,
+            "Slot 1 in storage must now be u4 (100 pts)"
+        );
         assert_eq!(slot1.points, 100);
-        assert_eq!(slot2.address, u2, "Slot 2 in storage must now be u2 (50 pts)");
+        assert_eq!(
+            slot2.address, u2,
+            "Slot 2 in storage must now be u2 (50 pts)"
+        );
         assert_eq!(slot2.points, 50);
-        assert_eq!(slot3.address, u1, "Slot 3 in storage must now be u1 (20 pts)");
+        assert_eq!(
+            slot3.address, u1,
+            "Slot 3 in storage must now be u1 (20 pts)"
+        );
         assert_eq!(slot3.points, 20);
     });
 
@@ -1062,9 +1107,16 @@ fn test_get_top_players_cpu_cost_scales_linearly_with_page_size() {
 
     // With O(page_size) direct slot reads (no O(n^2) selection sort or Vec rebuilds),
     // reading 50 elements is well within the default Soroban CPU instruction budget (100M).
-    assert!(cpu_50 < 10_000_000, "50 pre-sorted slot reads must consume minimal CPU (got {})", cpu_50);
+    assert!(
+        cpu_50 < 10_000_000,
+        "50 pre-sorted slot reads must consume minimal CPU (got {})",
+        cpu_50
+    );
     // Cost for 50 elements should scale linearly O(k) with page size, not quadratically
-    assert!(cpu_50 <= cpu_10 * 7, "CPU cost must scale linearly O(k) with page size");
+    assert!(
+        cpu_50 <= cpu_10 * 7,
+        "CPU cost must scale linearly O(k) with page size"
+    );
 }
 
 // ── Issue #61 Migration: Legacy unsorted data migration ───────────────────────
@@ -1082,23 +1134,63 @@ fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
     let contract_id = client.address.clone();
     env.as_contract(&contract_id, || {
         // Remove migration flag to simulate a pre-upgrade deployment
-        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+        env.storage()
+            .instance()
+            .remove(&DataKey::TopPlayersMigrated);
 
         // Unsorted: slot 0=10pts, slot 1=50pts, slot 2=20pts, slot 3=100pts
-        let e0 = PlayerEntry { address: u1.clone(), points: 10, epoch: 0, seq: 0 };
-        let e1 = PlayerEntry { address: u2.clone(), points: 50, epoch: 0, seq: 1 };
-        let e2 = PlayerEntry { address: u3.clone(), points: 20, epoch: 0, seq: 2 };
-        let e3 = PlayerEntry { address: u4.clone(), points: 100, epoch: 0, seq: 3 };
+        let e0 = PlayerEntry {
+            address: u1.clone(),
+            points: 10,
+            epoch: 0,
+            seq: 0,
+        };
+        let e1 = PlayerEntry {
+            address: u2.clone(),
+            points: 50,
+            epoch: 0,
+            seq: 1,
+        };
+        let e2 = PlayerEntry {
+            address: u3.clone(),
+            points: 20,
+            epoch: 0,
+            seq: 2,
+        };
+        let e3 = PlayerEntry {
+            address: u4.clone(),
+            points: 100,
+            epoch: 0,
+            seq: 3,
+        };
 
-        env.storage().persistent().set(&DataKey::TopPlayerAt(0), &e0);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
-        env.storage().persistent().set(&DataKey::TopPlayerAt(1), &e1);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
-        env.storage().persistent().set(&DataKey::TopPlayerAt(2), &e2);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
-        env.storage().persistent().set(&DataKey::TopPlayerAt(3), &e3);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(u4.clone()), &3_u32);
-        env.storage().instance().set(&DataKey::TopPlayerCount, &4_u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerAt(0), &e0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerAt(1), &e1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerAt(2), &e2);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerAt(3), &e3);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(u4.clone()), &3_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayerCount, &4_u32);
     });
 
     // One-shot migration via the explicit endpoint
@@ -1107,21 +1199,65 @@ fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
 
     // Slots must now be in strictly descending order: 100, 50, 20, 10
     env.as_contract(&contract_id, || {
-        let s0: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(0)).unwrap();
-        let s1: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(1)).unwrap();
-        let s2: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(2)).unwrap();
-        let s3: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(3)).unwrap();
+        let s0: PlayerEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TopPlayerAt(0))
+            .unwrap();
+        let s1: PlayerEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TopPlayerAt(1))
+            .unwrap();
+        let s2: PlayerEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TopPlayerAt(2))
+            .unwrap();
+        let s3: PlayerEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TopPlayerAt(3))
+            .unwrap();
 
-        assert_eq!(s0.address, u4); assert_eq!(s0.points, 100);
-        assert_eq!(s1.address, u2); assert_eq!(s1.points, 50);
-        assert_eq!(s2.address, u3); assert_eq!(s2.points, 20);
-        assert_eq!(s3.address, u1); assert_eq!(s3.points, 10);
+        assert_eq!(s0.address, u4);
+        assert_eq!(s0.points, 100);
+        assert_eq!(s1.address, u2);
+        assert_eq!(s1.points, 50);
+        assert_eq!(s2.address, u3);
+        assert_eq!(s2.points, 20);
+        assert_eq!(s3.address, u1);
+        assert_eq!(s3.points, 10);
 
         // Reverse lookups must be consistent with sorted slot order
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone())).unwrap(), 0);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone())).unwrap(), 1);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone())).unwrap(), 2);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone())).unwrap(), 3);
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone()))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone()))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone()))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone()))
+                .unwrap(),
+            3
+        );
     });
 
     // Second call is a no-op: migration flag is set, returns 0 and writes nothing.
@@ -1180,8 +1316,11 @@ fn test_upsert_top_eviction_write_budget_is_bounded() {
     // Weakest original player (10 pts) should have been evicted
     let evicted = players.get(49).unwrap();
     let evicted_rank = client.get_rank(&evicted);
-    assert!(evicted_rank == 0 || evicted_rank > 50,
-        "Weakest player should have been evicted; got rank {}", evicted_rank);
+    assert!(
+        evicted_rank == 0 || evicted_rank > 50,
+        "Weakest player should have been evicted; got rank {}",
+        evicted_rank
+    );
 }
 
 // ── Tests validating gas/write budget under REAL default resource limits ──────
@@ -1237,17 +1376,48 @@ fn test_get_top_players_automatically_migrates_under_default_limits() {
 
     // Simulate pre-upgrade unmigrated state
     env.as_contract(&contract_id, || {
-        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
-        let e0 = PlayerEntry { address: u1.clone(), points: 15, epoch: 0, seq: 0 };
-        let e1 = PlayerEntry { address: u2.clone(), points: 75, epoch: 0, seq: 1 };
-        let e2 = PlayerEntry { address: u3.clone(), points: 45, epoch: 0, seq: 2 };
-        env.storage().persistent().set(&DataKey::TopPlayerAt(0), &e0);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
-        env.storage().persistent().set(&DataKey::TopPlayerAt(1), &e1);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
-        env.storage().persistent().set(&DataKey::TopPlayerAt(2), &e2);
-        env.storage().persistent().set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
-        env.storage().instance().set(&DataKey::TopPlayerCount, &3_u32);
+        env.storage()
+            .instance()
+            .remove(&DataKey::TopPlayersMigrated);
+        let e0 = PlayerEntry {
+            address: u1.clone(),
+            points: 15,
+            epoch: 0,
+            seq: 0,
+        };
+        let e1 = PlayerEntry {
+            address: u2.clone(),
+            points: 75,
+            epoch: 0,
+            seq: 1,
+        };
+        let e2 = PlayerEntry {
+            address: u3.clone(),
+            points: 45,
+            epoch: 0,
+            seq: 2,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerAt(0), &e0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerAt(1), &e1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerAt(2), &e2);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayerCount, &3_u32);
     });
 
     // The first read performs the one-time migration under default limits.
@@ -1277,7 +1447,9 @@ fn test_full_legacy_migration_fits_default_write_limits() {
     client.initialize(&admin, &market, &referral);
 
     env.as_contract(&contract_id, || {
-        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+        env.storage()
+            .instance()
+            .remove(&DataKey::TopPlayersMigrated);
         env.storage().instance().remove(&DataKey::TopPlayers);
         for slot in 0..(MAX_TOP_PLAYERS - 1) {
             let entry = PlayerEntry {
@@ -1286,7 +1458,9 @@ fn test_full_legacy_migration_fits_default_write_limits() {
                 epoch: 0,
                 seq: slot as u64,
             };
-            env.storage().persistent().set(&DataKey::TopPlayerAt(slot), &entry);
+            env.storage()
+                .persistent()
+                .set(&DataKey::TopPlayerAt(slot), &entry);
         }
         env.storage()
             .instance()
@@ -1417,7 +1591,10 @@ fn test_reward_enforces_supply_cap() {
 
     // Try to mint 1 more — should fail (cap exceeded)
     let result = client.try_reward(&market, &user, &10_u64, &1_0000000_i128, &false);
-    assert!(result.is_err(), "reward should fail when supply cap exceeded");
+    assert!(
+        result.is_err(),
+        "reward should fail when supply cap exceeded"
+    );
     // Balance and supply unchanged — cap enforced, no state corruption
     assert_eq!(token_client.balance(&user), 5_0000000_i128);
     assert_eq!(token_client.total_supply(), 5_0000000_i128);
@@ -1452,7 +1629,10 @@ fn test_reward_bonus_enforces_supply_cap() {
 
     // Try to mint 1 more — should fail
     let result = client.try_reward_bonus(&referral, &user, &5_u64, &1_0000000_i128);
-    assert!(result.is_err(), "reward_bonus should fail when supply cap exceeded");
+    assert!(
+        result.is_err(),
+        "reward_bonus should fail when supply cap exceeded"
+    );
     assert_eq!(token_client.balance(&user), 3_0000000_i128);
 }
 
@@ -1470,7 +1650,10 @@ fn test_claim_pending_preserves_reward_on_cap_exceeded() {
 
     // Claim — should fail because minting would exceed cap
     let result = client.try_claim_pending_rewards(&user);
-    assert!(result.is_err(), "claim should fail when pending tokens exceed cap");
+    assert!(
+        result.is_err(),
+        "claim should fail when pending tokens exceed cap"
+    );
 
     // Critical: the pending reward must be PRESERVED (not lost) so the user
     // can retry once the cap is raised.

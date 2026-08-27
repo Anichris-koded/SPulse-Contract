@@ -455,11 +455,8 @@ fn test_reduce_position_with_referrer_paid() {
     fund_user(&t, &user, 1_000_0000000);
 
     let no_ref: Option<Address> = None;
-    t.referral_client.register_referral(
-        &referrer,
-        &String::from_str(&t.env, "Referrer"),
-        &no_ref,
-    );
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -707,7 +704,8 @@ fn test_reject_too_many_bets_across_sides() {
     // Both sides share one per-user entry/count: 21 alternating bets must
     // trip MAX_BETS_PER_USER regardless of side.
     for i in 0..=20u32 {
-        t.client.place_bet(&user, &id, &(i % 2 == 0), &11_0000000_i128);
+        t.client
+            .place_bet(&user, &id, &(i % 2 == 0), &11_0000000_i128);
     }
 }
 
@@ -1384,16 +1382,9 @@ fn test_bettor_index_pages_beyond_count_are_empty() {
     t.client.place_bet(&user, &id, &true, &10_0000000_i128);
 
     // Offsets past the live count return empty pages instead of scanning.
+    assert_eq!(t.client.get_market_bettors_page(&id, &1, &10).len(), 0);
     assert_eq!(
-        t.client
-            .get_market_bettors_page(&id, &1, &10)
-            .len(),
-        0
-    );
-    assert_eq!(
-        t.client
-            .get_market_bettors_page(&id, &u32::MAX, &10)
-            .len(),
+        t.client.get_market_bettors_page(&id, &u32::MAX, &10).len(),
         0
     );
 }
@@ -1755,11 +1746,7 @@ fn test_empty_side_resolution_pool_to_fees() {
     // Draining during the dispute window reverts.
     let treasury = Address::generate(&t.env);
     t.client.add_fee_recipient(&t.admin, &treasury);
-    assert!(
-        t.client
-            .try_withdraw_fees(&t.admin, &treasury)
-            .is_err()
-    );
+    assert!(t.client.try_withdraw_fees(&t.admin, &treasury).is_err());
 
     // After the dispute window, finalize releases the locked fees.
     advance_time(&t.env, DISPUTE_WINDOW_SECS);
@@ -2114,11 +2101,7 @@ fn test_payout_invariant_holds_through_partial_claims() {
     let n1 = t.client.get_bet(&id, &w1).amount;
     let n2 = t.client.get_bet(&id, &w2).amount;
     let n3 = t.client.get_bet(&id, &w3).amount;
-    let payouts = [
-        (n1 * pool) / win,
-        (n2 * pool) / win,
-        (n3 * pool) / win,
-    ];
+    let payouts = [(n1 * pool) / win, (n2 * pool) / win, (n3 * pool) / win];
     assert_eq!(t.client.get_payout(&id, &w1), payouts[0]);
     assert_eq!(t.client.get_payout(&id, &w2), payouts[1]);
     assert_eq!(t.client.get_payout(&id, &w3), payouts[2]);
@@ -2143,10 +2126,7 @@ fn test_payout_invariant_holds_through_partial_claims() {
         let dropped = before - t.xlm.balance(&market_contract);
         assert_eq!(dropped, payouts[i]);
         claimed += dropped;
-        assert_eq!(
-            t.xlm.balance(&market_contract),
-            bal_after_resolve - claimed
-        );
+        assert_eq!(t.xlm.balance(&market_contract), bal_after_resolve - claimed);
         assert_eq!(t.client.get_accumulated_fees(), fees_before + dust);
     }
 
@@ -2180,7 +2160,8 @@ fn test_hedged_position_payout_uses_winning_side_net_only() {
 
     t.client.place_bet(&hedger, &id, &true, &60_0000000_i128);
     t.client.place_bet(&hedger, &id, &false, &40_0000000_i128); // hedge
-    t.client.place_bet(&pure_winner, &id, &true, &50_0000000_i128);
+    t.client
+        .place_bet(&pure_winner, &id, &true, &50_0000000_i128);
 
     advance_time(&t.env, 3601);
     let fees_before = t.client.get_accumulated_fees();
@@ -2211,10 +2192,7 @@ fn test_hedged_position_payout_uses_winning_side_net_only() {
     t.client.claim(&pure_winner, &id);
 
     let market_contract = t.client.address.clone();
-    assert_eq!(
-        t.xlm.balance(&market_contract),
-        fees_before + dust
-    );
+    assert_eq!(t.xlm.balance(&market_contract), fees_before + dust);
     assert_eq!(p_hedge, hedge_net_yes * pool / win);
 }
 
@@ -2344,8 +2322,9 @@ fn test_refresh_market_ttl_rebumps_bet_and_market() {
     let bet_key = DataKey::Bet(id, user.clone());
     let market_key = DataKey::Market(id);
     let ttl = |key: &DataKey| -> u32 {
-        t.env
-            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+        t.env.as_contract(&market_contract, || {
+            t.env.storage().persistent().get_ttl(key)
+        })
     };
     let bet_before = ttl(&bet_key);
     let market_before = ttl(&market_key);
@@ -2440,7 +2419,8 @@ fn test_resolve_market_rebumps_payout_entry() {
 
     let market_contract = t.client.address.clone();
     let payout_ttl = t.env.as_contract(&market_contract, || {
-        t.env.storage()
+        t.env
+            .storage()
             .persistent()
             .get_ttl(&DataKey::Payout(id, user.clone()))
     });
@@ -2785,13 +2765,8 @@ fn test_execute_set_config_before_delay_rejected() {
     // A real contract deployment must be staged: set_config validates that
     // every dependency is the expected executable kind (issue #51/#6).
     let new_lb = second_leaderboard(&t);
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
     // Too soon — the timelock has not matured.
     t.client.execute_set_config(&t.admin);
 }
@@ -2819,13 +2794,8 @@ fn test_set_config_does_not_apply_immediately() {
     let cfg = t.client.get_config();
     let new_lb = second_leaderboard(&t);
 
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
 
     // Live config is unchanged until execute_set_config after the delay.
     assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
@@ -2870,13 +2840,8 @@ fn test_set_config_execute_before_delay() {
     let t = setup();
     let cfg = t.client.get_config();
     let new_lb = second_leaderboard(&t);
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
     t.client.execute_set_config(&t.admin);
 }
 
@@ -2885,13 +2850,8 @@ fn test_set_config_execute_after_delay_and_pin() {
     let t = setup();
     let cfg = t.client.get_config();
     let new_lb = second_leaderboard(&t);
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
     advance_time(&t.env, CONFIG_DELAY_SECS);
     t.client.execute_set_config(&t.admin);
 
@@ -2906,13 +2866,8 @@ fn test_cancel_set_config_during_dispute_window() {
     let t = setup();
     let cfg = t.client.get_config();
     let new_lb = second_leaderboard(&t);
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
     t.client.cancel_set_config(&t.admin);
     assert!(t.client.get_pending_config().is_none());
     assert_eq!(t.client.get_config().leaderboard, cfg.leaderboard);
@@ -2928,13 +2883,8 @@ fn test_set_config_multisig_requires_threshold() {
 
     let cfg = t.client.get_config();
     let new_lb = second_leaderboard(&t);
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
     advance_time(&t.env, CONFIG_DELAY_SECS);
     // Only the proposer approved (1 of 2).
     t.client.execute_set_config(&t.admin);
@@ -2948,13 +2898,8 @@ fn test_cancel_set_config_removes_pending() {
     // every dependency is the expected executable kind (issue #51/#6).
     let new_lb = second_leaderboard(&t);
     let cfg = t.client.get_config();
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
     assert!(t.client.get_pending_config().is_some());
 
     t.client.cancel_set_config(&t.admin);
@@ -2990,13 +2935,8 @@ fn test_set_config_multisig_execute_with_second_approval() {
 
     let cfg = t.client.get_config();
     let new_lb = second_leaderboard(&t);
-    t.client.set_config(
-        &t.admin,
-        &cfg.token,
-        &cfg.referral,
-        &new_lb,
-        &cfg.xlm_sac,
-    );
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
     t.client.approve_set_config(&g2);
     advance_time(&t.env, CONFIG_DELAY_SECS);
     t.client.execute_set_config(&g2);
@@ -3038,7 +2978,10 @@ fn last_event_name(env: &Env) -> Symbol {
 fn test_create_market_emits_event() {
     let t = setup();
     let _id = create_test_market(&t);
-    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_created"));
+    assert_eq!(
+        last_event_name(&t.env),
+        Symbol::new(&t.env, "market_created")
+    );
 }
 
 #[test]
@@ -3063,7 +3006,10 @@ fn test_resolve_market_emits_event() {
     t.client.place_bet(&bob, &id, &false, &100_0000000_i128);
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
-    assert_eq!(last_event_name(&t.env), Symbol::new(&t.env, "market_resolved"));
+    assert_eq!(
+        last_event_name(&t.env),
+        Symbol::new(&t.env, "market_resolved")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3172,8 +3118,7 @@ fn test_fee_recipient_two_step_cannot_target_arbitrary_address() {
 
     let fees = t.client.get_accumulated_fees();
     let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
-    t.client
-        .request_withdraw_fees(&recipient, &stranger, &cap);
+    t.client.request_withdraw_fees(&recipient, &stranger, &cap);
 }
 
 #[test]
@@ -3193,7 +3138,10 @@ fn test_migrate_fee_ledger_snapshots_legacy_balance() {
             .storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &legacy_amount);
-        t.env.storage().instance().remove(&DataKey::FeeLedgerMigrated);
+        t.env
+            .storage()
+            .instance()
+            .remove(&DataKey::FeeLedgerMigrated);
     });
 
     t.client.migrate_fee_ledger();
@@ -3239,10 +3187,12 @@ fn test_set_config_rejects_duplicate_proposal() {
     // every dependency is the expected executable kind (issue #51/#6).
     let cfg = t.client.get_config();
     let new_lb = second_leaderboard(&t);
-    t.client.set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
 
     // A second proposal while one is pending must be rejected.
-    t.client.set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
+    t.client
+        .set_config(&t.admin, &cfg.token, &cfg.referral, &new_lb, &cfg.xlm_sac);
 }
 
 #[test]
@@ -3331,7 +3281,11 @@ fn test_two_sided_loser_does_not_receive_xlm_on_claim() {
 
     let bob_before = t.xlm.balance(&bob);
     t.client.claim(&bob, &id);
-    assert_eq!(t.xlm.balance(&bob), bob_before, "loser must not receive XLM");
+    assert_eq!(
+        t.xlm.balance(&bob),
+        bob_before,
+        "loser must not receive XLM"
+    );
     assert_eq!(t.token_client.balance(&bob), 2_0000000);
 }
 

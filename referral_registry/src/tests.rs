@@ -2,7 +2,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, String,
+    Address, Env, String, Vec,
 };
 
 use leaderboard::LeaderboardContract;
@@ -92,7 +92,10 @@ fn test_register_referral_without_referrer() {
     );
 
     assert_eq!(t.client.get_referrer(&user), None);
-    assert_eq!(t.client.get_display_name(&user), Some(String::from_str(&t.env, "User")));
+    assert_eq!(
+        t.client.get_display_name(&user),
+        Some(String::from_str(&t.env, "User"))
+    );
 }
 
 #[test]
@@ -140,7 +143,10 @@ fn test_credit_with_referrer_pays_referrer() {
     let paid = t.client.credit(&t.market, &user, &referral_fee);
     assert_eq!(paid, true);
 
-    assert_eq!(t.xlm.balance(&referrer), referrer_balance_before + referral_fee);
+    assert_eq!(
+        t.xlm.balance(&referrer),
+        referrer_balance_before + referral_fee
+    );
     assert_eq!(t.client.get_earnings(&referrer), referral_fee);
 }
 
@@ -192,7 +198,10 @@ fn test_credit_after_late_referrer_registration() {
     let referrer_balance_before = t.xlm.balance(&referrer);
     let paid = t.client.credit(&t.market, &user, &referral_fee);
     assert_eq!(paid, true);
-    assert_eq!(t.xlm.balance(&referrer), referrer_balance_before + referral_fee);
+    assert_eq!(
+        t.xlm.balance(&referrer),
+        referrer_balance_before + referral_fee
+    );
 }
 
 #[test]

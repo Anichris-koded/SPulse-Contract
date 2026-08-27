@@ -388,8 +388,7 @@ impl PULSETokenContract {
             expiration_ledger,
         };
         env.storage().temporary().set(&key, &value);
-        let live_for = expiration_ledger
-            .saturating_sub(env.ledger().sequence());
+        let live_for = expiration_ledger.saturating_sub(env.ledger().sequence());
         env.storage()
             .temporary()
             .extend_ttl(&key, live_for, live_for);
@@ -400,7 +399,11 @@ impl PULSETokenContract {
     /// Returns 0 once the allowance has expired.
     pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
         let key = DataKey::Allowance(from, spender);
-        match env.storage().temporary().get::<DataKey, AllowanceValue>(&key) {
+        match env
+            .storage()
+            .temporary()
+            .get::<DataKey, AllowanceValue>(&key)
+        {
             Some(allowance) if allowance.expiration_ledger >= env.ledger().sequence() => {
                 allowance.amount
             }

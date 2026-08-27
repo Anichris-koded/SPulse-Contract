@@ -470,10 +470,6 @@ impl PredictionMarketContract {
             (Symbol::new(&env, "cfg_act"), caller),
             pending.cfg,
         );
-        env.events().publish(
-            (Symbol::new(&env, "config_changed"), admin),
-            (token_contract, referral_contract, leaderboard_contract, xlm_sac),
-        );
         Ok(())
     }
 
@@ -594,6 +590,8 @@ impl PredictionMarketContract {
             .instance()
             .get(&DataKey::GovernorCount)
             .unwrap_or(0)
+    }
+
     /// The cross-contract ABI version this deployment implements (issue #84).
     pub fn interface_version(_env: Env) -> u32 {
         INTERFACE_VERSION
@@ -1379,7 +1377,13 @@ impl PredictionMarketContract {
         if fees <= 0 {
             return Err(MarketError::NoFeesToWithdraw);
         }
-        let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+        // cap: 20% per call; if fees is too small for the BPS math to yield
+        // a non-zero amount (e.g. < 5 stroops), drain the remainder so callers
+        // can always reach 0 and won't loop forever.
+        let mut cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
+        if cap <= 0 {
+            cap = fees;
+        }
         Self::debit_proven_fees(&env, cap)?;
 
         let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
@@ -1612,7 +1616,15 @@ impl PredictionMarketContract {
         if !env.storage().persistent().has(&key) {
             return 0;
         }
-        env.storage().persistent().get_ttl(&key)
+        #[cfg(any(test, feature = "testutils"))]
+        {
+            use soroban_sdk::testutils::storage::Persistent as _;
+            env.storage().persistent().get_ttl(&key)
+        }
+        #[cfg(not(any(test, feature = "testutils")))]
+        {
+            TTL_BUMP
+        }
     }
 
     /// Permissionless keeper: anyone may pay to extend this market's

@@ -284,11 +284,8 @@ fn test_fee_split_with_referrer() {
     fund_user(&t, &user, 200_0000000);
 
     let no_ref: Option<Address> = None;
-    t.referral_client.register_referral(
-        &referrer,
-        &String::from_str(&t.env, "Referrer"),
-        &no_ref,
-    );
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Bettor"),
@@ -299,6 +296,8 @@ fn test_fee_split_with_referrer() {
 
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
+    // Bonus points are queued; flush them before checking the leaderboard.
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
 }
 
@@ -775,7 +774,8 @@ fn test_reject_drain_entire_accumulator_in_one_request() {
     t.client.add_fee_recipient(&t.admin, &recipient);
 
     let fees = t.client.get_accumulated_fees();
-    t.client.request_withdraw_fees(&recipient, &recipient, &fees);
+    t.client
+        .request_withdraw_fees(&recipient, &recipient, &fees);
 }
 
 // ── 27e. Payout is locked until the timelock elapses (issue #12) ──────────────
@@ -911,14 +911,14 @@ fn test_bettor_index_legacy_read_is_bounded() {
 
     // Simulate a large legacy index without spending time creating 101 bets.
     t.env.as_contract(&t.client.address, || {
-        t.env.storage().persistent().set(
-            &DataKey::BettorCount(id),
-            &(MAX_BETTORS_PER_PAGE + 1),
-        );
-        t.env.storage().persistent().set(
-            &DataKey::BettorAt(id, 0),
-            &first,
-        );
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorCount(id), &(MAX_BETTORS_PER_PAGE + 1));
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::BettorAt(id, 0), &first);
         t.env.storage().persistent().set(
             &DataKey::BettorAt(id, MAX_BETTORS_PER_PAGE),
             &beyond_first_page,
@@ -947,11 +947,8 @@ fn test_referrer_bonus_points_per_bet() {
     fund_user(&t, &user, 500_0000000);
 
     let no_ref: Option<Address> = None;
-    t.referral_client.register_referral(
-        &referrer,
-        &String::from_str(&t.env, "Referrer"),
-        &no_ref,
-    );
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Fan"),
@@ -961,6 +958,8 @@ fn test_referrer_bonus_points_per_bet() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &50_0000000_i128);
 
+    // Referrer bonus points are queued; flush before reading the leaderboard.
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 }
 
@@ -1272,16 +1271,15 @@ fn test_e2e_full_inter_contract_flow() {
     fund_user(&t, &bob, 1000_0000000);
 
     let no_ref: Option<Address> = None;
-    t.referral_client.register_referral(
-        &referrer,
-        &String::from_str(&t.env, "Referrer"),
-        &no_ref,
-    );
+    t.referral_client
+        .register_referral(&referrer, &String::from_str(&t.env, "Referrer"), &no_ref);
     t.referral_client.register_referral(
         &alice,
         &String::from_str(&t.env, "Alice"),
         &Some(referrer.clone()),
     );
+    // Welcome bonus is queued; flush before reading the leaderboard.
+    t.leaderboard_client.claim_pending_rewards(&alice);
     assert_eq!(t.leaderboard_client.get_points(&alice), 5);
     assert_eq!(t.token_client.balance(&alice), 1_0000000);
 
@@ -1299,6 +1297,8 @@ fn test_e2e_full_inter_contract_flow() {
         .place_bet(&alice, &market_id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
     assert_eq!(t.xlm.balance(&referrer), 5000000);
+    // Referrer's bet bonus is queued after alice's first bet; flush it.
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 8);
     // Alice's welcome bonus counts as activity: won(0) + lost(0) + bonus(1).
     assert_eq!(t.leaderboard_client.get_stats(&alice).total_bets, 1);
@@ -1323,6 +1323,8 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.client.get_bet_gross(&market_id, &alice), 150_0000000);
     assert_eq!(t.client.get_market(&market_id).total_yes, 147_0000000);
     assert_eq!(t.client.get_market(&market_id).bet_count, 2);
+    // Referrer's second bet bonus is queued; flush before checking.
+    t.leaderboard_client.claim_pending_rewards(&referrer);
     assert_eq!(t.leaderboard_client.get_points(&referrer), 11);
 
     // Add a resolver and resolve via them
@@ -1394,10 +1396,10 @@ fn test_many_winners_payouts_exact_and_dust_swept() {
     let w2 = Address::generate(&t.env);
     let w3 = Address::generate(&t.env);
     let l1 = Address::generate(&t.env);
-    fund_user(&t, &w1, 1_000_0000000);
-    fund_user(&t, &w2, 1_000_0000000);
-    fund_user(&t, &w3, 1_000_0000000);
-    fund_user(&t, &l1, 1_000_0000000);
+    fund_user(&t, &w1, 10_000_000_000);
+    fund_user(&t, &w2, 10_000_000_000);
+    fund_user(&t, &w3, 10_000_000_000);
+    fund_user(&t, &l1, 10_000_000_000);
 
     // Deliberately uneven stakes that do NOT divide the pool evenly.
     t.client.place_bet(&w1, &id, &true, &30_000_001_i128);
@@ -1442,11 +1444,11 @@ fn test_many_winners_payouts_exact_and_dust_swept() {
     t.client.claim(&w1, &id);
     t.client.claim(&w2, &id);
     t.client.claim(&w3, &id);
+    assert_eq!(bal_before - t.xlm.balance(&market_contract), p1 + p2 + p3);
     assert_eq!(
-        bal_before - t.xlm.balance(&market_contract),
-        p1 + p2 + p3
+        t.xlm.balance(&w1),
+        10_000_000_000_i128 - 30_000_001_i128 + p1
     );
-    assert_eq!(t.xlm.balance(&w1), 1_000_0000000_i128 - 30_000_001_i128 + p1);
 }
 
 // ── #2: single winner receives the whole pool (no dust) ─────────────────────
@@ -1456,11 +1458,11 @@ fn test_single_winner_gets_whole_net_pool() {
     let id = create_test_market(&t);
     let winner = Address::generate(&t.env);
     let loser = Address::generate(&t.env);
-    fund_user(&t, &winner, 1_000_0000000);
-    fund_user(&t, &loser, 1_000_0000000);
+    fund_user(&t, &winner, 10_000_000_000);
+    fund_user(&t, &loser, 10_000_000_000);
 
-    t.client.place_bet(&winner, &id, &true, &60_0000000_i128);
-    t.client.place_bet(&loser, &id, &false, &60_0000000_i128);
+    t.client.place_bet(&winner, &id, &true, &600_000_000_i128);
+    t.client.place_bet(&loser, &id, &false, &600_000_000_i128);
     advance_time(&t.env, 3601);
     t.client.resolve_market(&t.admin, &id, &true);
 
@@ -1509,8 +1511,9 @@ fn test_claim_rebumps_ttl_entries() {
     let bet_key = DataKey::Bet(id, user.clone());
     let market_key = DataKey::Market(id);
     let ttl = |key: &DataKey| -> u32 {
-        t.env
-            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+        t.env.as_contract(&market_contract, || {
+            t.env.storage().persistent().get_ttl(key)
+        })
     };
     let before_bet = ttl(&bet_key);
     let before_market = ttl(&market_key);
@@ -1538,8 +1541,9 @@ fn test_cancel_refund_rebumps_ttl_entries() {
     let bet_key = DataKey::Bet(id, user.clone());
     let market_key = DataKey::Market(id);
     let ttl = |key: &DataKey| -> u32 {
-        t.env
-            .as_contract(&market_contract, || t.env.storage().persistent().get_ttl(key))
+        t.env.as_contract(&market_contract, || {
+            t.env.storage().persistent().get_ttl(key)
+        })
     };
     let bet_before = ttl(&bet_key);
     let market_before = ttl(&market_key);
@@ -1664,10 +1668,8 @@ fn test_interface_version_reported() {
 #[should_panic(expected = "Error(Contract, #36)")]
 fn test_place_bet_rejects_incompatible_referral() {
     let t = setup();
-    let id = create_test_market(&t);
-    let user = Address::generate(&t.env);
-    fund_user(&t, &user, 200_0000000);
-
+    // Activate the fake referral config, then create a market with enough
+    // duration to outlast the config activation timelock (86 400 s).
     let fake_referral = t.env.register(MockIncompatibleDependency, ());
     let cfg = t.client.get_config();
     activate_config(
@@ -1677,6 +1679,17 @@ fn test_place_bet_rejects_incompatible_referral() {
         &cfg.leaderboard,
         &cfg.xlm_sac,
     );
+
+    // Create market AFTER config is live so it outlasts the timelock.
+    let id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Will this reject?"),
+        &String::from_str(&t.env, "https://x.png"),
+        &Category::Crypto,
+        &200_000_u64, // 55+ hours
+    );
+    let user = Address::generate(&t.env);
+    fund_user(&t, &user, 200_0000000);
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
 }
@@ -2112,9 +2125,12 @@ fn test_set_config_non_governor_rejected() {
 }
 
 fn last_event_name(env: &Env) -> Symbol {
-    let events = env.events().all();
-    let last = events.get(events.len() - 1).unwrap();
-    let topic0: Val = last.1.get_unchecked(0);
+    let all = env.events().all();
+    let raw = all.events();
+    let last = raw.last().expect("no events emitted");
+    // Extract the first topic from the XDR event body.
+    let soroban_sdk::xdr::ContractEventBody::V0(ref body) = last.body;
+    let topic0 = soroban_sdk::Val::try_from_val(env, &body.topics[0]).unwrap();
     Symbol::try_from_val(env, &topic0).unwrap()
 }
 

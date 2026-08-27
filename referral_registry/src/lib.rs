@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
-    IntoVal, String, Symbol, Vec,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 pub const INTERFACE_VERSION: u32 = 1;
@@ -142,8 +142,9 @@ impl ReferralRegistryContract {
             return Err(ReferralError::AlreadyRegistered);
         }
 
-        if let Some(ref_addr) = referrer {
-            if ref_addr == user {
+        if let Some(ref ref_addr) = referrer {
+            if ref_addr == &user {
+        
                 return Err(ReferralError::SelfReferral);
             }
             if !env.storage().persistent().has(&DataKey::Referrer(ref_addr.clone())) {

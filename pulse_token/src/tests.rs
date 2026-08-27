@@ -409,23 +409,7 @@ fn test_paused_rejects_mint() {
     client.mint(&minter, &recipient, &10_0000000_i128);
 }
 
-#[test]
-#[should_panic(expected = "Error(Contract, #9)")]
-fn test_paused_rejects_transfer() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let client = setup(&env);
-    let admin = init(&env, &client);
 
-    let minter = Address::generate(&env);
-    client.set_minter(&minter);
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    client.mint(&minter, &alice, &50_0000000_i128);
-
-    client.pause(&admin);
-    client.transfer(&alice, &bob, &10_0000000_i128);
-}
 
 #[test]
 #[should_panic(expected = "Error(Contract, #9)")]

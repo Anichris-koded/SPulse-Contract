@@ -1,9 +1,9 @@
 use super::*;
 use soroban_sdk::{
     contract, contractimpl,
-    testutils::{Address as _, Events, Ledger, LedgerInfo},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, BytesN, Env, String, Symbol,
+    Address, BytesN, Env, String, Symbol, TryIntoVal,
 };
 
 use leaderboard::LeaderboardContract;
@@ -2380,7 +2380,7 @@ fn test_place_bet_rejects_incompatible_referral() {
         &cfg.leaderboard,
         &cfg.xlm_sac,
     );
-    advance_time(&t.env, CONFIG_CHANGE_DELAY_SECS);
+    advance_time(&t.env, CONFIG_DELAY_SECS);
     t.client.execute_set_config(&t.admin);
 
     // The referral dependency now reports an incompatible interface version.
@@ -2715,7 +2715,7 @@ fn test_cancel_withdrawal_request_still_works_while_paused() {
 // ── Timelocked config changes (issue #93) ───────────────────────────────────
 //
 // set_config no longer re-points the market to arbitrary addresses instantly.
-// It stages the change, which only lands after CONFIG_CHANGE_DELAY_SECS via
+// It stages the change, which only lands after CONFIG_DELAY_SECS via
 // execute_set_config, and can be cancelled before it matures. This gives
 // off-chain monitors time to detect a malicious redirect and the admin time to
 // reverse it.
@@ -2746,7 +2746,7 @@ fn test_set_config_is_timelocked() {
     assert_eq!(pending.requested_at, t.env.ledger().timestamp());
 
     // After the delay it lands.
-    advance_time(&t.env, CONFIG_CHANGE_DELAY_SECS);
+    advance_time(&t.env, CONFIG_DELAY_SECS);
     t.client.execute_set_config(&t.admin);
 
     let after = t.client.get_config();

@@ -1538,8 +1538,12 @@ fn setup_with_token() -> (
         &7u32,
     );
 
-    // Wire token into leaderboard
+    // Wire token into leaderboard, and authorize the leaderboard contract to
+    // mint PULSE — reward()/reward_bonus() call token_client.mint() with the
+    // leaderboard contract as the minter, which pulse_token rejects unless
+    // it's on the authorized-minter list.
     client.set_token_contract(&admin, &token_id);
+    token_client.set_minter(&contract_id);
 
     (env, client, admin, market, referral, token_client)
 }

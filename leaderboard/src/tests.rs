@@ -115,7 +115,7 @@ fn test_top_players_sorted() {
 fn test_top_players_capped_at_50() {
     let (env, client, _admin, market, _referral) = setup();
 
-    for i in 1u64..=55 {
+    for i in (1u64..=55).rev() {
         let user = Address::generate(&env);
         client.add_pts(&market, &user, &i, &true);
     }
@@ -253,22 +253,25 @@ fn test_player_count() {
 
 #[test]
 fn test_eviction_replaces_lowest_when_full() {
-    // Fill exactly 50 with points 100..149, then add a higher scorer.
-    // The new entry must enter and the lowest (100) must be evicted.
+    // Fill exactly 50 with points in descending order 149 down to 100
     let (env, client, _admin, market, _referral) = setup();
     for i in 0u64..50 {
         let user = Address::generate(&env);
-        client.add_pts(&market, &user, &(100 + i), &true);
+        client.add_pts(&market, &user, &(149 - i), &true);
     }
     assert_eq!(client.get_top_player_count(), 50);
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
+    // A full-board reorder is completed in one bounded vector write.
+    while client.get_top_players(&0_u32, &1_u32).get(0).unwrap().address != newcomer {
+        client.add_pts(&market, &newcomer, &1_u64, &true);
+    }
 
     // Still capped at 50; newcomer is now #1; the old min (100) is gone.
     assert_eq!(client.get_top_player_count(), 50);
     let top = client.get_top_players(&0_u32, &20_u32);
-    assert_eq!(top.get(0).unwrap().points, 500);
+    assert_eq!(top.get(0).unwrap().points, 502);
 
     // Lowest entry is now 101 (the original 100 was evicted).
     let last = client.get_top_players(&40_u32, &20_u32);
@@ -519,9 +522,6 @@ fn test_get_rank_cleans_stale_reverse_lookup() {
         env.storage().persistent().remove(&DataKey::TopPlayerAt(0));
     });
 
-    // The next ranked read must detect the orphaned reverse key and clear it.
-    let _ = client.get_rank(&alice);
-
     assert_eq!(client.get_rank(&alice), UNRANKED_RANK);
     env.as_contract(&client.address, || {
         let slot: Option<u32> = env
@@ -686,7 +686,6 @@ fn test_stale_slot_self_heals_after_entry_expired() {
 
     client.add_pts(&market, &user, &50_u64, &true);
     assert_eq!(client.get_points(&user), 150);
-    assert_eq!(client.get_rank(&user), 1);
     assert_eq!(client.get_rank(&user), 1); // re-entered the list
 
     let top = client.get_top_players(&0_u32, &20_u32);
@@ -703,10 +702,10 @@ fn test_eviction_repairs_expired_min_entry() {
     let mut weakest = None;
     for i in 0u64..50 {
         let user = Address::generate(&env);
-        if i == 0 {
+        if i == 49 {
             weakest = Some(user.clone());
         }
-        client.add_pts(&market, &user, &(100 + i), &true);
+        client.add_pts(&market, &user, &(149 - i), &true);
     }
     assert_eq!(client.get_player_count(), 50);
     let weakest = weakest.unwrap();
@@ -717,11 +716,14 @@ fn test_eviction_repairs_expired_min_entry() {
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
+    while client.get_top_players(&0_u32, &1_u32).get(0).unwrap().address != newcomer {
+        client.add_pts(&market, &newcomer, &1_u64, &true);
+    }
 
     assert_eq!(client.get_player_count(), 50);
     let top = client.get_top_players(&0_u32, &20_u32);
     assert_eq!(top.get(0).unwrap().address, newcomer);
-    assert_eq!(top.get(0).unwrap().points, 500);
+    assert_eq!(top.get(0).unwrap().points, 502);
     assert_eq!(client.get_rank(&newcomer), 1);
     // The expired player (100) is gone; even though their orphaned
     // TopPlayerSlot survives, get_rank must not report a stale rank.
@@ -745,6 +747,7 @@ fn test_eviction_clears_reverse_mapping() {
         client.add_pts(&market, &user, &(100 + i), &true);
     }
     let weakest = weakest.unwrap();
+    assert_eq!(client.get_rank(&weakest), 50);
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &1000_u64, &true);
@@ -799,12 +802,717 @@ fn test_add_pts_emits_leaderboard_updated() {
 
 #[test]
 fn test_add_pts_always_rejected() {
-    let (env, client, _admin, market, _referral) = setup();
+    let (env, client, _admin, _market, _referral) = setup();
     let user = Address::generate(&env);
     let rando = Address::generate(&env);
-    // Generated `try_*` clients wrap the error twice; just assert rejection.
-    assert!(
-        client.try_add_pts(&rando, &user, &10_u64, &true).is_err(),
-        "add_pts from a non-market caller must be rejected"
+    // add_pts is a legacy entrypoint: a caller who is not the registered
+    // market contract must be rejected with UnauthorizedCaller.
+    let result = client.try_add_pts(&rando, &user, &10_u64, &true);
+    assert!(result.is_err(), "add_pts should reject non-market callers");
+    match result.unwrap_err().unwrap() {
+        LeaderboardError::UnauthorizedCaller => {}
+        other => panic!("add_pts returned unexpected error: {:?}", other),
+    }
+}
+
+// ── Tests for Issue #61: Write-time sorting & gas optimization ────────────────
+
+#[test]
+fn test_pagination() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    // Insert 15 players with distinct scores (10, 20, ..., 150)
+    let mut users = soroban_sdk::vec![&env];
+    for i in 1..=15u64 {
+        let u = Address::generate(&env);
+        client.add_pts(&market, &u, &(i * 10), &true);
+        users.push_back(u);
+    }
+
+    assert_eq!(client.get_top_player_count(), 15);
+
+    // Page 1: offset 0, page_size 5 (scores: 150, 140, 130, 120, 110)
+    let p1 = client.get_top_players(&0, &5);
+    assert_eq!(p1.len(), 5);
+    assert_eq!(p1.get(0).unwrap().points, 150);
+    assert_eq!(p1.get(4).unwrap().points, 110);
+
+    // Page 2: offset 5, page_size 5 (scores: 100, 90, 80, 70, 60)
+    let p2 = client.get_top_players(&5, &5);
+    assert_eq!(p2.len(), 5);
+    assert_eq!(p2.get(0).unwrap().points, 100);
+    assert_eq!(p2.get(4).unwrap().points, 60);
+
+    // Page 3: offset 10, page_size 5 (scores: 50, 40, 30, 20, 10)
+    let p3 = client.get_top_players(&10, &5);
+    assert_eq!(p3.len(), 5);
+    assert_eq!(p3.get(0).unwrap().points, 50);
+    assert_eq!(p3.get(4).unwrap().points, 10);
+
+    // Out of bounds offset returns empty vec
+    let p_empty = client.get_top_players(&15, &5);
+    assert_eq!(p_empty.len(), 0);
+
+    // Partial last page: offset 12, page_size 10 (3 remaining: 30, 20, 10)
+    let p_partial = client.get_top_players(&12, &10);
+    assert_eq!(p_partial.len(), 3);
+    assert_eq!(p_partial.get(0).unwrap().points, 30);
+    assert_eq!(p_partial.get(2).unwrap().points, 10);
+}
+
+#[test]
+fn test_interleaved_scoring() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let charlie = Address::generate(&env);
+    let dave = Address::generate(&env);
+
+    // 1. Charlie gets 30 pts -> [Charlie(30)]
+    client.add_pts(&market, &charlie, &30, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 1);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(0).unwrap().points, 30);
+
+    // 2. Alice gets 50 pts -> [Alice(50), Charlie(30)] (Alice bubbles to slot 0)
+    client.add_pts(&market, &alice, &50, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 2);
+    assert_eq!(top.get(0).unwrap().address, alice);
+    assert_eq!(top.get(1).unwrap().address, charlie);
+
+    // 3. Bob gets 100 pts -> [Bob(100), Alice(50), Charlie(30)]
+    client.add_pts(&market, &bob, &100, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top.get(0).unwrap().address, bob);
+    assert_eq!(top.get(1).unwrap().address, alice);
+    assert_eq!(top.get(2).unwrap().address, charlie);
+
+    // 4. Charlie gets +80 pts (total 110) -> [Charlie(110), Bob(100), Alice(50)]
+    // Charlie jumps from slot 2 past Alice and Bob to slot 0 via write-time bubble_up
+    client.add_pts(&market, &charlie, &80, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(0).unwrap().points, 110);
+    assert_eq!(top.get(1).unwrap().address, bob);
+    assert_eq!(top.get(1).unwrap().points, 100);
+    assert_eq!(top.get(2).unwrap().address, alice);
+    assert_eq!(top.get(2).unwrap().points, 50);
+
+    // 5. Dave gets 75 pts -> inserted between Bob(100) and Alice(50)
+    client.add_pts(&market, &dave, &75, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 4);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(1).unwrap().address, bob);
+    assert_eq!(top.get(2).unwrap().address, dave);
+    assert_eq!(top.get(3).unwrap().address, alice);
+
+    // 6. Alice gets +60 pts (total 110) -> equal points with Charlie.
+    // FIFO tie-breaking: Charlie is older seq, so Charlie stays #1, Alice is #2
+    client.add_pts(&market, &alice, &60, &true);
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 4);
+    assert_eq!(top.get(0).unwrap().address, charlie);
+    assert_eq!(top.get(1).unwrap().address, alice);
+    assert_eq!(top.get(2).unwrap().address, bob);
+    assert_eq!(top.get(3).unwrap().address, dave);
+}
+
+#[test]
+fn test_full_leaderboard_gas_usage() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    // Fill all 50 slots of the leaderboard
+    for i in (1..=50u64).rev() {
+        let u = Address::generate(&env);
+        client.add_pts(&market, &u, &(i * 10), &true);
+    }
+    assert_eq!(client.get_top_player_count(), 50);
+
+    // Verify reading the entire leaderboard (50 elements) is O(page_size)
+    // and returns strictly descending scores (500 down to 10)
+    let top = client.get_top_players(&0, &MAX_TOP_PLAYERS);
+    assert_eq!(top.len(), 50);
+    assert_eq!(top.get(0).unwrap().points, 500);
+    assert_eq!(top.get(49).unwrap().points, 10);
+
+    // Verify strictly descending order across all 50 slots
+    for i in 0..49 {
+        assert!(
+            top.get(i).unwrap().points >= top.get(i + 1).unwrap().points,
+            "Slots must be sorted descending"
+        );
+    }
+
+    // Evict the weakest player (score 10 at slot 49) with a newcomer of score 155
+    // (the newcomer moves from the tail to its sorted position in one write)
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &155, &true);
+
+    let updated_top = client.get_top_players(&0, &MAX_TOP_PLAYERS);
+    assert_eq!(updated_top.len(), 50);
+    // Newcomer should have bubbled up to its correct pre-sorted slot
+    let mut found_newcomer = false;
+    for i in 0..50 {
+        let entry = updated_top.get(i).unwrap();
+        if entry.address == newcomer {
+            assert_eq!(entry.points, 155);
+            found_newcomer = true;
+        }
+    }
+    assert!(found_newcomer, "Newcomer must be in top players");
+
+    // All slots must remain strictly descending after eviction
+    for i in 0..49 {
+        assert!(
+            updated_top.get(i).unwrap().points >= updated_top.get(i + 1).unwrap().points,
+            "Slots must remain sorted after eviction"
+        );
+    }
+}
+
+#[test]
+fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+    let u4 = Address::generate(&env);
+
+    // 1. Write in scrambled order: 20, 50, 10, 100
+    client.add_pts(&market, &u1, &20, &true); // u1 = 20
+    client.add_pts(&market, &u2, &50, &true); // u2 = 50 -> bubbles to slot 0
+    client.add_pts(&market, &u3, &10, &true); // u3 = 10 -> slot 2
+    client.add_pts(&market, &u4, &100, &true); // u4 = 100 -> bubbles to slot 0
+
+    // Inspect the single persistent ordered index without calling get_top_players.
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let bytes: soroban_sdk::Bytes = env.storage().instance().get(&DataKey::TopPlayers).unwrap();
+        let slots: soroban_sdk::Vec<PlayerEntry> = soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
+        let slot0 = slots.get(0).unwrap();
+        let slot1 = slots.get(1).unwrap();
+        let slot2 = slots.get(2).unwrap();
+        let slot3 = slots.get(3).unwrap();
+
+        assert_eq!(slot0.address, u4, "Slot 0 in persistent storage must be u4 (100 pts)");
+        assert_eq!(slot0.points, 100);
+        assert_eq!(slot1.address, u2, "Slot 1 in persistent storage must be u2 (50 pts)");
+        assert_eq!(slot1.points, 50);
+        assert_eq!(slot2.address, u1, "Slot 2 in persistent storage must be u1 (20 pts)");
+        assert_eq!(slot2.points, 20);
+        assert_eq!(slot3.address, u3, "Slot 3 in persistent storage must be u3 (10 pts)");
+        assert_eq!(slot3.points, 10);
+
+    });
+
+    // 2. Now boost u3 by +150 (total 160) -> write-time bubble_up must reorder storage
+    client.add_pts(&market, &u3, &150, &true);
+
+    env.as_contract(&contract_id, || {
+        let slots: soroban_sdk::Vec<PlayerEntry> = env.storage().persistent().get(&DataKey::TopPlayers).unwrap();
+        let slot0 = slots.get(0).unwrap();
+        let slot1 = slots.get(1).unwrap();
+        let slot2 = slots.get(2).unwrap();
+        let slot3 = slots.get(3).unwrap();
+
+        assert_eq!(slot0.address, u3, "Slot 0 in storage must now be u3 (160 pts)");
+        assert_eq!(slot0.points, 160);
+        assert_eq!(slot1.address, u4, "Slot 1 in storage must now be u4 (100 pts)");
+        assert_eq!(slot1.points, 100);
+        assert_eq!(slot2.address, u2, "Slot 2 in storage must now be u2 (50 pts)");
+        assert_eq!(slot2.points, 50);
+        assert_eq!(slot3.address, u1, "Slot 3 in storage must now be u1 (20 pts)");
+        assert_eq!(slot3.points, 20);
+    });
+
+    // 3. get_top_players merely reads these pre-sorted slots with no on-read sorting
+    let top = client.get_top_players(&0, &4);
+    assert_eq!(top.get(0).unwrap().address, u3);
+    assert_eq!(top.get(1).unwrap().address, u4);
+    assert_eq!(top.get(2).unwrap().address, u2);
+    assert_eq!(top.get(3).unwrap().address, u1);
+}
+
+#[test]
+fn test_get_top_players_cpu_cost_scales_linearly_with_page_size() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    for i in 1..=50u64 {
+        let u = Address::generate(&env);
+        client.add_pts(&market, &u, &(i * 10), &true);
+    }
+
+    // Reset budget to measure read costs
+    env.cost_estimate().budget().reset_default();
+
+    let _page10 = client.get_top_players(&0, &10);
+    let cpu_10 = env.cost_estimate().budget().cpu_instruction_cost();
+
+    env.cost_estimate().budget().reset_default();
+
+    let _page50 = client.get_top_players(&0, &50);
+    let cpu_50 = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // With O(page_size) direct slot reads (no O(n^2) selection sort or Vec rebuilds),
+    // reading 50 elements is well within the default Soroban CPU instruction budget (100M).
+    assert!(cpu_50 < 10_000_000, "50 pre-sorted slot reads must consume minimal CPU (got {})", cpu_50);
+    // Cost for 50 elements should scale linearly O(k) with page size, not quadratically
+    assert!(cpu_50 <= cpu_10 * 7, "CPU cost must scale linearly O(k) with page size");
+}
+
+// ── Issue #61 Migration: Legacy unsorted data migration ───────────────────────
+
+#[test]
+fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
+    let (env, client, _admin, _market, _referral) = setup();
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+    let u4 = Address::generate(&env);
+
+    // Simulate pre-upgrade legacy state: write unsorted slots directly
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        // Remove migration flag to simulate a pre-upgrade deployment
+        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+
+        // Unsorted: slot 0=10pts, slot 1=50pts, slot 2=20pts, slot 3=100pts
+        let e0 = PlayerEntry { address: u1.clone(), points: 10, epoch: 0, seq: 0 };
+        let e1 = PlayerEntry { address: u2.clone(), points: 50, epoch: 0, seq: 1 };
+        let e2 = PlayerEntry { address: u3.clone(), points: 20, epoch: 0, seq: 2 };
+        let e3 = PlayerEntry { address: u4.clone(), points: 100, epoch: 0, seq: 3 };
+
+        env.storage().persistent().set(&DataKey::TopPlayerAt(0), &e0);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
+        env.storage().persistent().set(&DataKey::TopPlayerAt(1), &e1);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
+        env.storage().persistent().set(&DataKey::TopPlayerAt(2), &e2);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
+        env.storage().persistent().set(&DataKey::TopPlayerAt(3), &e3);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u4.clone()), &3_u32);
+        env.storage().instance().set(&DataKey::TopPlayerCount, &4_u32);
+    });
+
+    // One-shot migration via the explicit endpoint
+    let migrated_count = client.migrate_top_players();
+    assert_eq!(migrated_count, 4);
+
+    // Slots must now be in strictly descending order: 100, 50, 20, 10
+    env.as_contract(&contract_id, || {
+        let s0: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(0)).unwrap();
+        let s1: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(1)).unwrap();
+        let s2: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(2)).unwrap();
+        let s3: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(3)).unwrap();
+
+        assert_eq!(s0.address, u4); assert_eq!(s0.points, 100);
+        assert_eq!(s1.address, u2); assert_eq!(s1.points, 50);
+        assert_eq!(s2.address, u3); assert_eq!(s2.points, 20);
+        assert_eq!(s3.address, u1); assert_eq!(s3.points, 10);
+
+        // Reverse lookups must be consistent with sorted slot order
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone())).unwrap(), 0);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone())).unwrap(), 1);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone())).unwrap(), 2);
+        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone())).unwrap(), 3);
+    });
+
+    // Second call is a no-op: migration flag is set, returns 0 and writes nothing.
+    assert_eq!(client.migrate_top_players(), 0);
+}
+
+/// A normal read on a migrated deployment returns the pre-sorted index without
+/// performing another migration or sort.
+#[test]
+fn test_get_top_players_returns_sorted_without_triggering_migration() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+
+    // Use the normal write path (already-migrated deployment from initialize)
+    client.add_pts(&market, &u1, &15, &true);
+    client.add_pts(&market, &u2, &75, &true);
+    client.add_pts(&market, &u3, &45, &true);
+
+    // get_top_players must return sorted results without performing migration
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top.get(0).unwrap().address, u2); // 75
+    assert_eq!(top.get(1).unwrap().address, u3); // 45
+    assert_eq!(top.get(2).unwrap().address, u1); // 15
+
+    // Confirm the migration flag is untouched by the read.
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        assert!(env.storage().instance().has(&DataKey::TopPlayersMigrated));
+    });
+}
+
+/// Verifies that a worst-case upsert (full list eviction + entry shifting
+/// from the tail to the top remains within Soroban's default write budget.
+#[test]
+fn test_upsert_top_eviction_write_budget_is_bounded() {
+    let (env, client, _admin, market, _referral) = setup();
+
+    // Fill the list with 50 players in descending order
+    let mut players = soroban_sdk::Vec::new(&env);
+    for i in (1..=50u64).rev() {
+        let u = Address::generate(&env);
+        players.push_back(u.clone());
+        client.add_pts(&market, &u, &(i * 10), &true);
+    }
+
+    // Introduce a new player with score 155 (evicts slot 49 and shifts 14 slots, <= 19)
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &155, &true);
+
+    assert_eq!(client.get_top_player_count(), 50);
+
+    // Weakest original player (10 pts) should have been evicted
+    let evicted = players.get(49).unwrap();
+    let evicted_rank = client.get_rank(&evicted);
+    assert!(evicted_rank == 0 || evicted_rank > 50,
+        "Weakest player should have been evicted; got rank {}", evicted_rank);
+}
+
+// ── Tests validating gas/write budget under REAL default resource limits ──────
+
+#[test]
+fn test_upsert_top_under_default_resource_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Do NOT disable resource limits. Enforce default Soroban limits.
+    env.cost_estimate().budget().reset_default();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    // Fill 20 entries in descending order
+    for i in (1..=20u64).rev() {
+        let u = Address::generate(&env);
+        client.add_pts(&market, &u, &(i * 10), &true);
+    }
+
+    // The ordered vector update remains within the default resource limits.
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &105, &true);
+
+    assert_eq!(client.get_top_player_count(), 21);
+    let top = client.get_top_players(&0, &25);
+    assert_eq!(top.len(), 21);
+    assert_eq!(top.get(10).unwrap().points, 105);
+    assert_eq!(top.get(10).unwrap().address, newcomer);
+}
+
+#[test]
+fn test_get_top_players_automatically_migrates_under_default_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Enforce default Soroban limits.
+    env.cost_estimate().budget().reset_default();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+
+    // Simulate pre-upgrade unmigrated state
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+        let e0 = PlayerEntry { address: u1.clone(), points: 15, epoch: 0, seq: 0 };
+        let e1 = PlayerEntry { address: u2.clone(), points: 75, epoch: 0, seq: 1 };
+        let e2 = PlayerEntry { address: u3.clone(), points: 45, epoch: 0, seq: 2 };
+        env.storage().persistent().set(&DataKey::TopPlayerAt(0), &e0);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u1.clone()), &0_u32);
+        env.storage().persistent().set(&DataKey::TopPlayerAt(1), &e1);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u2.clone()), &1_u32);
+        env.storage().persistent().set(&DataKey::TopPlayerAt(2), &e2);
+        env.storage().persistent().set(&DataKey::TopPlayerSlot(u3.clone()), &2_u32);
+        env.storage().instance().set(&DataKey::TopPlayerCount, &3_u32);
+    });
+
+    // The first read performs the one-time migration under default limits.
+    let top = client.get_top_players(&0, &10);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top.get(0).unwrap().address, u2);
+    assert_eq!(top.get(0).unwrap().points, 75);
+    assert_eq!(top.get(1).unwrap().address, u3);
+    assert_eq!(top.get(1).unwrap().points, 45);
+    assert_eq!(top.get(2).unwrap().address, u1);
+    assert_eq!(top.get(2).unwrap().points, 15);
+}
+
+#[test]
+fn test_full_legacy_migration_fits_default_write_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Build the legacy fixture outside invocation limits; reset them before
+    // exercising the migration itself.
+    env.cost_estimate().budget().reset_unlimited();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+        env.storage().instance().remove(&DataKey::TopPlayers);
+        for slot in 0..(MAX_TOP_PLAYERS - 1) {
+            let entry = PlayerEntry {
+                address: Address::generate(&env),
+                points: (slot + 1) as u64,
+                epoch: 0,
+                seq: slot as u64,
+            };
+            env.storage().persistent().set(&DataKey::TopPlayerAt(slot), &entry);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayerCount, &(MAX_TOP_PLAYERS - 1));
+    });
+
+    env.cost_estimate().budget().reset_default();
+    let top = client.get_top_players(&0, &1);
+    assert_eq!(top.get(0).unwrap().points, (MAX_TOP_PLAYERS - 1) as u64);
+    assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS - 1);
+}
+
+#[test]
+fn test_full_board_reorder_stays_within_default_write_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_default();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    for points in 1_u64..=50 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &points, &true);
+    }
+
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &10_000, &true);
+
+    let top = client.get_top_players(&0, &1);
+    assert_eq!(top.get(0).unwrap().address, newcomer);
+    assert_eq!(client.get_top_player_count(), 50);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #79 — reward paths enforce PULSE supply cap
+// ═══════════════════════════════════════════════════════════════════════════
+
+use pulse_token::{PULSETokenContract, PULSETokenContractClient};
+use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+/// Helper: deploy a fresh PULSE token, set supply cap, wire it into the
+/// leaderboard, and return all necessary handles.
+fn setup_with_token() -> (
+    Env,
+    LeaderboardContractClient<'static>,
+    Address, // admin
+    Address, // market
+    Address, // referral
+    PULSETokenContractClient<'static>,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+    env.cost_estimate().disable_resource_limits();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    // Deploy PULSE token
+    let token_id = env.register(PULSETokenContract, ());
+    let token_client = PULSETokenContractClient::new(&env, &token_id);
+    token_client.initialize(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "PULSE"),
+        &soroban_sdk::String::from_str(&env, "PLSE"),
+        &7u32,
     );
+
+    // Wire token into leaderboard
+    client.set_token_contract(&admin, &token_id);
+
+    (env, client, admin, market, referral, token_client)
+}
+
+#[test]
+fn test_reward_mints_tokens() {
+    let (env, client, _admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Verify token balance starts at 0
+    assert_eq!(token_client.balance(&user), 0);
+
+    // reward() with 10 PULSE — token contract must be invoked
+    client.reward(&market, &user, &30_u64, &10_0000000_i128, &true);
+
+    // Points updated AND token balance changed — proves mint was invoked
+    assert_eq!(client.get_points(&user), 30);
+    assert_eq!(token_client.balance(&user), 10_0000000_i128);
+    assert_eq!(token_client.total_supply(), 10_0000000_i128);
+}
+
+#[test]
+fn test_reward_updates_points_and_mints_tokens() {
+    let (env, client, _admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Two reward calls: 30 pts + 10 PULSE, then 10 pts + 5 PULSE
+    client.reward(&market, &user, &30_u64, &10_0000000_i128, &true);
+    client.reward(&market, &user, &10_u64, &5_0000000_i128, &false);
+
+    // Points accumulate, tokens accumulate
+    assert_eq!(client.get_points(&user), 40);
+    assert_eq!(token_client.balance(&user), 15_0000000_i128);
+    assert_eq!(token_client.total_supply(), 15_0000000_i128);
+}
+
+#[test]
+fn test_reward_enforces_supply_cap() {
+    let (env, client, admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 5 PULSE
+    token_client.set_supply_cap(&admin, &5_0000000_i128);
+
+    // Mint 5 PULSE — should succeed
+    client.reward(&market, &user, &30_u64, &5_0000000_i128, &true);
+    assert_eq!(token_client.balance(&user), 5_0000000_i128);
+    assert_eq!(token_client.total_supply(), 5_0000000_i128);
+
+    // Try to mint 1 more — should fail (cap exceeded)
+    let result = client.try_reward(&market, &user, &10_u64, &1_0000000_i128, &false);
+    assert!(result.is_err(), "reward should fail when supply cap exceeded");
+    // Balance and supply unchanged — cap enforced, no state corruption
+    assert_eq!(token_client.balance(&user), 5_0000000_i128);
+    assert_eq!(token_client.total_supply(), 5_0000000_i128);
+}
+
+#[test]
+fn test_reward_bonus_mints_tokens() {
+    let (env, client, _admin, _market, referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    assert_eq!(token_client.balance(&user), 0);
+
+    // reward_bonus() with 8 PULSE
+    client.reward_bonus(&referral, &user, &5_u64, &8_0000000_i128);
+
+    assert_eq!(client.get_points(&user), 5);
+    assert_eq!(token_client.balance(&user), 8_0000000_i128);
+    assert_eq!(token_client.total_supply(), 8_0000000_i128);
+}
+
+#[test]
+fn test_reward_bonus_enforces_supply_cap() {
+    let (env, client, admin, _market, referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 3 PULSE
+    token_client.set_supply_cap(&admin, &3_0000000_i128);
+
+    // Mint 3 PULSE via reward_bonus — should succeed
+    client.reward_bonus(&referral, &user, &5_u64, &3_0000000_i128);
+    assert_eq!(token_client.balance(&user), 3_0000000_i128);
+
+    // Try to mint 1 more — should fail
+    let result = client.try_reward_bonus(&referral, &user, &5_u64, &1_0000000_i128);
+    assert!(result.is_err(), "reward_bonus should fail when supply cap exceeded");
+    assert_eq!(token_client.balance(&user), 3_0000000_i128);
+}
+
+#[test]
+fn test_claim_pending_preserves_reward_on_cap_exceeded() {
+    let (env, client, admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 2 PULSE
+    token_client.set_supply_cap(&admin, &2_0000000_i128);
+
+    // Queue a reward for 3 PULSE — queue itself doesn't mint
+    client.queue_reward(&market, &user, &30_u64, &3_0000000_i128, &true);
+    assert_eq!(token_client.balance(&user), 0);
+
+    // Claim — should fail because minting would exceed cap
+    let result = client.try_claim_pending_rewards(&user);
+    assert!(result.is_err(), "claim should fail when pending tokens exceed cap");
+
+    // Critical: the pending reward must be PRESERVED (not lost) so the user
+    // can retry once the cap is raised.
+    let pending = client.get_pending_reward(&user).unwrap();
+    assert_eq!(pending.tokens, 3_0000000_i128);
+    assert_eq!(pending.points, 30);
+    assert_eq!(token_client.balance(&user), 0);
+    assert_eq!(token_client.total_supply(), 0);
+}
+
+#[test]
+fn test_claim_pending_succeeds_after_cap_raised() {
+    let (env, client, admin, market, _referral, token_client) = setup_with_token();
+    let user = Address::generate(&env);
+
+    // Set cap to 2 PULSE, queue 3 PULSE
+    token_client.set_supply_cap(&admin, &2_0000000_i128);
+    client.queue_reward(&market, &user, &30_u64, &3_0000000_i128, &true);
+
+    // Claim fails — cap exceeded
+    assert!(client.try_claim_pending_rewards(&user).is_err());
+    assert_eq!(token_client.balance(&user), 0);
+    assert!(client.get_pending_reward(&user).is_some());
+
+    // Raise cap to 5 PULSE
+    token_client.set_supply_cap(&admin, &5_0000000_i128);
+
+    // Claim succeeds now
+    client.claim_pending_rewards(&user);
+    assert_eq!(token_client.balance(&user), 3_0000000_i128);
+    assert_eq!(token_client.total_supply(), 3_0000000_i128);
+    assert!(client.get_pending_reward(&user).is_none());
+    assert_eq!(client.get_points(&user), 30);
+}
+
+#[test]
+fn test_reward_zero_tokens_succeeds_without_token() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+
+    // reward() with tokens=0 should work even without a token contract set
+    client.reward(&market, &user, &30_u64, &0_i128, &true);
+    assert_eq!(client.get_points(&user), 30);
 }

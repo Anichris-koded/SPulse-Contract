@@ -173,7 +173,6 @@ pub enum DataKey {
     BettorAt(u64, u32),
     Resolver(Address),
     FeeRecipient(Address),
-    HasReferrer(Address),
     RateWindowSeq, // (u32 window_start_seq, u32 count) — ledger-sequence anchored (issue #56)
     // ── Settlement-time payouts (issue #2) ───────────────────────────────
     Payout(u64, Address), // i128 — exact payout computed at resolve time
@@ -1895,7 +1894,15 @@ impl PredictionMarketContract {
         if !env.storage().persistent().has(&key) {
             return 0;
         }
-        env.storage().persistent().get_ttl(&key)
+        #[cfg(any(test, feature = "testutils"))]
+        {
+            use soroban_sdk::testutils::storage::Persistent as _;
+            env.storage().persistent().get_ttl(&key)
+        }
+        #[cfg(not(any(test, feature = "testutils")))]
+        {
+            TTL_BUMP
+        }
     }
 
     /// Permissionless keeper: anyone may pay to extend this market's

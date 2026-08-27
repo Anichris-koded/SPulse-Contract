@@ -62,7 +62,6 @@
     [],
     [],
     [],
-    [],
     []
   ],
   "ledger": {
@@ -98,14 +97,6 @@
                   {
                     "key": {
                       "symbol": "bonus_bets"
-                    },
-                    "val": {
-                      "u32": 0
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "epoch"
                     },
                     "val": {
                       "u32": 0
@@ -153,16 +144,16 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "TopPlayerSeqAt"
+                    "symbol": "StatsEpoch"
                   },
                   {
-                    "u32": 0
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "u64": "1"
+                "u32": 0
               }
             }
           },
@@ -267,6 +258,18 @@
                       },
                       "val": {
                         "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TopPlayersMigrated"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": true
                       }
                     }
                   ]

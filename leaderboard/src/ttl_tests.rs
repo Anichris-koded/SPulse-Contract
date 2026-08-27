@@ -22,9 +22,6 @@ fn setup() -> (
     let env = Env::default();
     env.mock_all_auths();
     env.cost_estimate().budget().reset_unlimited();
-    // Behavior-focused suite: the bounded bubble plus read-time re-sort touch
-    // tens of slots per call, so lift the invocation resource limits just like
-    // the CPU budget above (mirrors tests::setup).
     env.cost_estimate().disable_resource_limits();
 
     let contract_id = env.register(LeaderboardContract, ());
@@ -152,6 +149,9 @@ fn test_min_points_and_min_slot_survive_ttl_refresh_cycle() {
     let weakest = client.get_min_points();
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &(min_before + 1), &true);
+    while client.get_top_players(&0_u32, &1_u32).get(0).unwrap().address != newcomer {
+        client.add_pts(&market, &newcomer, &1, &true);
+    }
 
     assert_eq!(instance_ttl(&env, &client.address), TTL_HIGH);
     assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);

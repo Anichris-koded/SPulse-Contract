@@ -26,9 +26,6 @@ fn setup() -> (
     let env = Env::default();
     env.mock_all_auths();
     env.cost_estimate().budget().reset_unlimited();
-    // Behavior-focused suite: the bounded bubble plus read-time re-sort touch
-    // tens of slots per call, so lift the invocation resource limits just like
-    // the CPU budget above (mirrors tests::setup).
     env.cost_estimate().disable_resource_limits();
 
     let contract_id = env.register(LeaderboardContract, ());

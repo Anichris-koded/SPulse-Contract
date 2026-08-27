@@ -263,8 +263,7 @@ fn test_eviction_replaces_lowest_when_full() {
 
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &500_u64, &true);
-    // Under Soroban write limit (MAX_SHIFT_SLOTS = 19), jumping across 49 slots
-    // settles across subsequent writes to reach #1
+    // A full-board reorder is completed in one bounded vector write.
     while client.get_top_players(&0_u32, &1_u32).get(0).unwrap().address != newcomer {
         client.add_pts(&market, &newcomer, &1_u64, &true);
     }
@@ -951,7 +950,7 @@ fn test_full_leaderboard_gas_usage() {
     }
 
     // Evict the weakest player (score 10 at slot 49) with a newcomer of score 155
-    // (bubbles 14 slots within MAX_SHIFT_SLOTS = 19 write bound)
+    // (the newcomer moves from the tail to its sorted position in one write)
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &155, &true);
 
@@ -992,14 +991,15 @@ fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
     client.add_pts(&market, &u3, &10, &true); // u3 = 10 -> slot 2
     client.add_pts(&market, &u4, &100, &true); // u4 = 100 -> bubbles to slot 0
 
-    // Directly inspect persistent storage (DataKey::TopPlayerAt) WITHOUT calling get_top_players!
-    // This proves the storage slots THEMSELVES are pre-sorted at write time:
+    // Inspect the single persistent ordered index without calling get_top_players.
     let contract_id = client.address.clone();
     env.as_contract(&contract_id, || {
-        let slot0: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(0)).expect("slot 0");
-        let slot1: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(1)).expect("slot 1");
-        let slot2: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(2)).expect("slot 2");
-        let slot3: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(3)).expect("slot 3");
+        let bytes: soroban_sdk::Bytes = env.storage().instance().get(&DataKey::TopPlayers).unwrap();
+        let slots: soroban_sdk::Vec<PlayerEntry> = soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
+        let slot0 = slots.get(0).unwrap();
+        let slot1 = slots.get(1).unwrap();
+        let slot2 = slots.get(2).unwrap();
+        let slot3 = slots.get(3).unwrap();
 
         assert_eq!(slot0.address, u4, "Slot 0 in persistent storage must be u4 (100 pts)");
         assert_eq!(slot0.points, 100);
@@ -1010,21 +1010,17 @@ fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
         assert_eq!(slot3.address, u3, "Slot 3 in persistent storage must be u3 (10 pts)");
         assert_eq!(slot3.points, 10);
 
-        // Verify reverse lookup keys TopPlayerSlot match exact slots in storage
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone())).unwrap(), 0);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone())).unwrap(), 1);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone())).unwrap(), 2);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone())).unwrap(), 3);
     });
 
     // 2. Now boost u3 by +150 (total 160) -> write-time bubble_up must reorder storage
     client.add_pts(&market, &u3, &150, &true);
 
     env.as_contract(&contract_id, || {
-        let slot0: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(0)).unwrap();
-        let slot1: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(1)).unwrap();
-        let slot2: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(2)).unwrap();
-        let slot3: PlayerEntry = env.storage().persistent().get(&DataKey::TopPlayerAt(3)).unwrap();
+        let slots: soroban_sdk::Vec<PlayerEntry> = env.storage().persistent().get(&DataKey::TopPlayers).unwrap();
+        let slot0 = slots.get(0).unwrap();
+        let slot1 = slots.get(1).unwrap();
+        let slot2 = slots.get(2).unwrap();
+        let slot3 = slots.get(3).unwrap();
 
         assert_eq!(slot0.address, u3, "Slot 0 in storage must now be u3 (160 pts)");
         assert_eq!(slot0.points, 160);
@@ -1034,11 +1030,6 @@ fn test_storage_slots_are_presorted_at_write_time_without_read_sorting() {
         assert_eq!(slot2.points, 50);
         assert_eq!(slot3.address, u1, "Slot 3 in storage must now be u1 (20 pts)");
         assert_eq!(slot3.points, 20);
-
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u3.clone())).unwrap(), 0);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u4.clone())).unwrap(), 1);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u2.clone())).unwrap(), 2);
-        assert_eq!(env.storage().persistent().get::<_, u32>(&DataKey::TopPlayerSlot(u1.clone())).unwrap(), 3);
     });
 
     // 3. get_top_players merely reads these pre-sorted slots with no on-read sorting
@@ -1167,9 +1158,7 @@ fn test_get_top_players_returns_sorted_without_triggering_migration() {
 }
 
 /// Verifies that a worst-case upsert (full list eviction + entry shifting
-/// MAX_SHIFT_SLOTS steps toward slot 0) remains within Soroban's write budget.
-/// The Soroban default is 40 ledger entry write operations for persistent storage.
-/// With MAX_SHIFT_SLOTS=19: 19 shifts × 2 + 2 = 40 persistent ledger writes.
+/// from the tail to the top remains within Soroban's default write budget.
 #[test]
 fn test_upsert_top_eviction_write_budget_is_bounded() {
     let (env, client, _admin, market, _referral) = setup();
@@ -1217,10 +1206,7 @@ fn test_upsert_top_under_default_resource_limits() {
         client.add_pts(&market, &u, &(i * 10), &true);
     }
 
-    // Shift within MAX_SHIFT_SLOTS = 19 under real Soroban constraints:
-    // Minimum is 10 at slot 19. Newcomer with 105 evicts 10 and shifts 9 slots (slot 19 -> 10).
-    // This writes 9*2 + 2 = 20 persistent entries, strictly within Soroban's 40 write limit
-    // and well within the 100 total ledger footprint limit.
+    // The ordered vector update remains within the default resource limits.
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &105, &true);
 
@@ -1273,6 +1259,70 @@ fn test_get_top_players_automatically_migrates_under_default_limits() {
     assert_eq!(top.get(1).unwrap().points, 45);
     assert_eq!(top.get(2).unwrap().address, u1);
     assert_eq!(top.get(2).unwrap().points, 15);
+}
+
+#[test]
+fn test_full_legacy_migration_fits_default_write_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Build the legacy fixture outside invocation limits; reset them before
+    // exercising the migration itself.
+    env.cost_estimate().budget().reset_unlimited();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&DataKey::TopPlayersMigrated);
+        env.storage().instance().remove(&DataKey::TopPlayers);
+        for slot in 0..(MAX_TOP_PLAYERS - 1) {
+            let entry = PlayerEntry {
+                address: Address::generate(&env),
+                points: (slot + 1) as u64,
+                epoch: 0,
+                seq: slot as u64,
+            };
+            env.storage().persistent().set(&DataKey::TopPlayerAt(slot), &entry);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayerCount, &(MAX_TOP_PLAYERS - 1));
+    });
+
+    env.cost_estimate().budget().reset_default();
+    let top = client.get_top_players(&0, &1);
+    assert_eq!(top.get(0).unwrap().points, (MAX_TOP_PLAYERS - 1) as u64);
+    assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS - 1);
+}
+
+#[test]
+fn test_full_board_reorder_stays_within_default_write_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_default();
+
+    let contract_id = env.register(LeaderboardContract, ());
+    let client = LeaderboardContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let market = Address::generate(&env);
+    let referral = Address::generate(&env);
+    client.initialize(&admin, &market, &referral);
+
+    for points in 1_u64..=50 {
+        let user = Address::generate(&env);
+        client.add_pts(&market, &user, &points, &true);
+    }
+
+    let newcomer = Address::generate(&env);
+    client.add_pts(&market, &newcomer, &10_000, &true);
+
+    let top = client.get_top_players(&0, &1);
+    assert_eq!(top.get(0).unwrap().address, newcomer);
+    assert_eq!(client.get_top_player_count(), 50);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

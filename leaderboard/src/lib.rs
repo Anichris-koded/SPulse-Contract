@@ -1,8 +1,9 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Val,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, vec, Address, Bytes, Env, IntoVal,
+    Symbol, Val, Vec,
+    xdr::{FromXdr, ToXdr},
 };
 
 pub const MAX_TOP_PLAYERS: u32 = 50;
@@ -30,14 +31,6 @@ const DECAY_RETAIN_DEN: u64 = 10;
 /// Past this many idle periods a score floors to zero. Derived from TTL_HIGH:
 /// a score cannot outlive the entry holding it, and this bounds the decay loop.
 const DECAY_ZERO_AFTER_PERIODS: u32 = TTL_HIGH / DECAY_PERIOD_LEDGERS;
-
-/// Maximum slots the single-pass shift in `bubble_up` may move an entry per
-/// write. Capped at 19 so that a worst-case shift performs at most
-/// 19 shifts × 2 keys + 2 keys for entry = 40 persistent ledger writes,
-/// strictly respecting Soroban's default limit of 40 persistent ledger writes
-/// per transaction (issue #61).
-/// An entry that needs more than 19 steps settles on subsequent writes.
-const MAX_SHIFT_SLOTS: u32 = 19;
 
 // Issue #84: bump whenever a function signature, argument order, or return
 // type that a caller relies on changes.
@@ -74,6 +67,7 @@ pub enum DataKey {
     TokenContract,
     Stats(Address),
     TopPlayerAt(u32),
+    TopPlayers, // instance Bytes containing XDR-encoded ordered Vec<PlayerEntry>
     TopPlayerCount,
     TopPlayerSlot(Address),
     TopPlayersMigrated, // bool — one-shot migration of legacy unsorted leaderboard slots
@@ -181,6 +175,10 @@ impl LeaderboardContract {
             .instance()
             .set(&DataKey::ReferralContract, &referral_contract);
         env.storage().instance().set(&DataKey::TopPlayerCount, &0_u32);
+        let empty_entries: Vec<PlayerEntry> = Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayers, &empty_entries.to_xdr(&env));
         env.storage().instance().set(&DataKey::MinPoints, &0_u64);
         env.storage().instance().set(&DataKey::MinSlot, &0_u32);
         env.storage()
@@ -461,6 +459,7 @@ impl LeaderboardContract {
     /// outside the list get `UNRANKED_RANK` (MAX_TOP_PLAYERS + 1), never 0.
     pub fn get_rank(env: Env, user: Address) -> u32 {
         let _ = Self::ensure_migrated(&env);
+        let entries = Self::ordered_entries(&env);
         let Some((slot, entry)) = Self::top_slot_entry(&env, &user) else {
             return UNRANKED_RANK;
         };
@@ -471,7 +470,7 @@ impl LeaderboardContract {
             if i == slot {
                 continue;
             }
-            if let Some(e) = Self::forward_entry(&env, i) {
+            if let Some(e) = entries.get(i) {
                 if Self::entry_points_now(&env, &e) > mine {
                     rank += 1;
                 }
@@ -490,8 +489,8 @@ impl LeaderboardContract {
     }
 
     /// Page of the top list. The persistent index is kept in descending order
-    /// by `upsert_top` (write-time single-pass shift capped at `MAX_SHIFT_SLOTS`,
-    /// issue #61), so this function reads directly from pre-sorted slots —
+    /// by `upsert_top` (write-time ordered-index update, issue #61), so this
+    /// function reads directly from pre-sorted slots —
     /// **O(page_size), zero Vec rebuilds, zero on-read sorting**.
     ///
     pub fn get_top_players(env: Env, offset: u32, page_size: u32) -> Vec<PlayerEntry> {
@@ -503,10 +502,11 @@ impl LeaderboardContract {
         let page_size = page_size.min(MAX_PAGE_SIZE);
         let end = (offset + page_size).min(count);
         let now = Self::current_epoch(&env);
+        let entries = Self::ordered_entries(&env);
 
         let mut result: Vec<PlayerEntry> = Vec::new(&env);
         for i in offset..end {
-            if let Some(mut entry) = Self::forward_entry(&env, i) {
+            if let Some(mut entry) = entries.get(i) {
                 // Materialise the decayed score for the caller without writing
                 // it back — the next accrual does that.
                 entry.points = Self::entry_points_now(&env, &entry);
@@ -521,7 +521,7 @@ impl LeaderboardContract {
     pub fn get_min_points(env: Env) -> u64 {
         let _ = Self::ensure_migrated(&env);
         let slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(0);
-        match Self::forward_entry(&env, slot) {
+        match Self::ordered_entries(&env).get(slot) {
             Some(entry) => Self::entry_points_now(&env, &entry),
             None => env
                 .storage()
@@ -532,6 +532,7 @@ impl LeaderboardContract {
     }
 
     pub fn get_min_slot(env: Env) -> u32 {
+        let _ = Self::ensure_migrated(&env);
         env.storage()
             .instance()
             .get(&DataKey::MinSlot)
@@ -1020,17 +1021,37 @@ impl LeaderboardContract {
     }
 
     fn forward_entry(env: &Env, slot: u32) -> Option<PlayerEntry> {
+        if let Some(bytes) = env.storage().instance().get::<_, Bytes>(&DataKey::TopPlayers) {
+            if let Ok(entries) = Vec::<PlayerEntry>::from_xdr(env, &bytes) {
+                return entries.get(slot);
+            }
+        }
         env.storage().persistent().get(&DataKey::TopPlayerAt(slot))
+    }
+
+    fn ordered_entries(env: &Env) -> Vec<PlayerEntry> {
+        env.storage()
+            .instance()
+            .get::<_, Bytes>(&DataKey::TopPlayers)
+            .and_then(|bytes| Vec::from_xdr(env, &bytes).ok())
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn save_ordered_entries(env: &Env, entries: &Vec<PlayerEntry>) {
+        let key = DataKey::TopPlayers;
+        env.storage().instance().set(&key, &entries.clone().to_xdr(env));
+        env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
     }
 
     /// Write `TopPlayerAt(slot)` and `TopPlayerSlot(address)` together, and
     /// bump both TTLs. This is the only way the two keys are created/updated.
     fn set_top_slot(env: &Env, slot: u32, entry: &PlayerEntry) {
-        let at_key = DataKey::TopPlayerAt(slot);
-        env.storage().persistent().set(&at_key, entry);
-        env.storage()
-            .persistent()
-            .extend_ttl(&at_key, TTL_BUMP, TTL_HIGH);
+        let mut entries = Self::ordered_entries(env);
+        while entries.len() <= slot {
+            entries.push_back(entry.clone());
+        }
+        entries.set(slot, entry.clone());
+        Self::save_ordered_entries(env, &entries);
         let slot_key = DataKey::TopPlayerSlot(entry.address.clone());
         env.storage().persistent().set(&slot_key, &slot);
         env.storage()
@@ -1046,9 +1067,15 @@ impl LeaderboardContract {
                 .persistent()
                 .remove(&DataKey::TopPlayerSlot(old.address));
         }
-        env.storage()
-            .persistent()
-            .remove(&DataKey::TopPlayerAt(slot));
+        let mut entries = Self::ordered_entries(env);
+        if slot < entries.len() {
+            entries.remove(slot);
+            Self::save_ordered_entries(env, &entries);
+        } else {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TopPlayerAt(slot));
+        }
     }
 
     /// Resolve a user's slot only if the reverse lookup is consistent with the
@@ -1056,12 +1083,13 @@ impl LeaderboardContract {
     /// missing, scan the forward index to recover from `TopPlayerSlot` TTL
     /// expiry (avoids inserting a duplicate).
     fn resolved_slot(env: &Env, user: &Address, count: u32) -> Option<u32> {
+        let entries = Self::ordered_entries(env);
         if let Some(slot) = env
             .storage()
             .persistent()
             .get::<_, u32>(&DataKey::TopPlayerSlot(user.clone()))
         {
-            match Self::forward_entry(env, slot) {
+            match entries.get(slot) {
                 Some(entry) if entry.address == *user => return Some(slot),
                 _ => {
                     env.storage()
@@ -1071,7 +1099,7 @@ impl LeaderboardContract {
             }
         }
         for i in 0..count {
-            if let Some(entry) = Self::forward_entry(env, i) {
+            if let Some(entry) = entries.get(i) {
                 if entry.address == *user {
                     Self::set_top_slot(env, i, &entry);
                     return Some(i);
@@ -1083,12 +1111,13 @@ impl LeaderboardContract {
 
     /// Like `resolved_slot`, but returns the full entry as well.
     fn top_slot_entry(env: &Env, user: &Address) -> Option<(u32, PlayerEntry)> {
+        let entries = Self::ordered_entries(env);
         if let Some(slot) = env
             .storage()
             .persistent()
             .get::<_, u32>(&DataKey::TopPlayerSlot(user.clone()))
         {
-            match Self::forward_entry(env, slot) {
+            match entries.get(slot) {
                 Some(entry) if entry.address == *user => return Some((slot, entry)),
                 _ => {
                     env.storage()
@@ -1099,7 +1128,7 @@ impl LeaderboardContract {
         }
         let count = Self::top_count(env);
         for i in 0..count {
-            if let Some(entry) = Self::forward_entry(env, i) {
+            if let Some(entry) = entries.get(i) {
                 if entry.address == *user {
                     Self::set_top_slot(env, i, &entry);
                     return Some((i, entry));
@@ -1120,21 +1149,14 @@ impl LeaderboardContract {
     fn repair_top_index(env: &Env) -> u32 {
         let count = Self::top_count(env);
         let mut write: u32 = 0;
+        let mut entries = Vec::new(env);
         for read in 0..count {
             if let Some(entry) = Self::forward_entry(env, read) {
-                Self::set_top_slot(env, write, &entry);
-                if write != read {
-                    env.storage()
-                        .persistent()
-                        .remove(&DataKey::TopPlayerAt(read));
-                }
+                entries.push_back(entry);
                 write += 1;
-            } else {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::TopPlayerAt(read));
             }
         }
+        Self::save_ordered_entries(env, &entries);
         env.storage()
             .instance()
             .set(&DataKey::TopPlayerCount, &write);
@@ -1200,51 +1222,30 @@ impl LeaderboardContract {
     }
 
 
-    /// Moves `entry` (currently at `slot`) upward until the list is descending
-    /// again, comparing decayed point values (issue #69).
-    ///
-    /// **Write budget:** uses a single-pass shift instead of pairwise swaps so
-    /// each affected slot is written exactly ONCE. Bounded by `MAX_SHIFT_SLOTS`:
-    ///   shift_len × 2 keys + 2 keys for entry = (MAX_SHIFT_SLOTS + 1) × 2 ≤ 48
-    /// persistent writes per call, leaving headroom for the 1 eviction-removal
-    /// write in `upsert_top` for a total of ≤ 49 persistent writes.
+    /// Moves `entry` into its sorted position. The whole bounded top list is
+    /// persisted as one ledger value, so a full-board reorder stays within the
+    /// persistent-write limit regardless of the distance moved.
     fn bubble_up(env: &Env, entry: &PlayerEntry, slot: u32) {
-        if slot == 0 {
+        let mut entries = Self::ordered_entries(env);
+        if slot >= entries.len() {
             return;
         }
-        let now_entry = Self::entry_points_now(env, entry);
-
-        // Read-only pass: find target insertion position, bounded by MAX_SHIFT_SLOTS.
-        let mut target_slot = slot;
-        let mut steps = 0u32;
-        while target_slot > 0 && steps < MAX_SHIFT_SLOTS {
-            let prev_slot = target_slot - 1;
-            match Self::forward_entry(env, prev_slot) {
-                Some(prev) if Self::entry_points_now(env, &prev) < now_entry => {
-                    target_slot = prev_slot;
-                    steps += 1;
-                }
-                _ => break,
+        entries.set(slot, entry.clone());
+        let mut target = slot;
+        let points = Self::entry_points_now(env, entry);
+        while target > 0 {
+            let previous = entries.get(target - 1).unwrap();
+            if Self::entry_points_now(env, &previous) >= points {
+                break;
             }
+            target -= 1;
         }
-
-        if target_slot == slot {
-            return; // already in the right position — no writes needed
+        if target != slot {
+            let moved = entries.get(slot).unwrap();
+            entries.remove(slot);
+            entries.insert(target, moved);
         }
-
-        // Write pass: shift `target_slot..slot` down by 1, each slot written once.
-        let mut s = slot;
-        while s > target_slot {
-            let from_slot = s - 1;
-            if let Some(e) = Self::forward_entry(env, from_slot) {
-                // Update the reverse index along with each shifted forward entry.
-                Self::set_top_slot(env, s, &e);
-            }
-            s -= 1;
-        }
-
-        // Write the entry into its final position.
-        Self::set_top_slot(env, target_slot, entry);
+        Self::save_ordered_entries(env, &entries);
     }
 
     // ── Migration (issue #61) ──────────────────────────────────────────────────
@@ -1291,11 +1292,8 @@ impl LeaderboardContract {
             }
         }
 
-        // Write back pre-sorted slots and rebuild reverse lookups
-        for i in 0..n {
-            let entry = entries.get(i).unwrap();
-            Self::set_top_slot(env, i, &entry);
-        }
+        // Persist the complete sorted index as one bounded ledger write.
+        Self::save_ordered_entries(env, &entries);
 
         env.storage().instance().set(&DataKey::TopPlayerCount, &n);
         env.storage().instance().set(&DataKey::TopPlayersMigrated, &true);
@@ -1309,10 +1307,10 @@ impl LeaderboardContract {
     /// so `get_top_players` reads pre-sorted slots in O(page_size) with no
     /// on-read sorting (issue #61).
     ///
-    /// **Write budget** (persistent writes bounded by `MAX_SHIFT_SLOTS = 19`):
-    /// - At most 19 shifted slots × 2 keys + 2 keys for entry = 40 persistent writes,
-    ///   strictly conforming to Soroban's default limit of 40 persistent ledger writes.
+    /// **Write budget:** the complete bounded top list is persisted as one
+    /// persistent value, so reorder distance does not increase ledger writes.
     fn upsert_top(env: &Env, user: Address, new_points: u64) {
+        let _ = Self::ensure_migrated(env);
         let count = Self::ensure_consistent(env, Self::top_count(env));
 
         // ── Path A: player already in the top list ────────────────────────────
@@ -1322,7 +1320,7 @@ impl LeaderboardContract {
             // Write the updated entry in place, then shift it up if needed.
             // bubble_up re-writes the slot only if it actually moves.
             Self::set_top_slot(env, slot, &entry);  // 2 writes
-            Self::bubble_up(env, &entry, slot);      // ≤ MAX_SHIFT_SLOTS×2 + 2 writes
+            Self::bubble_up(env, &entry, slot);
             Self::recompute_min(env);                // 2 instance writes (not persistent)
             return;
         }
@@ -1340,7 +1338,7 @@ impl LeaderboardContract {
             env.storage()                                        // 1 instance write
                 .instance()
                 .set(&DataKey::TopPlayerCount, &(slot + 1));
-            Self::bubble_up(env, &entry, slot);                  // ≤ MAX_SHIFT_SLOTS×2+2 writes
+            Self::bubble_up(env, &entry, slot);
             if slot + 1 == MAX_TOP_PLAYERS {
                 Self::recompute_min(env);                        // 2 instance writes
             }
@@ -1349,11 +1347,12 @@ impl LeaderboardContract {
 
         // ── Path C: list full — evict weakest, place new entry at its slot ────
         //
-        // Recompute the true minimum because a capped bubble may leave the
-        // weakest entry away from the tail. Replace that slot in place and let
+        // Recompute the true minimum because decay can leave the weakest entry
+        // away from the tail. Replace that slot in place and let
         // `bubble_up` move the new entry toward its best available position.
         //
-        // Write budget:  1 (evict reverse) + 2 (new at tail) + ≤ MAX_SHIFT_SLOTS×2 = ≤ 49.
+        // The ordered vector keeps this replacement within a constant number
+        // of persistent writes, even when the minimum is far from the tail.
         Self::recompute_min(env);  // instance-only writes; sets MinSlot = count-1 when sorted
         let min_slot: u32 = env.storage().instance().get(&DataKey::MinSlot).unwrap_or(count - 1);
         let Some(min_entry) = Self::forward_entry(env, min_slot) else {
@@ -1380,7 +1379,7 @@ impl LeaderboardContract {
             seq: Self::next_seq(env),
         };
         Self::set_top_slot(env, min_slot, &new_entry); // 2 writes
-        Self::bubble_up(env, &new_entry, min_slot);    // ≤ MAX_SHIFT_SLOTS×2+2 writes
+        Self::bubble_up(env, &new_entry, min_slot);
         Self::recompute_min(env);                      // 2 instance writes
     }
 }

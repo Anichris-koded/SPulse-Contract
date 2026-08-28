@@ -1004,9 +1004,17 @@ impl PredictionMarketContract {
         xlm.transfer(&user, &this, &amount);
 
         // ── Referral (live lookup — no stale cache) ───────────────────────
+        // referral_registry.credit() fully disposes of referral_fee itself:
+        // it pays a registered referrer, or (issue #99 redesign) refunds an
+        // unregistered bettor directly. Either way the XLM has already left
+        // this contract for good by the time credit() returns — there is
+        // nothing left here for the market to claim as its own earned fees.
+        // (Crediting it to market fees on a false return, like an earlier
+        // version of this code did, recorded a phantom fee no longer backed
+        // by any real balance.)
         Self::require_compatible_referral(&env, &cfg.referral)?;
         xlm.transfer(&this, &cfg.referral, &referral_fee);
-        let paid_referrer: bool = env.invoke_contract(
+        let _paid_referrer: bool = env.invoke_contract(
             &cfg.referral,
             &Symbol::new(&env, "credit"),
             vec![
@@ -1016,11 +1024,6 @@ impl PredictionMarketContract {
                 referral_fee.into_val(&env),
             ],
         );
-        if !paid_referrer {
-            // credit() returned the fee: the market keeps it, so it counts as
-            // genuine earned fees for this market.
-            Self::credit_market_fees(&env, market_id, referral_fee);
-        }
 
         // ── Release reentrancy lock ──────────────────────────────────────
         env.storage().persistent().remove(&lock_key);
@@ -1067,16 +1070,6 @@ impl PredictionMarketContract {
             return Err(MarketError::MarketExpired);
         }
 
-        let cfg: Config = env.storage().instance().get(&DataKey::Cfg).unwrap();
-
-        // Live referral lookup: only users whose referral fee was actually
-        // retained (no registered referrer) get that share back on reduction.
-        let has_referrer: bool = env.invoke_contract(
-            &cfg.referral,
-            &Symbol::new(&env, "has_referrer"),
-            vec![&env, user.clone().into_val(&env)],
-        );
-
         let bet_key = DataKey::Bet(market_id, user.clone());
         let mut entry: BetEntry = env
             .storage()
@@ -1088,11 +1081,14 @@ impl PredictionMarketContract {
         }
 
         // Decompose exactly like place_bet so partial reductions stay integral.
+        // referral_registry.credit() (called from place_bet) fully disposes
+        // of the referral share (amount - net_part - plat_part) at bet time
+        // -- pays a registered referrer, or refunds the bettor directly if
+        // unregistered. The market never retains it either way, so it's
+        // never part of this refund.
         let net_part = amount * NET_NUMERATOR / BPS_DENOM;
         let plat_part = amount * PLATFORM_FEE_BPS / BPS_DENOM;
-        let ref_part = amount - net_part - plat_part;
-
-        let refund = net_part + plat_part + if has_referrer { 0 } else { ref_part };
+        let refund = net_part + plat_part;
 
         // Determine which side to reduce from.
         let is_yes = entry.net_yes >= entry.net_no;
@@ -1106,10 +1102,9 @@ impl PredictionMarketContract {
         *dominated_net -= net_part;
         entry.gross -= amount;
 
-        // The released fee share (platform + retained referral) leaves this
-        // market's provenance ledger and the global accumulator (#4/#57).
-        let released = plat_part + if has_referrer { 0 } else { ref_part };
-        Self::debit_market_fees(&env, market_id, released);
+        // The released fee share (platform only -- see refund above) leaves
+        // this market's provenance ledger and the global accumulator (#4/#57).
+        Self::debit_market_fees(&env, market_id, plat_part);
 
         if is_yes {
             market.total_yes -= net_part;
@@ -1474,6 +1469,12 @@ impl PredictionMarketContract {
         let gross = entry.gross;
         let net_yes = entry.net_yes;
         let net_no = entry.net_no;
+        // place_bet always sends the referral share of gross out of this
+        // contract at bet time (to a referrer, or refunded to this same
+        // bettor by referral_registry directly) -- gross alone overstates
+        // what this contract still physically holds. Refund net + platform
+        // only, recomputing platform's share the same way place_bet did.
+        let refund = net_yes + net_no + (gross * PLATFORM_FEE_BPS / BPS_DENOM);
         // Issue #58: zero both gross (idempotency guard) and nets so that
         // get_bet no longer reports a staked amount after the refund.
         entry.gross = 0;
@@ -1502,12 +1503,14 @@ impl PredictionMarketContract {
         token::Client::new(&env, &cfg.xlm_sac).transfer(
             &env.current_contract_address(),
             &user,
-            &gross,
+            &refund,
         );
 
-        env.events()
-            .publish((Symbol::new(&env, "cancel_refund"), user, market_id), gross);
-        Ok(gross)
+        env.events().publish(
+            (Symbol::new(&env, "cancel_refund"), user, market_id),
+            refund,
+        );
+        Ok(refund)
     }
 
     // ── Claim ─────────────────────────────────────────────────────────────

@@ -270,9 +270,10 @@ fn test_fee_full_2_percent_no_referrer() {
     fund_user(&t, &user, 200_0000000);
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
-    // No registered referrer: the 0.5% referral fee is retained by the
-    // market as refundable open fees alongside the 1.5% platform fee.
-    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    // No registered referrer: referral_registry.credit() refunds the 0.5%
+    // referral share straight back to the bettor. Only the 1.5% platform
+    // fee accrues to the market.
+    assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
 }
 
 // ── 6. Fee split with referrer ────────────────────────────────────────────────
@@ -308,10 +309,12 @@ fn test_fee_split_with_referrer() {
 // ── 6b. Issue #99: bet with an UNREGISTERED referrer link is rejected ────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #5)")]
 fn test_reject_place_bet_with_unregistered_referrer() {
-    // A user cannot even register a referral link to an unregistered address,
-    // so an unregistered attacker-controlled address can never receive fees.
+    // A user cannot even register a referral link to an unregistered address
+    // (referral_registry::ReferralError::InvalidReferrer), so an
+    // unregistered attacker-controlled address can never receive fees --
+    // caught at registration time, before place_bet is ever reached.
     let t = setup();
     let user = Address::generate(&t.env);
     let shady = Address::generate(&t.env);
@@ -420,8 +423,9 @@ fn test_increase_position_same_side() {
 // SECURITY REGRESSION SUITE — issue #98 (position management / reduce_position)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── 98a. Partial reduction, no referrer: full 100% of the released stake is
-//        refundable (net + platform fee + referral fee all held on contract) ──
+// ── 98a. Partial reduction, no referrer: referral_registry.credit() already
+//        refunded the referral share straight to the bettor at bet time, so
+//        only net + platform fee are ever held on contract / refundable ──
 #[test]
 fn test_reduce_position_partial_no_referrer() {
     let t = setup();
@@ -431,16 +435,17 @@ fn test_reduce_position_partial_no_referrer() {
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128); // 100 XLM
     assert_eq!(t.client.get_market(&id).total_yes, 98_0000000);
-    assert_eq!(t.client.get_accumulated_fees(), 2_0000000); // 1.5 + 0.5
+    assert_eq!(t.client.get_accumulated_fees(), 1_5000000); // platform only
 
     // Reduce 40 XLM of the 100 XLM position.
     let refund = t.client.reduce_position(&user, &id, &40_0000000_i128);
-    // net(39.2) + platform(0.6) + referral(0.2) == 40.0 held by the contract
-    assert_eq!(refund, 40_0000000);
+    // net(39.2) + platform(0.6) == 39.8 held by the contract; the 0.2
+    // referral share left permanently at bet time.
+    assert_eq!(refund, 39_8000000);
     assert_eq!(t.client.get_bet_gross(&id, &user), 60_0000000);
     assert_eq!(t.client.get_bet(&id, &user).amount, 58_8000000); // 98 - 39.2
     assert_eq!(t.client.get_market(&id).total_yes, 58_8000000);
-    assert_eq!(t.client.get_accumulated_fees(), 1_2000000); // 2.0 - (0.6+0.2)
+    assert_eq!(t.client.get_accumulated_fees(), 0_9000000); // 1.5 - 0.6
     assert_eq!(t.client.get_user_bet_count(&id, &user), 1); // not a new bet
 }
 
@@ -483,7 +488,9 @@ fn test_reduce_position_full_close_deletes_position() {
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     let refund = t.client.reduce_position(&user, &id, &100_0000000_i128);
-    assert_eq!(refund, 100_0000000); // full gross back (no referrer)
+    // net(98) + platform(1.5) == 99.5; the 0.5 referral share already left
+    // permanently (refunded to this same no-referrer bettor) at bet time.
+    assert_eq!(refund, 99_5000000);
     assert_eq!(t.client.get_bet_gross(&id, &user), 0);
     assert!(t.client.try_get_bet(&id, &user).is_err()); // NoBetFound
     assert_eq!(t.client.get_market(&id).total_yes, 0);
@@ -539,13 +546,16 @@ fn test_reduce_then_cancel_refund_pays_remaining_gross() {
 
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     let reduced = t.client.reduce_position(&user, &id, &40_0000000_i128);
-    assert_eq!(reduced, 40_0000000);
+    assert_eq!(reduced, 39_8000000); // net + platform only, see partial_no_referrer
     assert_eq!(t.client.get_bet_gross(&id, &user), 60_0000000);
 
-    // Market is then cancelled: refund covers only the 60 XLM still held.
+    // Market is then cancelled: refund covers net(58.8) + platform(0.9) of
+    // the remaining 60 XLM gross -- not the full 60, since the referral
+    // share of every stroop of gross left this contract permanently back
+    // at bet time (see cancel_refund).
     t.client.cancel_market(&t.admin, &id);
     let refunded = t.client.cancel_refund(&user, &id);
-    assert_eq!(refunded, 60_0000000);
+    assert_eq!(refunded, 59_7000000);
     assert_eq!(t.client.get_bet_gross(&id, &user), 0);
 
     // Idempotent: a second refund attempt finds nothing left.
@@ -765,8 +775,9 @@ fn test_hedged_payout_conserves_pool() {
     t.client.claim(&bob, &id);
     assert_eq!(t.xlm.balance(&bob), bob_before);
 
-    // Platform keeps exactly the 2% fees — pool is fully distributed to winners.
-    assert_eq!(t.client.get_accumulated_fees(), 5_0000000); // 2% of 250 gross
+    // Platform keeps exactly the 1.5% platform fee — referral share was
+    // refunded to each bettor directly; pool is fully distributed to winners.
+    assert_eq!(t.client.get_accumulated_fees(), 3_7500000); // 1.5% of 250 gross
 }
 
 // ── 12e. Cancel refund covers both sides (gross total) ───────────────────────
@@ -784,7 +795,7 @@ fn test_cancel_refund_two_sided_position() {
 
     t.client.cancel_market(&t.admin, &id);
     let refunded = t.client.cancel_refund(&user, &id);
-    assert_eq!(refunded, 150_0000000); // full gross across both sides
+    assert_eq!(refunded, 149_2500000); // net + platform (99.5%) across both sides
     assert_eq!(t.xlm.balance(&user), before);
 }
 
@@ -892,15 +903,18 @@ fn test_cancel_market_claim_style_refund() {
     let acc_fees_after_cancel = t.client.get_accumulated_fees();
     assert_eq!(acc_fees_after_cancel, 0);
 
-    // Each bettor pulls their own gross refund
+    // Each bettor pulls net + platform (99.5% of gross) from cancel_refund;
+    // the other 0.5% already came straight back to them from
+    // referral_registry at bet time, so their final balance still nets out
+    // to the full gross either way.
     let alice_refund = t.client.cancel_refund(&alice, &id);
-    assert_eq!(alice_refund, 100_0000000); // full gross (100 XLM)
+    assert_eq!(alice_refund, 99_5000000);
     assert_eq!(t.xlm.balance(&alice), alice_before);
     assert_eq!(t.client.get_bet(&id, &alice).amount, 0);
     assert_eq!(t.client.get_bet_gross(&id, &alice), 0);
 
     let bob_refund = t.client.cancel_refund(&bob, &id);
-    assert_eq!(bob_refund, 50_0000000); // full gross (50 XLM)
+    assert_eq!(bob_refund, 49_7500000);
     assert_eq!(t.xlm.balance(&bob), bob_before);
     assert_eq!(t.client.get_bet(&id, &bob).amount, 0);
     assert_eq!(t.client.get_bet_gross(&id, &bob), 0);
@@ -1727,9 +1741,10 @@ fn test_empty_side_resolution_pool_to_fees() {
     // Only YES bets — no one bets NO
     t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
     let fees_before = t.client.get_accumulated_fees();
-    // No referrer: platform (1.5%) + retained referral (0.5%) = 2%.
-    assert_eq!(fees_before, 2_0000000);
-    assert_eq!(t.client.get_market_fees(&id), 2_0000000);
+    // No referrer: only the 1.5% platform fee accrues -- referral_registry
+    // refunds the 0.5% referral share straight back to alice.
+    assert_eq!(fees_before, 1_5000000);
+    assert_eq!(t.client.get_market_fees(&id), 1_5000000);
 
     // Advance past end_time and resolve NO (empty winning side)
     advance_time(&t.env, 3601);
@@ -1741,7 +1756,7 @@ fn test_empty_side_resolution_pool_to_fees() {
     assert_eq!(t.client.get_payout(&id, &alice), 98_0000000);
     let fp = t.client.get_forfeited_pool(&id).expect("forfeited pool");
     assert_eq!(fp.amount, 98_0000000);
-    assert_eq!(fp.locked_fees, 2_0000000);
+    assert_eq!(fp.locked_fees, 1_5000000);
 
     // Draining during the dispute window reverts.
     let treasury = Address::generate(&t.env);
@@ -1776,11 +1791,12 @@ fn test_cancel_fees_zeroed_correctly() {
     fund_user(&t, &alice, 200_0000000);
     fund_user(&t, &bob, 200_0000000);
 
-    // Two bets accumulate fees. Neither bettor has a referrer, so both
-    // referral fees are retained by the market as refundable open fees too.
-    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 1.5 platform + 0.5 referral
-    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 1.5 platform + 0.5 referral
-    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
+    // Two bets accumulate fees. Neither bettor has a referrer, but
+    // referral_registry.credit() refunds that 0.5% straight back to each
+    // bettor -- only the 1.5% platform fee ever accrues to the market.
+    t.client.place_bet(&alice, &id, &true, &100_0000000_i128); // 1.5 platform
+    t.client.place_bet(&bob, &id, &false, &100_0000000_i128); // 1.5 platform
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000);
 
     // Cancel zeroes out those fees
     t.client.cancel_market(&t.admin, &id);
@@ -1847,9 +1863,10 @@ fn test_e2e_full_inter_contract_flow() {
     // Bob bets NO 200 XLM — no referrer
     t.client
         .place_bet(&bob, &market_id, &false, &200_0000000_i128);
-    // Bob has no referrer, so his 1% referral fee is retained by the market
-    // as refundable open fees too. Alice: 1.5M; Bob: 3M + 1M retained → 5.5M.
-    assert_eq!(t.client.get_accumulated_fees(), 5_5000000);
+    // Bob has no referrer, so referral_registry refunds his 0.5% referral
+    // share straight back to him -- only platform fees accrue to the
+    // market. Alice: 1.5M; Bob: 3M platform → 4.5M.
+    assert_eq!(t.client.get_accumulated_fees(), 4_5000000);
     // Bob never registered, so no bonus: total_bets = won(0) + lost(0) + bonus(0).
     assert_eq!(t.leaderboard_client.get_stats(&bob).total_bets, 0);
     assert_eq!(t.client.get_market(&market_id).total_no, 196_0000000);
@@ -1919,9 +1936,9 @@ fn test_e2e_full_inter_contract_flow() {
     t.client.cancel_market(&t.admin, &market2);
     // AccumulatedFees from market2 should be zeroed
     assert_eq!(t.client.get_accumulated_fees(), 0);
-    // Charlie pulls their own refund (gross = 100 XLM)
+    // Charlie pulls net + platform (99.5%); see cancel_market_claim_style_refund
     let refunded = t.client.cancel_refund(&charlie, &market2);
-    assert_eq!(refunded, 100_0000000);
+    assert_eq!(refunded, 99_5000000);
     assert_eq!(t.xlm.balance(&charlie), charlie_before);
 }
 
@@ -1932,14 +1949,16 @@ fn test_e2e_full_inter_contract_flow() {
 // ── #99: an unregistered attacker-controlled address can never be named as a
 //    referrer, so it can never receive fees or accrue count/earnings ─────────
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #5)")]
 fn test_reject_unregistered_referrer_e2e() {
     let t = setup();
     let user = Address::generate(&t.env);
     let attacker = Address::generate(&t.env);
     fund_user(&t, &user, 1_000_0000000);
 
-    // Attacker never registers; naming them as referrer must fail.
+    // Attacker never registers; naming them as referrer must fail with
+    // referral_registry::ReferralError::InvalidReferrer, at registration
+    // time.
     t.referral_client.register_referral(
         &user,
         &String::from_str(&t.env, "Victim"),
@@ -2060,9 +2079,17 @@ fn test_many_winners_payouts_exact_and_dust_swept() {
     t.client.claim(&w2, &id);
     t.client.claim(&w3, &id);
     assert_eq!(bal_before - t.xlm.balance(&market_contract), p1 + p2 + p3);
+    // w1 has no referrer, so referral_registry.credit() already refunded
+    // their referral share straight back at bet time -- on top of the
+    // claimed payout.
+    let gross1 = 30_000_001_i128;
+    let net1 = gross1 * NET_NUMERATOR / BPS_DENOM;
+    let total_fee1 = gross1 - net1; // matches place_bet's exact derivation
+    let platform_fee1 = gross1 * PLATFORM_FEE_BPS / BPS_DENOM;
+    let referral_refund1 = total_fee1 - platform_fee1;
     assert_eq!(
         t.xlm.balance(&w1),
-        10_000_000_000_i128 - 30_000_001_i128 + p1
+        10_000_000_000_i128 - gross1 + referral_refund1 + p1
     );
 }
 
@@ -2609,7 +2636,7 @@ fn test_cancel_refund_still_works_while_paused() {
 
     t.client.pause(&t.admin);
     let refunded = t.client.cancel_refund(&user, &id);
-    assert_eq!(refunded, 100_0000000);
+    assert_eq!(refunded, 99_5000000); // net + platform; see cancel_market_claim_style_refund
 }
 
 // View functions must keep working while paused.
@@ -3033,17 +3060,17 @@ fn test_cancel_does_not_wipe_other_market_fees() {
     fund_user(&t, &alice, 200_0000000);
     fund_user(&t, &bob, 200_0000000);
 
-    t.client.place_bet(&alice, &id1, &true, &100_0000000_i128); // 2 XLM retained
-    t.client.place_bet(&bob, &id2, &true, &100_0000000_i128); // 2 XLM retained
-    assert_eq!(t.client.get_accumulated_fees(), 4_0000000);
-    assert_eq!(t.client.get_market_fees(&id1), 2_0000000);
-    assert_eq!(t.client.get_market_fees(&id2), 2_0000000);
+    t.client.place_bet(&alice, &id1, &true, &100_0000000_i128); // 1.5 XLM platform
+    t.client.place_bet(&bob, &id2, &true, &100_0000000_i128); // 1.5 XLM platform
+    assert_eq!(t.client.get_accumulated_fees(), 3_0000000);
+    assert_eq!(t.client.get_market_fees(&id1), 1_5000000);
+    assert_eq!(t.client.get_market_fees(&id2), 1_5000000);
 
     t.client.cancel_market(&t.admin, &id1);
 
     assert_eq!(t.client.get_market_fees(&id1), 0);
-    assert_eq!(t.client.get_market_fees(&id2), 2_0000000);
-    assert_eq!(t.client.get_accumulated_fees(), 2_0000000);
+    assert_eq!(t.client.get_market_fees(&id2), 1_5000000);
+    assert_eq!(t.client.get_accumulated_fees(), 1_5000000);
 }
 
 #[test]
@@ -3053,9 +3080,9 @@ fn test_cancel_reclaims_pool_fees_not_inflated_ledger() {
     let alice = Address::generate(&t.env);
     fund_user(&t, &alice, 200_0000000);
     t.client.place_bet(&alice, &id, &true, &100_0000000_i128);
-    assert_eq!(t.client.get_market_fees(&id), 2_0000000);
+    assert_eq!(t.client.get_market_fees(&id), 1_5000000);
 
-    // Simulate an inflated per-market ledger (10 XLM recorded vs 2 earned).
+    // Simulate an inflated per-market ledger (10 XLM recorded vs 1.5 earned).
     t.env.as_contract(&t.client.address, || {
         t.env
             .storage()
@@ -3094,9 +3121,10 @@ fn test_withdraw_fees_cannot_take_empty_side_principal() {
     advance_time(&t.env, DISPUTE_WINDOW_SECS);
     t.client.finalize_zero_side(&id);
     let withdrawn = withdraw_all_admin_fees(&t, &treasury);
-    // Only the retained platform+referral fees are withdrawable; the empty
-    // side's principal is paid back to Alice via the settlement ledger.
-    assert_eq!(withdrawn, 2_0000000);
+    // Only the retained platform fee is withdrawable (referral share was
+    // refunded to Alice at bet time); the empty side's principal is paid
+    // back to her via the settlement ledger.
+    assert_eq!(withdrawn, 1_5000000);
 
     let alice_before = t.xlm.balance(&alice);
     t.client.claim(&alice, &id);
@@ -3154,9 +3182,9 @@ fn test_migrate_fee_ledger_snapshots_legacy_balance() {
     fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     assert_eq!(t.client.get_legacy_fees(), legacy_amount);
-    // No referrer: the referral fee is retained too (2% total).
-    assert_eq!(t.client.get_market_fees(&id), 2_0000000);
-    assert_eq!(t.client.get_accumulated_fees(), legacy_amount + 2_0000000);
+    // No referrer: only the 1.5% platform fee accrues.
+    assert_eq!(t.client.get_market_fees(&id), 1_5000000);
+    assert_eq!(t.client.get_accumulated_fees(), legacy_amount + 1_5000000);
 }
 
 #[test]
@@ -3170,7 +3198,7 @@ fn test_admin_withdraw_respects_cap() {
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
     let fees = t.client.get_accumulated_fees();
-    assert_eq!(fees, 6_0000000); // 3 bets x 2% (referral fee retained)
+    assert_eq!(fees, 4_5000000); // 3 bets x 1.5% platform (referral refunded)
 
     let cap = fees * MAX_WITHDRAWAL_BPS / BPS_DENOM;
     let withdrawn = t.client.withdraw_fees(&t.admin, &t.admin);
@@ -3202,7 +3230,7 @@ fn test_two_step_withdraw_debits_market_ledger() {
     let user = Address::generate(&t.env);
     fund_user(&t, &user, 200_0000000);
     t.client.place_bet(&user, &id, &true, &100_0000000_i128);
-    assert_eq!(t.client.get_market_fees(&id), 2_0000000);
+    assert_eq!(t.client.get_market_fees(&id), 1_5000000);
 
     let recipient = Address::generate(&t.env);
     t.client.add_fee_recipient(&t.admin, &recipient);
@@ -3308,7 +3336,7 @@ fn test_freeze_zero_side_during_dispute_refunds_gross() {
 
     assert!(t.client.try_claim(&alice, &id).is_err());
     let refunded = t.client.cancel_refund(&alice, &id);
-    assert_eq!(refunded, 100_0000000);
+    assert_eq!(refunded, 99_5000000); // net + platform; see cancel_market_claim_style_refund
     assert_eq!(t.xlm.balance(&alice), alice_before);
     assert_eq!(t.client.get_accumulated_fees(), 0);
 }

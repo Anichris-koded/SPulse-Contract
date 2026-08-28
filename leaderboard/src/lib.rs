@@ -1303,6 +1303,16 @@ impl LeaderboardContract {
         }
 
         // Persist the complete sorted index as one bounded ledger write.
+        //
+        // Sorting can move every entry to a different slot than the legacy
+        // layout had it in, which leaves TopPlayerSlot reverse lookups
+        // pointing at stale slots. Deliberately NOT rewriting all of them
+        // here: doing so is an O(n) persistent-write fan-out that reopens
+        // exactly the unbounded footprint issue #61 eliminated (a full-board
+        // migration already reads/sorts n entries -- adding n more writes
+        // blows the default resource budget for the max-size case).
+        // top_slot_entry/resolved_slot self-heal a stale reverse key lazily,
+        // on that specific user's next lookup, instead.
         Self::save_ordered_entries(env, &entries);
 
         env.storage().instance().set(&DataKey::TopPlayerCount, &n);

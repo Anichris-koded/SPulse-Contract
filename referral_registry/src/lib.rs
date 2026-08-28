@@ -11,6 +11,7 @@ pub const INTERFACE_VERSION: u32 = 1;
 
 const MAX_REFERRAL_DEPTH: u32 = 5;
 const WELCOME_BONUS_PTS: u64 = 5;
+const WELCOME_BONUS_TOKENS: i128 = 1_0000000;
 const REFERRAL_BONUS_PTS: u64 = 3;
 const TTL_BUMP: u32 = 3_153_600;
 const TTL_HIGH: u32 = 6_307_200;
@@ -191,7 +192,7 @@ impl ReferralRegistryContract {
                 this.into_val(&env),
                 user.into_val(&env),
                 WELCOME_BONUS_PTS.into_val(&env),
-                0_i128.into_val(&env),
+                WELCOME_BONUS_TOKENS.into_val(&env),
             ],
         );
 
@@ -212,10 +213,13 @@ impl ReferralRegistryContract {
         Self::require_market_contract(&env, &caller)?;
         caller.require_auth();
 
+        // See get_referrer for why this needs the Option<Address> type
+        // annotation plus a flatten(), not a bare Address read.
         let referrer: Option<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::Referrer(user.clone()));
+            .get::<_, Option<Address>>(&DataKey::Referrer(user.clone()))
+            .flatten();
 
         match referrer {
             None => {
@@ -259,7 +263,19 @@ impl ReferralRegistryContract {
     }
 
     pub fn get_referrer(env: Env, user: Address) -> Option<Address> {
-        env.storage().persistent().get(&DataKey::Referrer(user))
+        // The stored value is itself an Option<Address> (Referrer(user) is
+        // written even for a no-referrer registration, to distinguish
+        // "registered with no referrer" from "never registered" for the
+        // has() check in register_referral). Reading it back typed as bare
+        // Address instead of Option<Address> tries to decode a Void
+        // (the no-referrer case) as an Address and panics with
+        // ConversionError -- read the actual stored shape and flatten the
+        // two independent Option layers (key-presence, stored value) into
+        // the one the caller cares about.
+        env.storage()
+            .persistent()
+            .get::<_, Option<Address>>(&DataKey::Referrer(user))
+            .flatten()
     }
 
     pub fn get_display_name(env: Env, user: Address) -> Option<String> {

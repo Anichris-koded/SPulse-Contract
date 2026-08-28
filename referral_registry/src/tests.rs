@@ -53,12 +53,16 @@ fn setup() -> TestSetup {
         &7u32,
     );
 
+    // Register both contracts before initializing either: leaderboard.
+    // initialize() takes referral_registry's address and vice versa, so
+    // both IDs must exist first -- there's no setter to fix up
+    // leaderboard's ReferralContract after the fact.
     let leaderboard_id = env.register(LeaderboardContract, ());
     let leaderboard_client = leaderboard::LeaderboardContractClient::new(&env, &leaderboard_id);
-    leaderboard_client.initialize(&admin, &market, &token_id);
-
     let referral_id = env.register(ReferralRegistryContract, ());
     let client = ReferralRegistryContractClient::new(&env, &referral_id);
+
+    leaderboard_client.initialize(&admin, &market, &referral_id);
     client.initialize(&admin, &market, &token_id, &leaderboard_id, &xlm_sac_id);
 
     leaderboard_client.set_token_contract(&admin, &token_id);

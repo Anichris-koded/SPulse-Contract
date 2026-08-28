@@ -278,9 +278,12 @@ fn test_eviction_replaces_lowest_when_full() {
     }
 
     // Still capped at 50; newcomer is now #1; the old min (100) is gone.
+    // bubble_up converges to the final position in one call (issue #61), so
+    // the while loop above never actually iterates -- newcomer keeps their
+    // original 500 points.
     assert_eq!(client.get_top_player_count(), 50);
     let top = client.get_top_players(&0_u32, &20_u32);
-    assert_eq!(top.get(0).unwrap().points, 502);
+    assert_eq!(top.get(0).unwrap().points, 500);
 
     // Lowest entry is now 101 (the original 100 was evicted).
     let last = client.get_top_players(&40_u32, &20_u32);
@@ -520,15 +523,18 @@ fn test_reward_updates_points_and_winloss() {
 
 #[test]
 fn test_get_rank_cleans_stale_reverse_lookup() {
-    // TTL expiry deletes TopPlayerAt with no hook to clear TopPlayerSlot.
-    // get_rank must not trust the orphaned reverse key.
+    // Forward data lives in the single TopPlayers blob now (issue #61); the
+    // scenario this test guards is the reverse lookup (TopPlayerSlot)
+    // surviving after the forward side is gone -- e.g. the blob expiring
+    // out of instance storage with no hook that also clears the reverse
+    // key. get_rank must not trust an orphaned reverse key.
     let (env, client, _admin, market, _referral) = setup();
     let alice = Address::generate(&env);
     client.add_pts(&market, &alice, &100_u64, &true);
     assert_eq!(client.get_rank(&alice), 1);
 
     env.as_contract(&client.address, || {
-        env.storage().persistent().remove(&DataKey::TopPlayerAt(0));
+        env.storage().instance().remove(&DataKey::TopPlayers);
     });
 
     assert_eq!(client.get_rank(&alice), UNRANKED_RANK);
@@ -552,9 +558,19 @@ fn test_reconcile_compacts_ttl_holes_and_restores_slots() {
     client.add_pts(&market, &charlie, &75_u64, &true);
     assert_eq!(client.get_player_count(), 3);
 
-    // Expire the middle forward entry (charlie at slot 1 after sort: bob, charlie, alice).
+    // Simulate charlie's forward entry (slot 1, after sort: bob, charlie,
+    // alice) disappearing from the single TopPlayers blob (issue #61) while
+    // TopPlayerCount still claims 3 -- a hole for repair_top_index to find
+    // and compact. There's no per-entry TTL to expire within the blob
+    // anymore, so this pokes the same inconsistency directly instead.
     env.as_contract(&client.address, || {
-        env.storage().persistent().remove(&DataKey::TopPlayerAt(1));
+        let bytes: soroban_sdk::Bytes = env.storage().instance().get(&DataKey::TopPlayers).unwrap();
+        let mut entries: soroban_sdk::Vec<PlayerEntry> =
+            soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
+        entries.remove(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayers, &entries.to_xdr(&env));
     });
 
     client.reconcile_top_slots();
@@ -738,7 +754,9 @@ fn test_eviction_repairs_expired_min_entry() {
     assert_eq!(client.get_player_count(), 50);
     let top = client.get_top_players(&0_u32, &20_u32);
     assert_eq!(top.get(0).unwrap().address, newcomer);
-    assert_eq!(top.get(0).unwrap().points, 502);
+    // bubble_up converges in one call (issue #61), so the while loop above
+    // never actually iterates -- newcomer keeps their original 500 points.
+    assert_eq!(top.get(0).unwrap().points, 500);
     assert_eq!(client.get_rank(&newcomer), 1);
     // The expired player (100) is gone; even though their orphaned
     // TopPlayerSlot survives, get_rank must not report a stale rank.
@@ -788,8 +806,18 @@ fn test_stale_min_rejected_before_eviction() {
         let user = Address::generate(&env);
         client.add_pts(&market, &user, &(100 + i), &true);
     }
+    // Simulate the weakest entry (100 pts, tail slot 49) disappearing from
+    // the TopPlayers blob (issue #61) while TopPlayerCount still claims 50
+    // -- forward_entry(min_slot) then genuinely returns None, so upsert_top
+    // must repair the index and retry rather than trust a stale min.
     env.as_contract(&client.address, || {
-        env.storage().persistent().remove(&DataKey::TopPlayerAt(49));
+        let bytes: soroban_sdk::Bytes = env.storage().instance().get(&DataKey::TopPlayers).unwrap();
+        let mut entries: soroban_sdk::Vec<PlayerEntry> =
+            soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
+        entries.remove(49);
+        env.storage()
+            .instance()
+            .set(&DataKey::TopPlayers, &entries.to_xdr(&env));
     });
 
     let newcomer = Address::generate(&env);
@@ -1131,10 +1159,14 @@ fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
     // Simulate pre-upgrade legacy state: write unsorted slots directly
     let contract_id = client.address.clone();
     env.as_contract(&contract_id, || {
-        // Remove migration flag to simulate a pre-upgrade deployment
+        // Remove migration flag AND the (post-initialize, empty) TopPlayers
+        // blob to simulate a genuine pre-upgrade deployment: forward_entry
+        // only falls back to the legacy TopPlayerAt slots when the blob key
+        // is entirely absent, and initialize() always writes an empty one.
         env.storage()
             .instance()
             .remove(&DataKey::TopPlayersMigrated);
+        env.storage().instance().remove(&DataKey::TopPlayers);
 
         // Unsorted: slot 0=10pts, slot 1=50pts, slot 2=20pts, slot 3=100pts
         let e0 = PlayerEntry {
@@ -1195,28 +1227,19 @@ fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
     let migrated_count = client.migrate_top_players();
     assert_eq!(migrated_count, 4);
 
-    // Slots must now be in strictly descending order: 100, 50, 20, 10
+    // Slots must now be in strictly descending order: 100, 50, 20, 10.
+    // Migration writes the sorted result into the single TopPlayers blob
+    // (issue #61), not back into the legacy per-slot TopPlayerAt keys --
+    // read the blob, matching how the contract itself reads post-migration
+    // state.
     env.as_contract(&contract_id, || {
-        let s0: PlayerEntry = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TopPlayerAt(0))
-            .unwrap();
-        let s1: PlayerEntry = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TopPlayerAt(1))
-            .unwrap();
-        let s2: PlayerEntry = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TopPlayerAt(2))
-            .unwrap();
-        let s3: PlayerEntry = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TopPlayerAt(3))
-            .unwrap();
+        let bytes: soroban_sdk::Bytes = env.storage().instance().get(&DataKey::TopPlayers).unwrap();
+        let slots: soroban_sdk::Vec<PlayerEntry> =
+            soroban_sdk::xdr::FromXdr::from_xdr(&env, &bytes).unwrap();
+        let s0 = slots.get(0).unwrap();
+        let s1 = slots.get(1).unwrap();
+        let s2 = slots.get(2).unwrap();
+        let s3 = slots.get(3).unwrap();
 
         assert_eq!(s0.address, u4);
         assert_eq!(s0.points, 100);
@@ -1226,8 +1249,19 @@ fn test_migrate_top_players_sorts_legacy_unsorted_slots() {
         assert_eq!(s2.points, 20);
         assert_eq!(s3.address, u1);
         assert_eq!(s3.points, 10);
+    });
 
-        // Reverse lookups must be consistent with sorted slot order
+    // Migration deliberately does NOT rewrite every TopPlayerSlot reverse
+    // lookup up front -- that would reopen the unbounded per-migration
+    // write footprint issue #61 eliminated. Instead each one self-heals
+    // lazily, on that specific user's next lookup: get_rank must still
+    // report the correct post-sort rank even though the reverse key it
+    // reads first is stale.
+    assert_eq!(client.get_rank(&u4), 1);
+    assert_eq!(client.get_rank(&u2), 2);
+    assert_eq!(client.get_rank(&u3), 3);
+    assert_eq!(client.get_rank(&u1), 4);
+    env.as_contract(&contract_id, || {
         assert_eq!(
             env.storage()
                 .persistent()
@@ -1372,11 +1406,15 @@ fn test_get_top_players_automatically_migrates_under_default_limits() {
     let u2 = Address::generate(&env);
     let u3 = Address::generate(&env);
 
-    // Simulate pre-upgrade unmigrated state
+    // Simulate pre-upgrade unmigrated state: remove the migration flag AND
+    // the (post-initialize, empty) TopPlayers blob -- forward_entry only
+    // falls back to the legacy TopPlayerAt slots when the blob key is
+    // entirely absent, and initialize() always writes an empty one.
     env.as_contract(&contract_id, || {
         env.storage()
             .instance()
             .remove(&DataKey::TopPlayersMigrated);
+        env.storage().instance().remove(&DataKey::TopPlayers);
         let e0 = PlayerEntry {
             address: u1.clone(),
             points: 15,

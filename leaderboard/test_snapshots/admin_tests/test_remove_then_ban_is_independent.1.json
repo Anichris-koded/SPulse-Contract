@@ -277,6 +277,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "TopPlayers"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bytes": "000000100000000100000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "TopPlayersMigrated"
                           }
                         ]

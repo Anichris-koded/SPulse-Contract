@@ -199,6 +199,15 @@ fn test_credit_after_late_referrer_registration() {
         &Option::<Address>::None,
     );
 
+    // Now that referrer exists, user can attach them (one-time upgrade from
+    // no-referrer -> has-referrer; register_referral rejected Some(referrer)
+    // earlier only because referrer wasn't registered yet).
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "User"),
+        &Some(referrer.clone()),
+    );
+
     let referrer_balance_before = t.xlm.balance(&referrer);
     let paid = t.client.credit(&t.market, &user, &referral_fee);
     assert_eq!(paid, true);

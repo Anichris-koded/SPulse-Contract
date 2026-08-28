@@ -142,8 +142,22 @@ impl ReferralRegistryContract {
         user.require_auth();
 
         let key = DataKey::Referrer(user.clone());
-        if env.storage().persistent().has(&key) {
-            return Err(ReferralError::AlreadyRegistered);
+        let is_first_registration = !env.storage().persistent().has(&key);
+        if !is_first_registration {
+            // A user who registered before they had anyone to name as their
+            // referrer isn't locked out of ever attaching one: allow a
+            // one-time upgrade from no-referrer to a real referrer. Anyone
+            // who already has a referrer stays locked (no referral-hopping
+            // after the fact), and re-registering with no referrer again is
+            // just a redundant no-op call, still rejected.
+            let already: Option<Address> = env
+                .storage()
+                .persistent()
+                .get::<_, Option<Address>>(&key)
+                .flatten();
+            if already.is_some() || referrer.is_none() {
+                return Err(ReferralError::AlreadyRegistered);
+            }
         }
 
         if let Some(ref ref_addr) = referrer {
@@ -157,8 +171,13 @@ impl ReferralRegistryContract {
             {
                 return Err(ReferralError::InvalidReferrer);
             }
+            // referral_depth(ref_addr) is the referrer's OWN depth in the
+            // chain; the new user being registered would sit one level
+            // deeper than that. Check what the user's depth would become,
+            // not the referrer's current depth, or a chain can grow one
+            // member past MAX_REFERRAL_DEPTH before ever being rejected.
             let depth = Self::referral_depth(&env, ref_addr);
-            if depth >= MAX_REFERRAL_DEPTH {
+            if depth + 1 >= MAX_REFERRAL_DEPTH {
                 return Err(ReferralError::DepthLimitExceeded);
             }
             let ref_key = DataKey::ReferrerCount(ref_addr.clone());
@@ -182,19 +201,24 @@ impl ReferralRegistryContract {
             TTL_HIGH,
         );
 
-        let lb = Self::leaderboard_contract(&env)?;
-        let this = env.current_contract_address();
-        let _: Val = env.invoke_contract(
-            &lb,
-            &Symbol::new(&env, "reward_bonus"),
-            vec![
-                &env,
-                this.into_val(&env),
-                user.into_val(&env),
-                WELCOME_BONUS_PTS.into_val(&env),
-                WELCOME_BONUS_TOKENS.into_val(&env),
-            ],
-        );
+        // Welcome bonus is a one-time reward for the account, not for
+        // attaching a referrer -- skip it on a late-bind upgrade so it
+        // can't be claimed twice.
+        if is_first_registration {
+            let lb = Self::leaderboard_contract(&env)?;
+            let this = env.current_contract_address();
+            let _: Val = env.invoke_contract(
+                &lb,
+                &Symbol::new(&env, "reward_bonus"),
+                vec![
+                    &env,
+                    this.into_val(&env),
+                    user.into_val(&env),
+                    WELCOME_BONUS_PTS.into_val(&env),
+                    WELCOME_BONUS_TOKENS.into_val(&env),
+                ],
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "referral_registered"), user),

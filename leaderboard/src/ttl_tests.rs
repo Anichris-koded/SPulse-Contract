@@ -149,7 +149,13 @@ fn test_min_points_and_min_slot_survive_ttl_refresh_cycle() {
     let weakest = client.get_min_points();
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &(min_before + 1), &true);
-    while client.get_top_players(&0_u32, &1_u32).get(0).unwrap().address != newcomer {
+    while client
+        .get_top_players(&0_u32, &1_u32)
+        .get(0)
+        .unwrap()
+        .address
+        != newcomer
+    {
         client.add_pts(&market, &newcomer, &1, &true);
     }
 
@@ -293,7 +299,9 @@ fn test_refresh_player_ttl_rebumps_stats() {
 
     let ttl = || {
         env.as_contract(&client.address, || {
-            env.storage().persistent().get_ttl(&DataKey::Stats(user.clone()))
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Stats(user.clone()))
         })
     };
     assert!(ttl() >= TTL_BUMP);

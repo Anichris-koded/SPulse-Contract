@@ -873,18 +873,6 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "SeqCounter"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "u64": "0"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
                             "symbol": "TokenContract"
                           }
                         ]
@@ -903,6 +891,18 @@
                       },
                       "val": {
                         "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TopPlayers"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bytes": "000000100000000100000000"
                       }
                     },
                     {
@@ -981,6 +981,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "Paused"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "TokenContract"
                           }
                         ]
@@ -993,7 +1005,7 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "XlmSacContract"
+                            "symbol": "XlmSac"
                           }
                         ]
                       },
@@ -1289,18 +1301,6 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "LegacyFees"
-                          }
-                        ]
-                      },
-                      "val": {
-                        "i128": "0"
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
                             "symbol": "MarketCount"
                           }
                         ]
@@ -1358,14 +1358,14 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "RateWindow"
+                            "symbol": "RateWindowSeq"
                           }
                         ]
                       },
                       "val": {
                         "vec": [
                           {
-                            "u64": "1000000"
+                            "u32": 100
                           },
                           {
                             "u32": 1

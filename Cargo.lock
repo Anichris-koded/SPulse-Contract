@@ -831,6 +831,7 @@ dependencies = [
 name = "leaderboard"
 version = "0.1.0"
 dependencies = [
+ "pulse_token",
  "soroban-sdk",
 ]
 

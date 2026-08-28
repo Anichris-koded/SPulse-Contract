@@ -1,9 +1,8 @@
 use super::*;
 use soroban_sdk::{
-    contract, contractimpl,
-    testutils::{Address as _, Events, Ledger, LedgerInfo},
+    testutils::{Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, String, Symbol,
+    Address, Env, String, Vec,
 };
 
 use leaderboard::LeaderboardContract;
@@ -54,12 +53,16 @@ fn setup() -> TestSetup {
         &7u32,
     );
 
+    // Register both contracts before initializing either: leaderboard.
+    // initialize() takes referral_registry's address and vice versa, so
+    // both IDs must exist first -- there's no setter to fix up
+    // leaderboard's ReferralContract after the fact.
     let leaderboard_id = env.register(LeaderboardContract, ());
     let leaderboard_client = leaderboard::LeaderboardContractClient::new(&env, &leaderboard_id);
-    leaderboard_client.initialize(&admin, &market, &token_id);
-
     let referral_id = env.register(ReferralRegistryContract, ());
     let client = ReferralRegistryContractClient::new(&env, &referral_id);
+
+    leaderboard_client.initialize(&admin, &market, &referral_id);
     client.initialize(&admin, &market, &token_id, &leaderboard_id, &xlm_sac_id);
 
     leaderboard_client.set_token_contract(&admin, &token_id);
@@ -93,7 +96,10 @@ fn test_register_referral_without_referrer() {
     );
 
     assert_eq!(t.client.get_referrer(&user), None);
-    assert_eq!(t.client.get_display_name(&user), Some(String::from_str(&t.env, "User")));
+    assert_eq!(
+        t.client.get_display_name(&user),
+        Some(String::from_str(&t.env, "User"))
+    );
 }
 
 #[test]
@@ -141,7 +147,10 @@ fn test_credit_with_referrer_pays_referrer() {
     let paid = t.client.credit(&t.market, &user, &referral_fee);
     assert_eq!(paid, true);
 
-    assert_eq!(t.xlm.balance(&referrer), referrer_balance_before + referral_fee);
+    assert_eq!(
+        t.xlm.balance(&referrer),
+        referrer_balance_before + referral_fee
+    );
     assert_eq!(t.client.get_earnings(&referrer), referral_fee);
 }
 
@@ -190,10 +199,22 @@ fn test_credit_after_late_referrer_registration() {
         &Option::<Address>::None,
     );
 
+    // Now that referrer exists, user can attach them (one-time upgrade from
+    // no-referrer -> has-referrer; register_referral rejected Some(referrer)
+    // earlier only because referrer wasn't registered yet).
+    t.client.register_referral(
+        &user,
+        &String::from_str(&t.env, "User"),
+        &Some(referrer.clone()),
+    );
+
     let referrer_balance_before = t.xlm.balance(&referrer);
     let paid = t.client.credit(&t.market, &user, &referral_fee);
     assert_eq!(paid, true);
-    assert_eq!(t.xlm.balance(&referrer), referrer_balance_before + referral_fee);
+    assert_eq!(
+        t.xlm.balance(&referrer),
+        referrer_balance_before + referral_fee
+    );
 }
 
 #[test]
@@ -264,17 +285,17 @@ fn test_referral_depth_limit() {
         let user = users.get(i as u32).unwrap();
         let result = if i == max_depth {
             t.client.try_register_referral(
-                user,
+                &user,
                 &String::from_str(&t.env, "U"),
                 &Some(referrer.clone()),
             )
         } else {
             t.client.register_referral(
-                user,
+                &user,
                 &String::from_str(&t.env, "U"),
                 &Some(referrer.clone()),
             );
-            Ok(())
+            Ok(Ok(()))
         };
         if i == max_depth {
             assert!(result.is_err(), "should fail at depth limit");

@@ -286,7 +286,7 @@ fn test_reset_player_zeroes_points_but_preserves_bet_history() {
 
     let after = client.get_stats(&alice);
     assert_eq!(after.points, 0); // zeroed
-    // Win/loss/bonus history preserved.
+                                 // Win/loss/bonus history preserved.
     assert_eq!(after.won_bets, 1);
     assert_eq!(after.lost_bets, 1);
     assert_eq!(after.total_bets, 3);
@@ -526,7 +526,9 @@ fn test_banned_player_cannot_reenter_leaderboard() {
     // Direct storage poke: force the ban flag away to prove accrual re-checks
     // the flag every call (belt and suspenders — not part of the public API).
     env.as_contract(&client.address, || {
-        env.storage().persistent().set(&DataKey::BannedPlayer(alice.clone()), &false);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BannedPlayer(alice.clone()), &false);
     });
     // No longer banned, so the player may accrue again.
     client.add_pts(&market, &alice, &50_u64, &true);

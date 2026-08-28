@@ -1,8 +1,10 @@
 #![no_std]
+// TODO: migrate to #[contractevent] — see prediction_market/src/lib.rs.
+#![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
-    IntoVal, String, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, vec, Address, Env, IntoVal, String,
+    Symbol, Val,
 };
 
 pub const INTERFACE_VERSION: u32 = 1;
@@ -123,7 +125,9 @@ impl ReferralRegistryContract {
     ) -> Result<(), ReferralError> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::TokenContract, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenContract, &token);
         env.storage().instance().extend_ttl(TTL_BUMP, TTL_HIGH);
         Ok(())
     }
@@ -138,20 +142,42 @@ impl ReferralRegistryContract {
         user.require_auth();
 
         let key = DataKey::Referrer(user.clone());
-        if env.storage().persistent().has(&key) {
-            return Err(ReferralError::AlreadyRegistered);
+        let is_first_registration = !env.storage().persistent().has(&key);
+        if !is_first_registration {
+            // A user who registered before they had anyone to name as their
+            // referrer isn't locked out of ever attaching one: allow a
+            // one-time upgrade from no-referrer to a real referrer. Anyone
+            // who already has a referrer stays locked (no referral-hopping
+            // after the fact), and re-registering with no referrer again is
+            // just a redundant no-op call, still rejected.
+            let already: Option<Address> = env
+                .storage()
+                .persistent()
+                .get::<_, Option<Address>>(&key)
+                .flatten();
+            if already.is_some() || referrer.is_none() {
+                return Err(ReferralError::AlreadyRegistered);
+            }
         }
 
         if let Some(ref ref_addr) = referrer {
             if ref_addr == &user {
-        
                 return Err(ReferralError::SelfReferral);
             }
-            if !env.storage().persistent().has(&DataKey::Referrer(ref_addr.clone())) {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::Referrer(ref_addr.clone()))
+            {
                 return Err(ReferralError::InvalidReferrer);
             }
-            let depth = Self::referral_depth(&env, &ref_addr);
-            if depth >= MAX_REFERRAL_DEPTH {
+            // referral_depth(ref_addr) is the referrer's OWN depth in the
+            // chain; the new user being registered would sit one level
+            // deeper than that. Check what the user's depth would become,
+            // not the referrer's current depth, or a chain can grow one
+            // member past MAX_REFERRAL_DEPTH before ever being rejected.
+            let depth = Self::referral_depth(&env, ref_addr);
+            if depth + 1 >= MAX_REFERRAL_DEPTH {
                 return Err(ReferralError::DepthLimitExceeded);
             }
             let ref_key = DataKey::ReferrerCount(ref_addr.clone());
@@ -169,23 +195,30 @@ impl ReferralRegistryContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::DisplayName(user.clone()), TTL_BUMP, TTL_HIGH);
-
-        let lb = Self::leaderboard_contract(&env)?;
-        let this = env.current_contract_address();
-        let _: Val = env.invoke_contract(
-            &lb,
-            &Symbol::new(&env, "reward_bonus"),
-            vec![
-                &env,
-                this.into_val(&env),
-                user.into_val(&env),
-                WELCOME_BONUS_PTS.into_val(&env),
-                0_i128.into_val(&env),
-            ],
+        env.storage().persistent().extend_ttl(
+            &DataKey::DisplayName(user.clone()),
+            TTL_BUMP,
+            TTL_HIGH,
         );
+
+        // Welcome bonus is a one-time reward for the account, not for
+        // attaching a referrer -- skip it on a late-bind upgrade so it
+        // can't be claimed twice.
+        if is_first_registration {
+            let lb = Self::leaderboard_contract(&env)?;
+            let this = env.current_contract_address();
+            let _: Val = env.invoke_contract(
+                &lb,
+                &Symbol::new(&env, "reward_bonus"),
+                vec![
+                    &env,
+                    this.into_val(&env),
+                    user.into_val(&env),
+                    WELCOME_BONUS_PTS.into_val(&env),
+                    WELCOME_BONUS_TOKENS.into_val(&env),
+                ],
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "referral_registered"), user),
@@ -204,10 +237,13 @@ impl ReferralRegistryContract {
         Self::require_market_contract(&env, &caller)?;
         caller.require_auth();
 
+        // See get_referrer for why this needs the Option<Address> type
+        // annotation plus a flatten(), not a bare Address read.
         let referrer: Option<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::Referrer(user.clone()));
+            .get::<_, Option<Address>>(&DataKey::Referrer(user.clone()))
+            .flatten();
 
         match referrer {
             None => {
@@ -237,11 +273,7 @@ impl ReferralRegistryContract {
                 );
 
                 let earnings_key = DataKey::Earnings(ref_addr.clone());
-                let earnings: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&earnings_key)
-                    .unwrap_or(0);
+                let earnings: i128 = env.storage().persistent().get(&earnings_key).unwrap_or(0);
                 env.storage()
                     .persistent()
                     .set(&earnings_key, &(earnings + amount));
@@ -255,15 +287,23 @@ impl ReferralRegistryContract {
     }
 
     pub fn get_referrer(env: Env, user: Address) -> Option<Address> {
+        // The stored value is itself an Option<Address> (Referrer(user) is
+        // written even for a no-referrer registration, to distinguish
+        // "registered with no referrer" from "never registered" for the
+        // has() check in register_referral). Reading it back typed as bare
+        // Address instead of Option<Address> tries to decode a Void
+        // (the no-referrer case) as an Address and panics with
+        // ConversionError -- read the actual stored shape and flatten the
+        // two independent Option layers (key-presence, stored value) into
+        // the one the caller cares about.
         env.storage()
             .persistent()
-            .get(&DataKey::Referrer(user))
+            .get::<_, Option<Address>>(&DataKey::Referrer(user))
+            .flatten()
     }
 
     pub fn get_display_name(env: Env, user: Address) -> Option<String> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DisplayName(user))
+        env.storage().persistent().get(&DataKey::DisplayName(user))
     }
 
     pub fn get_referrer_count(env: Env, referrer: Address) -> u32 {

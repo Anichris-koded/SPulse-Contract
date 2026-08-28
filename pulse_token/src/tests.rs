@@ -70,7 +70,12 @@ fn instance_ttl(env: &Env, contract: &Address) -> u32 {
 }
 
 /// Mint `amount` to `to` and return the authorized minter.
-fn mint_to(client: &PULSETokenContractClient<'_>, env: &Env, to: &Address, amount: i128) -> Address {
+fn mint_to(
+    client: &PULSETokenContractClient<'_>,
+    env: &Env,
+    to: &Address,
+    amount: i128,
+) -> Address {
     let minter = Address::generate(env);
     client.set_minter(&minter);
     client.mint(&minter, to, &amount);
@@ -409,8 +414,6 @@ fn test_paused_rejects_mint() {
     client.mint(&minter, &recipient, &10_0000000_i128);
 }
 
-
-
 #[test]
 #[should_panic(expected = "Error(Contract, #9)")]
 fn test_paused_rejects_burn() {
@@ -599,7 +602,10 @@ fn test_burn_extends_ttl_on_remaining_balance() {
     advance_ledgers(&env, 4_000_000);
 
     let before = balance_ttl(&env, &client.address, &alice);
-    assert!(before < TTL_BUMP, "setup invariant broken: TTL ({before}) should be below TTL_BUMP");
+    assert!(
+        before < TTL_BUMP,
+        "setup invariant broken: TTL ({before}) should be below TTL_BUMP"
+    );
 
     // A partial burn leaves a live balance behind — that remainder needs its
     // TTL refreshed just as much as a transfer's does.
@@ -627,7 +633,12 @@ fn test_transfer_from_extends_ttl_on_both_balance_keys() {
 
     advance_ledgers(&env, 4_000_000);
     // Approve *after* the fast-forward so the allowance itself is still live.
-    client.approve(&alice, &spender, &1_000_0000000_i128, &(env.ledger().sequence() + 1_000));
+    client.approve(
+        &alice,
+        &spender,
+        &1_000_0000000_i128,
+        &(env.ledger().sequence() + 1_000),
+    );
 
     let alice_before = balance_ttl(&env, &client.address, &alice);
     let bob_before = balance_ttl(&env, &client.address, &bob);

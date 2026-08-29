@@ -151,7 +151,7 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-              "function_name": "set_token",
+              "function_name": "set_token_contract",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -299,7 +299,7 @@
                   "bool": true
                 },
                 {
-                  "i128": "10000001"
+                  "i128": "100000001"
                 }
               ]
             }
@@ -318,7 +318,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     },
                     {
-                      "i128": "10000001"
+                      "i128": "100000001"
                     }
                   ]
                 }
@@ -672,6 +672,87 @@
             "contract_data": {
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MinterIndex"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 0
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307300
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MinterIndex"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 2
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307300
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MinterIndex"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u32": 1
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307300
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
               "key": "ledger_key_contract_instance",
               "durability": "persistent",
               "val": {
@@ -702,6 +783,63 @@
                       },
                       "val": {
                         "u32": 7
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "MinterAt"
+                          },
+                          {
+                            "u32": 0
+                          }
+                        ]
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "MinterAt"
+                          },
+                          {
+                            "u32": 1
+                          }
+                        ]
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "MinterAt"
+                          },
+                          {
+                            "u32": 2
+                          }
+                        ]
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "MinterCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 3
                       }
                     },
                     {
@@ -792,12 +930,48 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "MinPoints"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "MinSlot"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "ReferralContract"
                           }
                         ]
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "SeqCounter"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "0"
                       }
                     },
                     {
@@ -831,7 +1005,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -915,7 +1089,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -961,23 +1135,23 @@
                       "symbol": "gross"
                     },
                     "val": {
-                      "i128": "10000001"
+                      "i128": "100000001"
                     }
                   },
                   {
                     "key": {
-                      "symbol": "is_yes"
+                      "symbol": "net_no"
                     },
                     "val": {
-                      "bool": true
+                      "i128": "0"
                     }
                   },
                   {
                     "key": {
-                      "symbol": "net"
+                      "symbol": "net_yes"
                     },
                     "val": {
-                      "i128": "9800000"
+                      "i128": "98000000"
                     }
                   }
                 ]
@@ -1064,7 +1238,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "200001"
+                "i128": "2000001"
               }
             }
           },
@@ -1082,22 +1256,22 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "HasReferrer"
+                    "symbol": "Governor"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "bool": false
+                "bool": true
               }
             }
           },
           "ext": "v0"
         },
-        "live_until": 6307300
+        "live_until": 199
       },
       {
         "entry": {
@@ -1216,10 +1390,37 @@
                       "symbol": "total_yes"
                     },
                     "val": {
-                      "i128": "9800000"
+                      "i128": "98000000"
                     }
                   }
                 ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6307300
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MarketAccumulatedFees"
+                  },
+                  {
+                    "u64": "1"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "i128": "2000001"
               }
             }
           },
@@ -1251,7 +1452,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "200001"
+                        "i128": "2000001"
                       }
                     },
                     {
@@ -1315,6 +1516,30 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "GovernorCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "GovernorThreshold"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "MarketCount"
                           }
                         ]
@@ -1332,7 +1557,52 @@
                         ]
                       },
                       "val": {
-                        "i128": "200001"
+                        "i128": "2000001"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "PinnedHashes"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "leaderboard"
+                            },
+                            "val": {
+                              "bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "referral"
+                            },
+                            "val": {
+                              "bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "token"
+                            },
+                            "val": {
+                              "bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "xlm_sac"
+                            },
+                            "val": {
+                              "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                            }
+                          }
+                        ]
                       }
                     },
                     {
@@ -1361,7 +1631,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       },
       {
         "entry": {
@@ -1460,7 +1730,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "10000001"
+                      "i128": "100000001"
                     }
                   },
                   {
@@ -1512,7 +1782,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "9989999999"
+                      "i128": "9899999999"
                     }
                   },
                   {
@@ -1654,7 +1924,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 199
+        "live_until": 6307300
       }
     ]
   },

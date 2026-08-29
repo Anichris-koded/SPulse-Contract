@@ -1,4 +1,6 @@
 #![no_std]
+// TODO: migrate to #[contractevent] — see prediction_market/src/lib.rs.
+#![allow(deprecated)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol,
@@ -36,10 +38,11 @@ pub enum TokenError {
     InsufficientAllowance = 7,
     InvalidExpirationLedger = 8,
     // Issue #95: operation blocked because the contract is paused.
-    ContractPaused = 9,
+    Paused = 9,
     AlreadyMinter = 10,
     NotMinter = 11,
     MinterListFull = 12,
+    SupplyCapExceeded = 13,
 }
 
 #[contracttype]
@@ -57,6 +60,7 @@ pub enum DataKey {
     MinterAt(u32),
     MinterCount,
     MinterIndex(Address),
+    SupplyCap, // i128 — maximum total_supply (0 = unlimited)
 }
 
 #[contracttype]
@@ -115,6 +119,34 @@ impl PULSETokenContract {
         INTERFACE_VERSION
     }
 
+    // ── Supply cap (issue #79) ────────────────────────────────────────────
+    // A cap of 0 means unlimited (backwards-compatible default).
+    // Admin only; emits a SupplyCapSet event so indexers can track policy changes.
+
+    /// Set or clear the maximum total_supply. Admin only.
+    pub fn set_supply_cap(env: Env, admin: Address, cap: i128) -> Result<(), TokenError> {
+        let stored = Self::require_admin(&env)?;
+        if admin != stored {
+            return Err(TokenError::NotAdmin);
+        }
+        admin.require_auth();
+        if cap < 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        env.storage().instance().set(&DataKey::SupplyCap, &cap);
+        env.events()
+            .publish((Symbol::new(&env, "supply_cap_set"), admin), cap);
+        Ok(())
+    }
+
+    /// Current supply cap. 0 means unlimited.
+    pub fn get_supply_cap(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SupplyCap)
+            .unwrap_or(0)
+    }
+
     /// Halt mint/transfer/burn in an emergency. Admin only. View functions
     /// (balance, total_supply, ...) keep working so integrators can still
     /// read state while the contract is paused.
@@ -126,7 +158,8 @@ impl PULSETokenContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "paused"), admin), true);
+        env.events()
+            .publish((Symbol::new(&env, "paused"), admin), true);
         Ok(())
     }
 
@@ -139,7 +172,8 @@ impl PULSETokenContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "unpaused"), admin), true);
+        env.events()
+            .publish((Symbol::new(&env, "unpaused"), admin), true);
         Ok(())
     }
 
@@ -171,12 +205,12 @@ impl PULSETokenContract {
         }
         let minter_key = DataKey::AuthorizedMinter(minter.clone());
         env.storage().persistent().set(&minter_key, &true);
-        env.storage().persistent().extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
-        // Track in the audit list
-        let index_key = DataKey::MinterIndex(minter.clone());
         env.storage()
             .persistent()
-            .set(&index_key, &count);
+            .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
+        // Track in the audit list
+        let index_key = DataKey::MinterIndex(minter.clone());
+        env.storage().persistent().set(&index_key, &count);
         env.storage()
             .persistent()
             .extend_ttl(&index_key, TTL_BUMP, TTL_HIGH);
@@ -187,7 +221,8 @@ impl PULSETokenContract {
             .instance()
             .set(&DataKey::MinterCount, &(count + 1));
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "minter_added"), minter), true);
+        env.events()
+            .publish((Symbol::new(&env, "minter_added"), minter), true);
         Ok(())
     }
 
@@ -260,39 +295,49 @@ impl PULSETokenContract {
         }
         minter.require_auth();
         let minter_key = DataKey::AuthorizedMinter(minter.clone());
-        let is_minter: bool = env
-            .storage()
-            .persistent()
-            .get(&minter_key)
-            .unwrap_or(false);
+        let is_minter: bool = env.storage().persistent().get(&minter_key).unwrap_or(false);
         if !is_minter {
             return Err(TokenError::UnauthorizedMinter);
         }
-        // An authorization grant that expires silently disables the minter
-        // (e.g. the leaderboard paying out rewards), so refresh it on use.
-        env.storage()
-            .persistent()
-            .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
-        let balance = Self::balance(env.clone(), to.clone());
-        Self::write_balance(&env, &to, balance + amount);
+        // Issue #79: enforce supply cap BEFORE any state change.
+        // Check must happen first — if cap is exceeded, no balance or
+        // supply should be modified.
         let supply: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
+        let cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupplyCap)
+            .unwrap_or(0);
+        if cap > 0 && supply + amount > cap {
+            return Err(TokenError::SupplyCapExceeded);
+        } // Cap OK — now apply state changes.
+        let balance = Self::balance(env.clone(), to.clone());
+        let to_key = DataKey::Balance(to.clone());
+        env.storage().persistent().set(&to_key, &(balance + amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, TTL_BUMP, TTL_HIGH);
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply + amount));
+        // An authorization grant that expires silently disables the minter
+        // (e.g. the leaderboard paying out rewards), so refresh it on use.
+        env.storage()
+            .persistent()
+            .extend_ttl(&minter_key, TTL_BUMP, TTL_HIGH);
         Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "mint"), minter, to),
-            amount,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "mint"), minter, to), amount);
         Ok(())
     }
 
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) -> Result<(), TokenError> {
-        Self::require_not_paused(&env)?;
+        // Deliberately NOT pause-gated: holders must always be able to move
+        // their own funds, even while mint/burn are halted (issue #95).
         if amount <= 0 {
             return Err(TokenError::InvalidAmount);
         }
@@ -305,10 +350,8 @@ impl PULSETokenContract {
         let to_balance = Self::balance(env.clone(), to.clone());
         Self::write_balance(&env, &to, to_balance + amount);
         Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "transfer"), from, to), amount);
         Ok(())
     }
 
@@ -341,8 +384,7 @@ impl PULSETokenContract {
             expiration_ledger,
         };
         env.storage().temporary().set(&key, &value);
-        let live_for = expiration_ledger
-            .saturating_sub(env.ledger().sequence());
+        let live_for = expiration_ledger.saturating_sub(env.ledger().sequence());
         env.storage()
             .temporary()
             .extend_ttl(&key, live_for, live_for);
@@ -353,7 +395,11 @@ impl PULSETokenContract {
     /// Returns 0 once the allowance has expired.
     pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
         let key = DataKey::Allowance(from, spender);
-        match env.storage().temporary().get::<DataKey, AllowanceValue>(&key) {
+        match env
+            .storage()
+            .temporary()
+            .get::<DataKey, AllowanceValue>(&key)
+        {
             Some(allowance) if allowance.expiration_ledger >= env.ledger().sequence() => {
                 allowance.amount
             }
@@ -410,10 +456,8 @@ impl PULSETokenContract {
         let to_balance = Self::balance(env.clone(), to.clone());
         Self::write_balance(&env, &to, to_balance + amount);
         Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "transfer"), from, to), amount);
         Ok(())
     }
 
@@ -437,7 +481,8 @@ impl PULSETokenContract {
             .instance()
             .set(&DataKey::TotalSupply, &(supply - amount));
         Self::bump_instance_ttl(&env);
-        env.events().publish((Symbol::new(&env, "burn"), from), amount);
+        env.events()
+            .publish((Symbol::new(&env, "burn"), from), amount);
         Ok(())
     }
 
@@ -487,7 +532,9 @@ impl PULSETokenContract {
     fn write_balance(env: &Env, account: &Address, amount: i128) {
         let key = DataKey::Balance(account.clone());
         env.storage().persistent().set(&key, &amount);
-        env.storage().persistent().extend_ttl(&key, TTL_BUMP, TTL_HIGH);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_BUMP, TTL_HIGH);
     }
 
     /// Refresh the instance entry holding `TotalSupply`, `Admin`, `Paused`
@@ -509,7 +556,7 @@ impl PULSETokenContract {
 
     fn require_not_paused(env: &Env) -> Result<(), TokenError> {
         if Self::is_paused(env.clone()) {
-            return Err(TokenError::ContractPaused);
+            return Err(TokenError::Paused);
         }
         Ok(())
     }

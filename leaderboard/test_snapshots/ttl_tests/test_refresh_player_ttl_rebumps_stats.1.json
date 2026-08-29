@@ -96,6 +96,14 @@
                 "map": [
                   {
                     "key": {
+                      "symbol": "bonus_bets"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "lost_bets"
                     },
                     "val": {
@@ -108,14 +116,6 @@
                     },
                     "val": {
                       "u64": "10"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "total_bets"
-                    },
-                    "val": {
-                      "u32": 1
                     }
                   },
                   {
@@ -144,41 +144,16 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "TopPlayerAt"
+                    "symbol": "StatsEpoch"
                   },
                   {
-                    "u32": 0
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "map": [
-                  {
-                    "key": {
-                      "symbol": "address"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "points"
-                    },
-                    "val": {
-                      "u64": "10"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "seq"
-                    },
-                    "val": {
-                      "u64": "0"
-                    }
-                  }
-                ]
+                "u32": 0
               }
             }
           },
@@ -261,7 +236,7 @@
                         ]
                       },
                       "val": {
-                        "u64": "10"
+                        "u64": "0"
                       }
                     },
                     {
@@ -310,6 +285,30 @@
                       },
                       "val": {
                         "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TopPlayers"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bytes": "0000001000000001000000010000001100000001000000040000000f000000076164647265737300000000120000000100000000000000000000000000000000000000000000000000000000000000050000000f0000000565706f636800000000000003000000000000000f00000006706f696e7473000000000005000000000000000a0000000f0000000373657100000000050000000000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TopPlayersMigrated"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": true
                       }
                     }
                   ]

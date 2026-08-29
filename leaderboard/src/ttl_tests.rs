@@ -22,10 +22,6 @@ fn setup() -> (
     let env = Env::default();
     env.mock_all_auths();
     env.cost_estimate().budget().reset_unlimited();
-    // The write-time ordered-index bubble (issue #68) can rewrite tens of
-    // slots in one call, exceeding mainnet invocation limits for the
-    // fill-to-capacity cases. Behavior is what these tests prove, so lift the
-    // resource limits like the CPU budget above (same as tests.rs setup).
     env.cost_estimate().disable_resource_limits();
 
     let contract_id = env.register(LeaderboardContract, ());
@@ -153,6 +149,15 @@ fn test_min_points_and_min_slot_survive_ttl_refresh_cycle() {
     let weakest = client.get_min_points();
     let newcomer = Address::generate(&env);
     client.add_pts(&market, &newcomer, &(min_before + 1), &true);
+    while client
+        .get_top_players(&0_u32, &1_u32)
+        .get(0)
+        .unwrap()
+        .address
+        != newcomer
+    {
+        client.add_pts(&market, &newcomer, &1, &true);
+    }
 
     assert_eq!(instance_ttl(&env, &client.address), TTL_HIGH);
     assert_eq!(client.get_top_player_count(), MAX_TOP_PLAYERS);
@@ -297,7 +302,9 @@ fn test_refresh_player_ttl_rebumps_stats() {
 
     let ttl = || {
         env.as_contract(&client.address, || {
-            env.storage().persistent().get_ttl(&DataKey::Stats(user.clone()))
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Stats(user.clone()))
         })
     };
     assert!(ttl() >= TTL_BUMP);
